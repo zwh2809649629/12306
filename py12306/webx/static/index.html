@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>py12306 · 购票助手管理台</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+/* ===== webx 补充样式（在原型样式基础上） ===== */
+#login-screen{min-height:100vh}
+.login-err{margin-top:12px;font-size:12.5px;color:var(--red);text-align:center;min-height:16px}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast .t{background:#1F2430;color:#fff;font-size:12.5px;font-weight:600;padding:9px 16px;border-radius:10px;box-shadow:0 12px 30px -10px rgba(0,0,0,.4);opacity:0;transform:translateY(-8px);transition:.25s;max-width:520px}
+.toast .t.show{opacity:1;transform:none}
+.toast .t.ok{background:#188038}.toast .t.err{background:#C8102E}
+.spin{width:13px;height:13px;border-radius:50%;border:2px solid var(--red-bg);border-top-color:var(--red);animation:sp 1s linear infinite;display:inline-block}
+@keyframes sp{to{transform:rotate(360deg)}}
+.stn-suggest{position:absolute;top:calc(100% + 4px);left:0;right:0;background:#fff;border:1px solid var(--line);border-radius:9px;box-shadow:var(--shadow);z-index:30;max-height:220px;overflow:auto}
+.stn-item{padding:8px 12px;font-size:13px;cursor:pointer;display:flex;justify-content:space-between}
+.stn-item:hover,.stn-item.on{background:var(--red-bg)}
+.stn-item small{color:var(--faint)}
+.route-input{position:relative}
+.empty{padding:40px 20px;text-align:center;color:var(--sub)}
+.empty b{display:block;color:var(--text);font-size:14px;margin-bottom:6px}
+.seat strong{font-size:12.5px;color:var(--ok)}
+.seat strong.none{color:var(--faint);font-weight:500}
+.seat strong.wait{color:var(--warn)}
+.seat small.seat-price{display:block;margin-top:3px;color:var(--faint);font-size:10px;font-weight:500}
+.seat-selectable{cursor:pointer}
+.seat-selectable:hover{background:#fff7f8}
+.seat-selected{background:#fff1f3}
+.seat-selected strong{color:var(--red-hi)}
+.results-panel.batch-mode td.actions .btn{opacity:.3;pointer-events:none}
+.qr-img{width:100%;height:160px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:10px}
+.qr-box.has-img{border-style:solid;border-color:var(--line);background:#fff}
+.set-field{grid-column:1 / -1;max-width:460px}
+.set-sub{grid-column:1 / -1;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;padding:2px 0 6px 44px}
+.set-sub .f-lab{margin-bottom:5px}
+.set-note{padding:10px 18px;font-size:11.5px;color:var(--faint);border-top:1px solid var(--line-soft)}
+.pass-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.hidden{display:none!important}
+/* 勾选列：默认按设计稿收成 0，进入批量/挑选模式后展开为窄列并显示勾选框 */
+.view#view-monitor .results-panel.batch-mode .table col:first-child{width:22px!important}
+.view#view-monitor .results-panel.batch-mode th:first-child,.view#view-monitor .results-panel.batch-mode tr:not(.phead):not(.psum) td:first-child{width:22px!important;min-width:22px!important;padding-left:8px!important;padding-right:2px!important;font-size:0}
+.view#view-monitor .results-panel.batch-mode th:first-child .row-check,.view#view-monitor .results-panel.batch-mode tr:not(.phead):not(.psum) td:first-child .row-check{display:inline-block;visibility:visible;pointer-events:auto}
+.hint{margin-top:7px;font-size:11.5px;color:var(--faint)}
+.task-picker{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:7px}
+.task-picker+.task-picker{margin-top:8px}
+.task-picker .station small{display:block;margin-top:2px}
+.task-seats{display:flex;flex-wrap:wrap;gap:6px}
+.task-seats label{display:inline-flex;align-items:center;gap:5px;background:var(--line-soft);border-radius:6px;padding:5px 10px;font-size:11.5px;cursor:pointer;user-select:none}
+.task-seats input{accent-color:var(--red)}
+</style>
+</head>
+<body>
+<!-- ============ 登录（独立全屏，未登录时显示） ============ -->
+<div id="login-screen" class="hidden">
+  <div class="login-wrap" style="min-height:100vh;padding:20px">
+    <div>
+      <div class="login-card">
+        <div class="lb">
+          <div class="logo">12306</div>
+          <h2>购票助手管理台</h2>
+          <p>py12306 · 多账号分布式抢票系统</p>
+        </div>
+        <div class="fld"><label>用户名</label><input id="loginUser" type="text" value="admin"></div>
+        <div class="fld"><label>密码</label>
+          <div class="pwd-suf"><input id="loginPwd" type="password"><span class="eye"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg></span></div>
+        </div>
+        <button class="btn btn-primary" id="loginBtn">登 录</button>
+        <div class="login-err" id="loginErr"></div>
+        <div class="lf"><span>登录后 7 天内保持登录</span></div>
+      </div>
+      <div class="login-foot">本地服务 · 首次启动的初始密码见 runtime/webx.log</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 应用外壳（登录后显示） ============ -->
+<div id="app" class="app hidden">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">123</div><div class="name">py12306<small>购票助手管理台</small></div></div>
+    <nav class="nav">
+      <div class="group">工作台</div>
+      <a data-view="dashboard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13h7V3H3zM14 21h7V11h-7zM14 3h7v4h-7zM3 21h7v-4H3z"/></svg>总览</a>
+      <a data-view="jobs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v14H4zM8 3v4M16 3v4M4 10h16"/></svg>抢票任务 <span class="bdg hot" id="navJobCount">0</span></a>
+      <a data-view="new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>新建任务</a>
+      <div class="group">监控</div>
+      <a data-view="monitor"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>车票查询</a>
+      <a data-view="accounts"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c.8-3.3 3.5-5 8-5s7.2 1.7 8 5"/></svg>账号管理</a>
+      <a data-view="logs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg>运行日志</a>
+      <div class="group">系统</div>
+      <a data-view="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/><circle cx="12" cy="12" r="4"/></svg>系统设置</a>
+    </nav>
+    <div class="side-foot">
+      <div class="node-card">
+        <div class="row"><span class="dot" id="nodeDot"></span><b id="nodeState" style="font-weight:600">运行中</b></div>
+        <div class="sub"><span id="nodeName">节点 —</span><span>webx 管理台</span></div>
+      </div>
+      <div class="side-login">
+        <span class="av" id="sideAv">A</span>
+        <span id="sideUser">admin</span>
+        <span class="out" id="logoutBtn" title="退出登录"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg></span>
+      </div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <h1 id="viewTitle">总览</h1><span class="crumb-sub">购票助手管理台</span>
+      <div class="top-right">
+        <span class="cluster-pill"><span class="dot"></span><span id="clusterPill">集群 未开启</span></span>
+        <span class="top-time" id="topTime"></span>
+        <span class="top-av" id="topAv">A</span>
+      </div>
+    </header>
+
+    <div class="content" id="content">
+
+      <!-- 总览 -->
+      <section class="view is-active" id="view-dashboard">
+        <div class="stats" id="dashStats"></div>
+        <div class="dash-grid">
+          <div style="min-width:0">
+            <div class="card" style="margin-bottom:16px">
+              <div class="card-h"><h3>任务运行状态</h3><span class="sub">每 3s 自动刷新</span><div class="act"><a class="btn btn-outline btn-sm" data-view="jobs">查看全部</a></div></div>
+              <table class="table"><thead><tr><th>任务</th><th>区间</th><th>日期</th><th>席位</th><th>状态</th><th>最近动态</th></tr></thead><tbody id="dashJobs"></tbody></table>
+            </div>
+            <div class="card">
+              <div class="card-h"><h3>近 7 日查询轮次</h3><span class="sub">单位：次</span></div>
+              <div class="chart" id="dashChart"></div>
+            </div>
+          </div>
+          <div>
+            <div class="card">
+              <div class="card-h"><h3>实时动态</h3><div class="act"><span class="tag ok"><span class="d"></span>实时</span></div></div>
+              <div class="feed" id="dashFeed"></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 抢票任务 -->
+      <section class="view" id="view-jobs">
+        <div class="toolbar">
+          <h2>抢票任务</h2><span class="cnt" id="jobsCnt">共 0 个</span>
+          <div class="sp">
+            <button class="btn btn-outline" id="jobsPauseAll">全部暂停</button>
+            <button class="btn btn-primary" data-view="new"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>新建任务</button>
+          </div>
+        </div>
+        <div id="jobsList"></div>
+      </section>
+
+      <!-- 任务详情 -->
+      <section class="view" id="view-detail">
+        <div class="detail-head">
+          <button class="btn btn-outline detail-back" data-view="jobs">‹</button>
+          <div class="detail-title"><h2 id="dName">任务详情</h2><div class="meta" id="dMeta"></div></div>
+          <div class="detail-actions">
+            <button class="btn btn-outline" id="dToggle">暂停任务</button>
+          </div>
+        </div>
+        <div class="detail-layout">
+          <div class="detail-stack">
+            <div class="card"><div class="card-h"><h3>行程信息</h3></div><div id="dFacts" class="detail-facts" style="padding:16px 18px"></div></div>
+            <div class="detail-stats" id="dStats"></div>
+            <div class="card"><div class="card-h"><h3>命中记录</h3></div><div class="detail-table-wrap"><table class="table"><thead><tr><th>车次</th><th>席别</th><th>余票</th><th>日期</th><th>时间</th></tr></thead><tbody id="dHits"></tbody></table></div></div>
+          </div>
+          <div class="detail-stack">
+            <div class="card"><div class="card-h"><h3>执行轨迹</h3></div><div class="detail-timeline" id="dTimeline"></div></div>
+            <div class="card"><div class="card-h"><h3>实时日志</h3></div><div class="detail-log" id="dLog"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 新建任务（对齐设计稿 task-flow 布局） -->
+      <section class="view" id="view-new">
+        <div class="order-toolbar task-toolbar">
+          <button class="btn back-order" id="taskHeaderBack" type="button" aria-label="返回">‹</button><div><h2>新建抢票任务</h2><span class="cnt">创建后将立即参与热重载，无需重启服务</span></div>
+        </div>
+        <div class="task-flow" id="taskFlow">
+          <div class="task-flow-grid">
+            <div>
+              <div class="task-flow-panel on" data-task-panel="1"><div class="form-sec"><div class="fh"><span class="no">1</span><h3>确认车次与席别</h3><span class="sub">从车票查询添加，可为每个车次选择多个席别</span></div><div class="fb">
+                <div class="task-flow-query"><span>查询余票后勾选需要预定的车次，再添加到当前任务。</span><button class="btn btn-outline" id="taskOpenTicketQuery" type="button">前往车票查询添加</button></div>
+                <div class="task-selection-list" id="taskSelectionList"></div>
+                <div class="task-flow-empty" id="taskSelectionEmpty">尚未添加车次，请先前往车票查询选择需要预定的车票（不添加则按下方区间查询全部车次）。</div>
+                <div class="f-lab" style="margin:12px 0 8px">出发日期<span class="opt-x" id="ntDateCnt">请选择，可多选</span></div>
+                <div id="ntDates" class="date-chips"></div>
+                <div class="f-lab" style="margin:12px 0 8px">出发 / 到达<span class="opt-x">可添加多组区间，成功率更高</span></div>
+                <div id="ntPairs">
+                  <div class="pair"><input class="stn" type="text" data-role="left" value="北京"><span class="arr">→</span><input class="stn" type="text" data-role="arrive" value="深圳"><span class="del">✕</span></div>
+                </div>
+                <div class="pair-add" id="ntAddPair">+ 添加一组区间</div>
+                <div class="hint">支持输入车站全称或简称，如「北京」「深圳北」。</div>
+              </div></div></div>
+              <div class="task-flow-panel" data-task-panel="2"><div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3><span class="sub">乘客列表跟随所选账号</span></div><div class="fb">
+                <div class="frow">
+                  <div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="ntAccount"><option value="">（需先添加并登录账号）</option></select></div>
+                  <div class="f-col"><div class="f-lab">任务名称<span class="opt-x">留空按站点自动命名</span></div><input class="ctl" id="ntName" type="text" placeholder="例如：国庆回深圳"></div>
+                </div>
+                <div class="f-lab" style="margin-top:14px">乘车人<span class="opt-x" id="ntPaxHint">需选择账号后加载</span></div>
+                <div class="order-people" id="ntPassengers"></div>
+                <div class="switch-row" style="margin-top:14px;max-width:460px"><span>允许余票不足时提交部分乘客</span><label class="tgl"><input id="ntLessMember" type="checkbox"><i></i></label></div>
+              </div></div></div>
+              <div class="task-flow-panel" data-task-panel="3"><div class="form-sec"><div class="fh"><span class="no">3</span><h3>设置抢票策略</h3><span class="sub">控制查询频率与席别优先级</span></div><div class="fb">
+                <div class="task-config-grid">
+                  <div><div class="f-lab">席别偏好（可多选，按勾选顺序降级尝试）</div><div class="chips" id="ntSeats"></div></div>
+                  <div><div class="f-lab">出发时间段</div><div style="display:flex;align-items:center;gap:9px"><select class="ctl" id="ntFromT"><option>00:00</option><option>06:00</option><option>08:00</option></select><span style="color:var(--faint)">—</span><select class="ctl" id="ntToT"><option>24:00</option><option>22:00</option><option>18:00</option></select></div></div>
+                  <div class="task-interval-field"><div class="f-lab">查询间隔</div><div class="task-interval-presets" id="ntIntervalPresets"><button class="task-interval-preset" type="button" data-min="0.5" data-max="1">快速 0.5–1s</button><button class="task-interval-preset on" type="button" data-min="1" data-max="1">均衡 1s</button><button class="task-interval-preset" type="button" data-min="1" data-max="2">稳健 1–2s</button><button class="task-interval-preset" type="button" data-custom="true">自定义</button></div><div class="task-interval-custom"><div><div class="f-lab">最小间隔（秒）</div><input class="ctl" id="ntIntMin" type="number" min="0.5" step="0.1" value="1"></div><div><div class="f-lab">最大间隔（秒）</div><input class="ctl" id="ntIntMax" type="number" min="0.5" step="0.1" value="1"></div></div></div>
+                  <div><div class="f-lab">指定车次（只抢列表内）</div><div class="tagbox" id="ntTrainBox"><input type="text" id="ntTrainInput" placeholder="输入车次回车添加"></div><div class="hint">留空表示不限车次。</div></div>
+                  <div><div class="f-lab">排除车次<span class="opt-x">与指定车次二选一</span></div><div class="tagbox" id="ntExceptBox"><input type="text" id="ntExceptInput" placeholder="输入车次回车排除"></div></div>
+                </div>
+              </div></div></div>
+            </div>
+            <aside class="summary"><div class="card"><div class="sh"><h3>任务摘要</h3><div class="sub">随当前选择实时更新</div></div>
+              <div class="sum-rows" id="ntSummary"></div>
+              <div class="sum-foot"><button class="btn btn-primary" id="taskFlowNext" type="button">创建任务</button></div>
+            </div></aside>
+          </div>
+        </div>
+      </section>
+
+      <!-- 车票查询（对齐设计稿布局） -->
+      <section class="view" id="view-monitor">
+        <div class="panel">
+          <div class="query">
+            <div class="field"><label>出发地</label><div class="route-input"><input id="mFrom" type="text" value="北京"><div class="stn-suggest hidden" id="mFromSug"></div></div></div>
+            <div class="field"><label>目的地</label><div class="route-input"><input id="mTo" type="text" value="深圳"><div class="stn-suggest hidden" id="mToSug"></div></div></div>
+            <div class="field"><label>出发日期</label><input id="mDate" type="date"></div>
+            <div class="field"><label>返程日期（可选）</label><input id="mBackDate" type="date" placeholder="不填则单程"></div>
+            <div class="field"><label>乘客类型</label><select class="ctl" id="mPassType"><option>成人</option><option>学生</option><option>儿童</option></select></div>
+            <button class="btn btn-primary" id="mSearch" style="background:var(--red);color:#fff;border-color:var(--red)">查询车票</button>
+          </div>
+          <div class="dates" id="mDates"></div>
+          <div class="filter" id="mFilter">
+            <div class="filter-row filter-mode-row">
+              <span class="filter-label">方案类型</span>
+              <div class="seg" id="mMode">
+                <button type="button" class="seg-btn on" data-mode="all">全部</button>
+                <button type="button" class="seg-btn" data-mode="direct">直达</button>
+                <button type="button" class="seg-btn" data-mode="transfer">中转方案</button>
+              </div>
+              <div class="filter-mode-params">
+                <label class="filter-mode-param" data-transfer-filter>中转车站
+                  <select id="mViaStation"><option value="all">不限</option></select>
+                </label>
+                <label class="filter-mode-param" data-transfer-filter>换乘次数
+                  <select id="mLegsCount"><option value="all">不限</option><option value="1">1 次换乘</option><option value="2">2 次换乘</option><option value="3">3 次及以上</option></select>
+                </label>
+                <label class="filter-mode-param">总耗时
+                  <select id="mDur"><option value="all">不限</option><option value="4">4 小时内</option><option value="6">6 小时内</option><option value="8">8 小时内</option><option value="12">12 小时内</option></select>
+                </label>
+              </div>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">车次类型</span>
+              <div class="filter-options" id="mType" data-filter-group="type">
+                <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>全部</span></label>
+                <label class="filter-option"><input type="checkbox" value="g"><span>G/C-高铁 / 城际</span></label>
+                <label class="filter-option"><input type="checkbox" value="d"><span>D-动车</span></label>
+                <label class="filter-option"><input type="checkbox" value="z"><span>Z-直达</span></label>
+                <label class="filter-option"><input type="checkbox" value="t"><span>T-特快</span></label>
+                <label class="filter-option"><input type="checkbox" value="k"><span>K-快速</span></label>
+                <label class="filter-option"><input type="checkbox" value="other"><span>其他</span></label>
+              </div>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">出发车站</span>
+              <div class="filter-options" id="mFromStation" data-filter-group="fromStation">
+                <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>全部</span></label>
+              </div>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">到达车站</span>
+              <div class="filter-options" id="mToStation" data-filter-group="toStation">
+                <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>全部</span></label>
+              </div>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">车次席别</span>
+              <div class="filter-options" id="mSeatFilter" data-filter-group="seats">
+                <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>全部</span></label>
+                <label class="filter-option"><input type="checkbox" value="business"><span>商务座</span></label>
+                <label class="filter-option"><input type="checkbox" value="first"><span>一等座</span></label>
+                <label class="filter-option"><input type="checkbox" value="second"><span>二等座</span></label>
+                <label class="filter-option"><input type="checkbox" value="hardSleeper"><span>硬卧</span></label>
+                <label class="filter-option"><input type="checkbox" value="hardSeat"><span>硬座</span></label>
+              </div>
+            </div>
+            <div class="filter-row">
+              <span class="filter-label">出发时间</span>
+              <div class="filter-options" id="mTime" data-filter-group="hour">
+                <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>不限</span></label>
+                <label class="filter-option"><input type="checkbox" value="00:00-06:00"><span>00:00 - 06:00</span></label>
+                <label class="filter-option"><input type="checkbox" value="06:00-12:00"><span>06:00 - 12:00</span></label>
+                <label class="filter-option"><input type="checkbox" value="12:00-18:00"><span>12:00 - 18:00</span></label>
+                <label class="filter-option"><input type="checkbox" value="18:00-24:00"><span>18:00 - 24:00</span></label>
+              </div>
+            </div>
+            <div class="filter-footer">
+              <label class="check"><input id="mAvailable" type="checkbox">仅看有票 / 可候补</label>
+              <div class="filter-actions"><button class="clear" id="mFilterClear" type="button">清除筛选</button><button class="filter-apply" id="mFilterApply" type="button">筛选 <span aria-hidden="true">⌃</span></button></div>
+            </div>
+          </div>
+        </div>
+        <div class="panel results-panel" id="mPanel">
+          <div class="bar">
+            <div><h2 id="mRoute">— → —</h2><small id="mSummary"></small></div>
+            <span class="status">即时结果 · 点击表头排序</span><button class="clear-sort" id="mClearSort" type="button">清除排序</button>
+            <div class="batch-actions">
+              <button class="btn batch-toggle" id="mBatchToggle" type="button" aria-pressed="false">批量</button>
+              <button class="btn batch-operation" id="mBatchBind" type="button">批量关联</button>
+              <button class="btn batch-operation" id="mBatchCreate" type="button">批量新建任务</button>
+            </div>
+          </div>
+          <div class="selection-bar" id="mSelBar"><strong id="mSelCount">已选 0 条</strong><small>已勾选车次</small>
+            <div class="floating-actions">
+              <button class="btn btn-outline normal-batch-only" id="mFloatPrefill" type="button">预填任务 / 预填本段</button>
+              <button class="btn btn-outline normal-batch-only" id="mFloatBind" type="button">关联任务</button>
+              <button class="btn btn-primary task-pick-only" id="mFloatAddTask" type="button">添加到任务</button>
+              <span class="reset-actions"><button class="btn btn-outline" id="mSelReset" type="button">重置选择</button></span>
+            </div>
+          </div>
+          <div class="scroll">
+            <table class="table"><colgroup><col style="width:4%"><col style="width:10%"><col style="width:7.54%"><col style="width:6.5%"><col style="width:5.96%"><col style="width:5.96%"><col style="width:8.2%"><col style="width:5.8%"><col style="width:5.8%"><col style="width:8.88%"><col style="width:5.8%"><col style="width:5.8%"><col style="width:5.8%"><col style="width:13.96%"></colgroup>
+            <thead><tr>
+              <th><input class="row-check" id="mSelAll" type="checkbox" aria-label="全选当前结果"></th>
+              <th><button class="sort-head" data-sort="type" type="button">车次<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th>出发站</th>
+              <th>到达站</th>
+              <th><button class="sort-head" data-sort="depart" type="button">出发<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th><button class="sort-head" data-sort="arrive" type="button">到达<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th><button class="sort-head" data-sort="duration" type="button">历时<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th>商务座</th><th>一等座</th>
+              <th><button class="sort-head" data-sort="tickets" type="button">二等座 / 余票<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th>硬卧</th><th>硬座</th><th>无座</th><th>操作</th>
+            </tr></thead><tbody id="mResults"></tbody></table>
+            <div class="empty hidden" id="mEmpty"><b>没有符合条件的车次</b>请调整筛选条件后重新查看。</div>
+          </div>
+        </div>
+        <div class="task-modal" id="taskModal">
+          <div class="task-dialog">
+            <div class="dh">
+              <h3>绑定到抢票任务</h3>
+              <button class="icon-btn" id="closeTaskModal" type="button" aria-label="关闭">×</button>
+            </div>
+            <div class="db">
+              <div class="preview" id="taskPreview"></div>
+              <div id="bindChoices" style="display:grid;gap:8px"></div>
+            </div>
+            <div class="df">
+              <button class="btn btn-ghost" id="cancelTaskModal" type="button">取消</button>
+              <button class="btn btn-primary" id="confirmTaskBind" type="button">确认关联</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 确认订单 -->
+      <section class="view" id="view-order">
+        <div class="order-page">
+          <div class="order-toolbar"><button class="btn back-order" id="oBack">‹</button><div><h2>确认订单</h2><span class="cnt">请核对行程、席别和乘车人信息</span></div><span class="order-status" id="oMode">立即预定</span></div>
+          <div class="order-layout">
+            <div>
+              <div class="form-sec"><div class="fh"><span class="no">1</span><h3>确认车次与席别</h3></div><div class="fb"><div class="task-selection-list" id="oSelections"></div><div class="empty" id="oSelEmpty"><b>尚未选择车次</b>请返回车票查询勾选车次后添加。</div></div></div>
+              <div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3></div><div class="fb">
+                <div class="frow">
+                  <div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="oAccount"><option value="">（需先添加并登录账号）</option></select></div>
+                </div>
+                <div class="f-lab" style="margin-top:14px">乘车人</div>
+                <div class="order-people" id="oPassengers"></div>
+              </div></div>
+            </div>
+            <aside class="summary order-summary"><div class="card"><div class="sh"><h3>订单摘要</h3><div class="sub">随选择实时更新</div></div>
+              <div class="sum-rows" id="oSummary"></div>
+              <div class="sum-foot"><button class="btn btn-primary" id="oSubmit">提交订单</button><div class="order-notice">实际出票结果与金额以 12306 返回为准。</div></div>
+            </div></aside>
+          </div>
+        </div>
+      </section>
+
+      <!-- 账号管理 -->
+      <section class="view" id="view-accounts">
+        <div class="toolbar"><h2>12306 账号</h2><span class="cnt" id="accCnt">共 0 个</span><div class="sp"><button class="btn btn-primary" id="accAdd"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>添加账号</button></div></div>
+        <div class="acc-grid">
+          <div class="card">
+            <table class="table"><thead><tr><th>账号</th><th>登录方式</th><th>状态</th><th>已同步乘客</th><th>最近心跳</th><th style="text-align:right">操作</th></tr></thead><tbody id="accList"></tbody></table>
+            <div class="set-note">会话缓存在 runtime/user/ 下，服务重启后自动恢复。扫码登录的账号需完成扫码后才参与抢票。</div>
+          </div>
+          <aside class="card addacc">
+            <div class="ah"><h3>添加 12306 账号</h3><span class="icon-btn x" id="accPanelClose"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></span></div>
+            <div class="tabs"><button class="on" id="accTabQr">扫码登录</button><button id="accTabPwd">账号密码</button></div>
+            <div id="accQrZone" class="qr-zone">
+              <div class="qr-box" id="accQrBox"><div style="text-align:center;color:var(--faint);font-size:12px" id="accQrPlaceholder">点击下方按钮生成二维码</div></div>
+              <div class="qr-status" id="accQrStatus">—</div>
+            </div>
+            <div id="accPwdZone" class="hidden" style="padding:20px 18px">
+              <div class="fld" style="margin-bottom:12px"><label style="font-size:12.5px;color:var(--sub);display:block;margin-bottom:6px">手机号 / 用户名</label><input class="ctl" id="accPwdUser" type="text"></div>
+              <div class="fld" style="margin-bottom:12px"><label style="font-size:12.5px;color:var(--sub);display:block;margin-bottom:6px">密码</label><input class="ctl" id="accPwdPass" type="password"></div>
+            </div>
+            <div style="padding:0 18px 18px">
+              <button class="btn btn-primary" id="accQrStart" style="width:100%;justify-content:center">生成登录二维码</button>
+              <div class="sync-note" style="margin-top:14px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4m0 4h.01"/></svg>登录成功后自动拉取该账号的乘客信息，新建任务可直接勾选乘车人。</div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- 运行日志 -->
+      <section class="view" id="view-logs">
+        <div class="toolbar">
+          <h2>运行日志</h2><span class="cnt" id="logCnt">runtime webx.log · 实时 tail</span>
+          <div class="sp">
+            <button class="btn btn-outline btn-sm" id="logPause">暂停滚动</button>
+            <a class="btn btn-outline btn-sm" href="/api/logs/download" id="logDownload">下载日志</a>
+          </div>
+        </div>
+        <div class="card" style="overflow:hidden">
+          <div class="term-toolbar" style="background:#141A26;border-radius:var(--r-lg) var(--r-lg) 0 0">
+            <span class="lv-chip on" data-lv="">全部</span>
+            <span class="lv-chip" data-lv="query">查询</span>
+            <span class="lv-chip" data-lv="order">下单</span>
+            <span class="lv-chip" data-lv="user">账号</span>
+            <span class="lv-chip" data-lv="error" style="color:#F89B9B">错误</span>
+            <input class="term-search" id="logSearch" type="text" placeholder="搜索日志，如 K356 / 命中">
+          </div>
+          <div class="term" id="logTerm" style="height:52vh;min-height:280px;overflow:auto"></div>
+        </div>
+      </section>
+
+      <!-- 系统设置 -->
+      <section class="view" id="view-settings">
+        <div class="toolbar"><h2>系统设置</h2><span class="cnt">保存后立即生效，无需重启服务</span><div class="sp"><button class="btn btn-primary" id="setSave">保存设置</button></div></div>
+        <div class="set-grid" id="setGrid"></div>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/static/main.js"></script>
+</body>
+</html>

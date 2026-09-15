@@ -15,12 +15,12 @@ def main():
     App.run()
     CommonLog.print_configs()
     App.did_start()
+    Web.run()
 
     App.run_check()
     Query.check_before_run()
 
     ####### 运行任务
-    Web.run()
     Cdn.run()
     User.run()
     Query.run()
