@@ -260,19 +260,38 @@ function startPolling() {
 }
 // 任务状态：单一事实来源（后端 _job_status 产出这些值）
 var JOB_STATUS = {
-  running:   { text: '运行中',     cls: 'ok',    dot: true },
-  paused:    { text: '已暂停',     cls: 'muted' },
-  pending:   { text: '待启动',     cls: 'warn' },
+  running:   { text: '运行中',   cls: 'ok',    dot: true },
+  paying:    { text: '待支付',   cls: 'hot',   dot: true },   // 下单成功且仍在 30 分钟窗口内
+  paused:    { text: '已暂停',   cls: 'muted' },
+  pending:   { text: '待启动',   cls: 'warn' },
   blocked:   { text: '账号未登录', cls: 'warn' },
-  completed: { text: '已完成',     cls: 'ok' },
-  finished:  { text: '已结束',     cls: 'muted' }
+  completed: { text: '已完成',   cls: 'muted' },               // 下单成功但已超过支付时限
+  finished:  { text: '已结束',   cls: 'muted' }
 };
 function jobStatusTag(st) {
   var s = JOB_STATUS[st] || { text: st || '未知', cls: 'muted' };
   return '<span class="tag ' + s.cls + '">' + (s.dot ? '<span class="d"></span>' : '') + esc(s.text) + '</span>';
 }
-// 任务已结束的任务不再可操作（引擎已销毁实例）；重新启用由用户点 ▶ 触发
-function jobDone(st) { return st === 'completed' || st === 'finished'; }
+// 任务已终结的任务不再可操作（引擎已销毁实例）；重新启用由用户点 ▶ 触发。
+// paying 也是终态（订单已生成，不会继续查询）。
+function jobDone(st) { return st === 'completed' || st === 'finished' || st === 'paying'; }
+
+// 支付提示：30 分钟内为红色紧迫样式，超时后转灰（订单已被 12306 取消）
+function payHint(j, cls) {
+  var base = j.order_message || '订单已生成，请到 12306 核对';
+  var train = j.order_train ? '（' + esc(j.order_train) + '）' : '';
+  var left = '';
+  if (j.order_paying && j.order_elapsed != null && j.pay_window) {
+    var mins = Math.max(0, Math.ceil((j.pay_window - j.order_elapsed) / 60));
+    left = '<span class="dh-t">剩余约 ' + mins + ' 分钟</span>';
+  } else if (!j.order_paying && j.order_at) {
+    left = '<span class="dh-t">已超过支付时限（' + esc(String(j.order_at).slice(5, 16)) + '）</span>';
+  }
+  // 超时后不再催付款，改为提示去核对订单状态
+  var label = j.order_paying ? '下单成功' : '已完成';
+  var text = j.order_paying ? base : (base.replace(/请 30 分钟内登录 12306 完成支付[^，]*/g, '').replace(/[，,]+$/, '') || '订单已生成');
+  return '<div class="' + cls + '"><b>' + label + '</b>' + esc(text) + train + left + '</div>';
+}
 var TITLES = { dashboard: '总览', jobs: '抢票任务', 'new': '新建抢票任务', detail: '任务详情', monitor: '车票查询', order: '确认订单', accounts: '12306 账号', logs: '运行日志', settings: '系统设置' };
 function currentView() {
   var v = document.querySelector('.view.is-active');
@@ -414,10 +433,9 @@ function loadJobs() {
         // 账号未就绪 → 引擎会卡在 wait_for_ready()，一条查询也发不出去，必须明确提示
         hint = '<div class="job-hint">账号<b>' + esc(j.account_name || j.account_key || '') + '</b>当前未登录，任务已中止。'
           + '<button class="link-btn" type="button" data-act="goacc">去账号管理登录</button></div>';
-      } else if (j.status === 'completed') {
-        // 已生成订单 —— 时效性强（12306 要求 30 分钟内支付），置顶醒目展示
-        hint = '<div class="job-hint pay"><b>下单成功</b>' + esc(j.order_message || '订单已生成，请到 12306 核对')
-          + (j.order_train ? '（' + esc(j.order_train) + '）' : '') + '</div>';
+      } else if (j.status === 'paying' || j.status === 'completed') {
+        // 下单成功：30 分钟内红色催付，超时后转灰（12306 会取消超时未付订单）
+        hint = payHint(j, 'job-hint ' + (j.status === 'paying' ? 'pay' : 'paid'));
       } else if (done && j.finish_reason) {
         hint = '<div class="job-hint done">' + esc(j.finish_reason)
           + (j.finished_at ? '（' + esc(String(j.finished_at).slice(5, 16)) + '）' : '') + '</div>';
@@ -475,14 +493,11 @@ function loadDetail(job_id) {
     $('dToggle').onclick = function () {
       jobToggle(job_id, dDone ? true : !j.is_active, this, function () { loadDetail(job_id); });
     };
-    // 账号未登录 / 下单成功 / 任务已结束：在标题下方给出可行动的说明
+    // 账号未登录 / 下单成功（待支付・超时） / 任务已结束：在标题下方给出可行动的说明
     if ($('dHint')) {
-      if (j.status === 'completed') {
-        // 已生成订单：时效性强（12306 要求 30 分钟内支付），优先展示
-        $('dHint').className = 'detail-hint pay';
-        $('dHint').innerHTML = '<b>下单成功</b>' + esc(j.order_message || '订单已生成，请到 12306 核对')
-          + (j.order_train ? '（' + esc(j.order_train) + '）' : '')
-          + (j.order_at ? '<span class="dh-t">' + esc(String(j.order_at).slice(5, 16)) + '</span>' : '');
+      if (j.status === 'paying' || j.status === 'completed') {
+        $('dHint').className = 'detail-hint ' + (j.status === 'paying' ? 'pay' : 'paid');
+        $('dHint').innerHTML = payHint(j, '');
       } else if (j.status === 'blocked') {
         $('dHint').className = 'detail-hint warn';
         $('dHint').innerHTML = '账号<b>' + esc(j.account_name || j.account_key || '')

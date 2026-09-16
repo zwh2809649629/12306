@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 import json
+import time
 
 from flask import Blueprint, request
 
 from py12306.webx.db import DataStore
 
 bp = Blueprint('jobs', __name__)
+
+# 12306 要求下单后 30 分钟内完成支付，超时订单会被取消。
+# 窗口内 → `paying`（待支付，需要提醒）；窗口外 → `completed`（已完成，提示转灰）。
+PAY_WINDOW_SECONDS = 30 * 60
 
 
 def _seat_tiers(job):
@@ -85,14 +90,25 @@ def _account_ready(db, account_key, runtime):
     return bool(acc.get('login_ok')) and bool(acc.get('active')), acc.get('user_name') or ''
 
 
-def _job_status(job, active, alive, acc_ready, order_success):
+def _seconds_since(ts):
+    """距给定 'YYYY-MM-DD HH:MM:SS' 的秒数；解析失败返回 None"""
+    if not ts:
+        return None
+    try:
+        return max(0.0, time.time() - time.mktime(time.strptime(str(ts)[:19], '%Y-%m-%d %H:%M:%S')))
+    except Exception:
+        return None
+
+
+def _job_status(job, active, alive, acc_ready, order_success, paying):
     """
     任务状态（文案在前端 JOB_STATUS）。
 
     顺序很重要：
-    1. **存在成功的下单记录 → completed**。终态且时效性强（12306 要求 30 分钟内支付），
-       不能被其它状态掩盖。注意传进来的应是「是否存在任一 success 记录」，
-       而不是「最新一条订单记录的状态」—— 后者会被后续的 queued/failed 覆盖。
+    1. **存在成功的下单记录** → `paying`（仍在 30 分钟支付窗口内）/ `completed`（已超时）。
+       这是终态且时效性强，不能被其它状态掩盖。注意传进来的应是
+       「是否存在任一 success 记录」，而不是「最新一条订单记录的状态」——
+       后者会被后续的 queued/failed 覆盖。
     2. **用户主动暂停 → paused**：必须在 finished_at 之前判。
        因为暂停会从 QUERY_JOBS 摘除任务 → 引擎 `Job.destroy()` → 我们的钩子
        会写 finished_at，若先判 finished_at 就会把「已暂停」错显示成「已结束」。
@@ -103,7 +119,7 @@ def _job_status(job, active, alive, acc_ready, order_success):
     6. 其余 → pending（已启用但还未被引擎加载）。
     """
     if order_success:
-        return 'completed'
+        return 'paying' if paying else 'completed'
     if not active:
         return 'paused'
     if job.get('finished_at'):
@@ -115,10 +131,12 @@ def _job_status(job, active, alive, acc_ready, order_success):
     return 'pending'
 
 
-# 列表排序权重：正在运行 > （账号未登录）> 待启动 > 已暂停 > 已完成 > 已结束。
+# 列表排序权重（用户明确指定的顺序）：
+#   运行中 > 下单成功未超过30分钟(待支付) > 账号未登录 > 待启动
+#          > 已暂停 > 已完成(超时) > 已结束
 # 放在后端是为了让「抢票任务」与「总览」两处顺序天然一致。
-_STATUS_RANK = {'running': 0, 'blocked': 1, 'pending': 2,
-                'paused': 3, 'completed': 4, 'finished': 5}
+_STATUS_RANK = {'running': 0, 'paying': 1, 'blocked': 2, 'pending': 3,
+                'paused': 4, 'completed': 5, 'finished': 6}
 
 
 def status_rank(status):
@@ -145,12 +163,17 @@ def _order_info(db, job_id):
         "WHERE job_id IS ? AND status='success' ORDER BY id DESC LIMIT 1", (job_id,))
     success = ok_rows[0] if ok_rows else {}
     shown = success or latest
+    at = shown.get('created_at') or ''
+    # 下单成功距现在多久 → 还在 30 分钟支付窗口内吗
+    elapsed = _seconds_since(at) if success else None
     return {
         'state': str(latest.get('status') or ''),
         'has_success': bool(success),
+        'paying': bool(success) and elapsed is not None and elapsed < PAY_WINDOW_SECONDS,
+        'elapsed': int(elapsed) if elapsed is not None else None,
         'message': shown.get('message') or '',
         'train': shown.get('train_number') or '',
-        'at': shown.get('created_at') or '',
+        'at': at,
     }
 
 
@@ -167,10 +190,13 @@ def _job_view(job, db):
         'account_name': acc_name,
         'account_ready': bool(acc_ready),
         'status': _job_status(job, active, engine_jobs.get(job.get('job_name'), False),
-                              acc_ready, od['has_success']),
+                              acc_ready, od['has_success'], od['paying']),
         # 订单状态（webx 自己的下单记录，非 12306 官方订单状态）
         'order_state': od['state'],
         'order_success': od['has_success'],
+        'order_paying': od['paying'],
+        'order_elapsed': od['elapsed'],
+        'pay_window': PAY_WINDOW_SECONDS,
         'order_message': od['message'],
         'order_train': od['train'],
         'order_at': od['at'],
