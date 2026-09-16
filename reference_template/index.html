@@ -805,7 +805,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
                   <tr>
                     <td><b>北京 → 深圳</b></td>
                     <td class="mono">09-12 · 09-13</td>
-                    <td>卓文颢 ×1</td>
+                    <td>张三 ×1</td>
                     <td class="chip-row"><span class="tag hot">硬卧</span><span class="tag hot">硬座</span><span class="tag muted">K356 等 3 车次</span></td>
                     <td><span class="tag ok"><span class="d"></span>运行中</span></td>
                     <td style="color:var(--red);font-weight:700">09:41 命中 K356 硬卧 17</td>
@@ -813,7 +813,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
                   <tr>
                     <td><b>北京 → 广州</b></td>
                     <td class="mono">09-13</td>
-                    <td>卓文颢、王五 ×2</td>
+                    <td>张三、王五 ×2</td>
                     <td class="chip-row"><span class="tag hot">硬卧</span><span class="tag muted">不限车次</span></td>
                     <td><span class="tag warn"><span class="d"></span>已暂停</span></td>
                     <td style="color:var(--sub)">09:36 无余票 · 第 1,204 轮</td>
@@ -901,7 +901,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
             <span class="tag muted">K356</span><span class="tag muted">K1172</span><span class="tag muted">K4184</span>
             <span class="tag muted">00:00 – 24:00</span>
             <span class="tag info">区间 09-12 / 09-13</span>
-            <span class="tag muted">乘客：卓文颢 ×1</span>
+            <span class="tag muted">乘客：张三 ×1</span>
             <span class="tag muted">间隔 0.5–1s</span>
           </div>
           <div class="l3">
@@ -931,7 +931,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
             <span class="tag muted">不限车次</span>
             <span class="tag muted">06:00 – 22:00</span>
             <span class="tag info">区间 09-13</span>
-            <span class="tag muted">乘客：卓文颢、王五 ×2</span>
+            <span class="tag muted">乘客：张三、王五 ×2</span>
             <span class="tag muted">间隔 1s</span>
           </div>
           <div class="l3">
@@ -992,10 +992,10 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
           <div class="task-flow-grid">
             <div>
               <div class="task-flow-panel on" data-task-panel="1"><div class="form-sec"><div class="fh"><span class="no">1</span><h3>确认车次与席别</h3><span class="sub">从车票查询添加，可为每个车次选择多个席别</span></div><div class="fb"><div class="task-flow-query"><span>查询余票后勾选需要预定的车次，再添加到当前任务。</span><button class="btn btn-outline" id="taskOpenTicketQuery" type="button">前往车票查询添加</button></div><div class="task-selection-list" id="taskSelectionList"></div><div class="task-flow-empty" id="taskSelectionEmpty">尚未添加车次，请先前往车票查询选择需要预定的车票。</div></div></div></div>
-              <div class="task-flow-panel" data-task-panel="2"><div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3><span class="sub">乘客列表跟随所选账号</span></div><div class="fb"><div class="frow"><div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="taskAccount"><option>138****6688（在线 · 3 位乘客）</option><option>wangwu（在线 · 2 位乘客）</option></select></div><div class="f-col"><div class="f-lab">任务名称</div><input id="taskName" type="text" placeholder="例如：周末回深圳"></div></div><div class="f-lab" style="margin-top:14px">乘车人</div><div class="order-people" id="taskPassengers"><label class="order-person"><input type="checkbox" value="卓文颢" checked><span><b>卓文颢 · 成人票</b><small>已通过身份核验</small></span></label><label class="order-person"><input type="checkbox" value="王五"><span><b>王五 · 成人票</b><small>学生资质已核验</small></span></label><label class="order-person"><input type="checkbox" value="王小明"><span><b>王小明 · 儿童票</b><small>随行儿童</small></span></label></div></div></div></div>
+              <div class="task-flow-panel" data-task-panel="2"><div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3><span class="sub">乘客列表跟随所选账号</span></div><div class="fb"><div class="frow"><div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="taskAccount"><option>138****6688（在线 · 3 位乘客）</option><option>wangwu（在线 · 2 位乘客）</option></select></div><div class="f-col"><div class="f-lab">任务名称</div><input id="taskName" type="text" placeholder="例如：周末回深圳"></div></div><div class="f-lab" style="margin-top:14px">乘车人</div><div class="order-people" id="taskPassengers"><label class="order-person"><input type="checkbox" value="张三" checked><span><b>张三 · 成人票</b><small>已通过身份核验</small></span></label><label class="order-person"><input type="checkbox" value="王五"><span><b>王五 · 成人票</b><small>学生资质已核验</small></span></label><label class="order-person"><input type="checkbox" value="王小明"><span><b>王小明 · 儿童票</b><small>随行儿童</small></span></label></div></div></div></div>
               <div class="task-flow-panel" data-task-panel="3"><div class="form-sec"><div class="fh"><span class="no">3</span><h3>设置抢票策略</h3><span class="sub">控制启动时间与查询频率</span></div><div class="fb"><div class="task-config-grid"><div><div class="f-lab">开始方式</div><select class="ctl" id="taskStartMode"><option value="now">创建后立即开始</option><option value="scheduled">定时开始</option></select></div><div><div class="f-lab">开始时间</div><input class="ctl" id="taskStartTime" type="datetime-local" value="2026-09-12T05:00" disabled></div><div class="task-interval-field"><div class="f-lab">查询间隔</div><div class="task-interval-presets" id="taskIntervalPresets"><button class="task-interval-preset" type="button" data-min="0.5" data-max="1">快速 0.5–1s</button><button class="task-interval-preset on" type="button" data-min="1" data-max="1">均衡 1s</button><button class="task-interval-preset" type="button" data-min="1" data-max="2">稳健 1–2s</button><button class="task-interval-preset" type="button" data-custom="true">自定义</button></div><div class="task-interval-custom" id="taskIntervalCustom"><div><div class="f-lab">最小间隔（秒）</div><input class="ctl" id="taskIntervalMin" type="number" min="0.5" step="0.1" value="1"></div><div><div class="f-lab">最大间隔（秒）</div><input class="ctl" id="taskIntervalMax" type="number" min="0.5" step="0.1" value="1"></div></div></div><div><div class="f-lab">命中策略</div><select class="ctl" id="taskHitPolicy"><option>命中任一席别立即提交</option><option>等待最高优先级席别</option></select></div><div><div class="f-lab">余票不足</div><select class="ctl" id="taskMemberPolicy"><option>必须满足全部乘客</option><option>允许部分乘客先提交</option></select></div><div><div class="f-lab">候补购票</div><div class="task-standby-option"><span><b>支持候补</b><small>无票时自动尝试候补下单</small></span><label class="tgl"><input id="taskStandby" type="checkbox" checked><i></i></label></div></div></div></div></div></div>
             </div>
-            <aside class="summary"><div class="card"><div class="sh"><h3>任务摘要</h3><div class="sub">随当前选择实时更新</div></div><div class="sum-rows"><div class="r"><span class="k">车次 / 席别</span><span class="v" id="taskSummaryTrains">未选择</span></div><div class="r"><span class="k">账号</span><span class="v" id="taskSummaryAccount">138****6688</span></div><div class="r"><span class="k">乘客</span><span class="v" id="taskSummaryPassengers">卓文颢</span></div><div class="r"><span class="k">开始时间</span><span class="v" id="taskSummaryStart">创建后立即开始</span></div><div class="r"><span class="k">查询间隔</span><span class="v" id="taskSummaryInterval">1 秒</span></div><div class="r"><span class="k">命中策略</span><span class="v" id="taskSummaryHitPolicy">命中任一席别立即提交</span></div><div class="r"><span class="k">余票不足</span><span class="v" id="taskSummaryMemberPolicy">必须满足全部乘客</span></div><div class="r"><span class="k">候补购票</span><span class="v" id="taskSummaryStandby">支持候补</span></div><div class="r task-total"><span class="k">订单总金额</span><span class="v" id="taskSummaryTotal">¥0</span></div></div><div class="sum-foot"><button class="btn btn-primary" id="taskFlowNext" type="button">创建任务</button></div></div></aside>
+            <aside class="summary"><div class="card"><div class="sh"><h3>任务摘要</h3><div class="sub">随当前选择实时更新</div></div><div class="sum-rows"><div class="r"><span class="k">车次 / 席别</span><span class="v" id="taskSummaryTrains">未选择</span></div><div class="r"><span class="k">账号</span><span class="v" id="taskSummaryAccount">138****6688</span></div><div class="r"><span class="k">乘客</span><span class="v" id="taskSummaryPassengers">张三</span></div><div class="r"><span class="k">开始时间</span><span class="v" id="taskSummaryStart">创建后立即开始</span></div><div class="r"><span class="k">查询间隔</span><span class="v" id="taskSummaryInterval">1 秒</span></div><div class="r"><span class="k">命中策略</span><span class="v" id="taskSummaryHitPolicy">命中任一席别立即提交</span></div><div class="r"><span class="k">余票不足</span><span class="v" id="taskSummaryMemberPolicy">必须满足全部乘客</span></div><div class="r"><span class="k">候补购票</span><span class="v" id="taskSummaryStandby">支持候补</span></div><div class="r task-total"><span class="k">订单总金额</span><span class="v" id="taskSummaryTotal">¥0</span></div></div><div class="sum-foot"><button class="btn btn-primary" id="taskFlowNext" type="button">创建任务</button></div></div></aside>
           </div>
         </div>
 
@@ -1064,7 +1064,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
                   <div class="f-col">
                     <div class="f-lab">乘车人 <span class="opt-x">已选 2 人</span></div>
                     <div class="chips">
-                      <label class="opt"><input type="checkbox" checked><span class="ck"></span>卓文颢 · 成人</label>
+                      <label class="opt"><input type="checkbox" checked><span class="ck"></span>张三 · 成人</label>
                       <label class="opt"><input type="checkbox" checked><span class="ck"></span>王五 · 成人 <b style="font-size:11px;color:var(--faint)">学生票</b></label>
                       <label class="opt"><input type="checkbox"><span class="ck"></span>王小明 · 儿童</label>
                     </div>
@@ -1145,7 +1145,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
                 <div class="r"><span class="k">账号</span><span class="v">138****6688<small>在线 · 会话有效</small></span></div>
                 <div class="r"><span class="k">日期</span><span class="v">09-12、09-13<small>共 2 天 · 均已开售</small></span></div>
                 <div class="r"><span class="k">区间</span><span class="v">北京→深圳 · 北京→广州<small>2 组区间并行查询</small></span></div>
-                <div class="r"><span class="k">乘客</span><span class="v">卓文颢、王五<small>2 人 · 含学生票 1 张</small></span></div>
+                <div class="r"><span class="k">乘客</span><span class="v">张三、王五<small>2 人 · 含学生票 1 张</small></span></div>
                 <div class="r"><span class="k">席别</span><span class="v">硬卧 → 硬座<small>无票时按序降级</small></span></div>
                 <div class="r"><span class="k">车次</span><span class="v">K356 / K1172 / K4184<small>仅限列表内车次</small></span></div>
                 <div class="r"><span class="k">策略</span><span class="v">00:00–24:00 · 间隔 1s<small>命中即提交下单</small></span></div>
@@ -1166,9 +1166,9 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
           <div class="order-layout">
             <div>
               <div class="form-sec"><div class="fh"><span class="no">1</span><h3>确认车次与席别</h3><span class="sub">可同时提交多个车次方案</span></div><div class="fb"><div class="task-selection-list" id="orderSelectionList"></div></div></div>
-              <div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3><span class="sub">乘客需已通过 12306 核验</span></div><div class="fb"><div class="frow"><div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="orderAccount"><option>138****6688（在线 · 3 位乘客）</option><option>wangwu（在线 · 2 位乘客）</option></select></div><div class="f-col"><div class="f-lab">联系人手机号</div><input class="ctl" id="orderPhone" value="138****6688"></div></div><div class="f-lab" style="margin-top:14px">乘车人</div><div class="order-people" id="orderPassengers"><label class="order-person"><input type="checkbox" value="卓文颢" checked><span><b>卓文颢 · 成人票</b><small>身份证 44***********1234</small></span></label><label class="order-person"><input type="checkbox" value="王五"><span><b>王五 · 成人票</b><small>身份证 43***********5678</small></span></label></div></div></div>
+              <div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3><span class="sub">乘客需已通过 12306 核验</span></div><div class="fb"><div class="frow"><div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="orderAccount"><option>138****6688（在线 · 3 位乘客）</option><option>wangwu（在线 · 2 位乘客）</option></select></div><div class="f-col"><div class="f-lab">联系人手机号</div><input class="ctl" id="orderPhone" value="138****6688"></div></div><div class="f-lab" style="margin-top:14px">乘车人</div><div class="order-people" id="orderPassengers"><label class="order-person"><input type="checkbox" value="张三" checked><span><b>张三 · 成人票</b><small>身份证 44***********1234</small></span></label><label class="order-person"><input type="checkbox" value="王五"><span><b>王五 · 成人票</b><small>身份证 43***********5678</small></span></label></div></div></div>
             </div>
-            <aside class="summary order-summary"><div class="card"><div class="sh"><h3>订单摘要</h3><div class="sub">随当前选择实时更新</div></div><div class="sum-rows"><div class="r"><span class="k">车次 / 席别</span><span class="v" id="orderSummaryTrains">未选择</span></div><div class="r"><span class="k">账号</span><span class="v" id="orderSummaryAccount">138****6688</span></div><div class="r"><span class="k">乘客</span><span class="v" id="orderSummaryPassengers">卓文颢</span></div><div class="r task-total"><span class="k">应付金额</span><span class="v" id="orderSummaryPrice">¥0</span></div></div><div class="sum-foot"><button class="btn btn-primary" id="submitOrder" type="button">提交订单</button><div class="order-notice">实际出票结果与金额以 12306 返回为准。</div></div></div></aside>
+            <aside class="summary order-summary"><div class="card"><div class="sh"><h3>订单摘要</h3><div class="sub">随当前选择实时更新</div></div><div class="sum-rows"><div class="r"><span class="k">车次 / 席别</span><span class="v" id="orderSummaryTrains">未选择</span></div><div class="r"><span class="k">账号</span><span class="v" id="orderSummaryAccount">138****6688</span></div><div class="r"><span class="k">乘客</span><span class="v" id="orderSummaryPassengers">张三</span></div><div class="r task-total"><span class="k">应付金额</span><span class="v" id="orderSummaryPrice">¥0</span></div></div><div class="sum-foot"><button class="btn btn-primary" id="submitOrder" type="button">提交订单</button><div class="order-notice">实际出票结果与金额以 12306 返回为准。</div></div></div></aside>
           </div>
         </div>
       </section>
@@ -1374,7 +1374,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
                   <td class="cell-user"><span class="auth a1">颢</span><span><b>138****6688</b><small>key: 0</small></span></td>
                   <td><span class="tag info">扫码登录</span></td>
                   <td><span class="tag ok"><span class="d"></span>在线</span></td>
-                  <td class="chip-row"><span class="tag muted">卓文颢·成人</span><span class="tag muted">王五·学生</span><span class="tag muted">王小明·儿童</span></td>
+                  <td class="chip-row"><span class="tag muted">张三·成人</span><span class="tag muted">王五·学生</span><span class="tag muted">王小明·儿童</span></td>
                   <td class="mono">09:40:58</td>
                   <td style="text-align:right" class="chip-row" style="justify-content:flex-end">
                     <button class="btn btn-outline btn-sm">重新扫码</button>

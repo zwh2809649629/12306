@@ -246,11 +246,33 @@ var pollTimers = {};
 function stopAllPolling() { Object.keys(pollTimers).forEach(function (k) { clearInterval(pollTimers[k]); }); pollTimers = {}; }
 function startPolling() {
   stopAllPolling();
-  if (currentView() === 'dashboard') pollTimers.dash = setInterval(loadDashboard, 3000);
-  if (currentView() === 'logs' && !logPaused) pollTimers.log = setInterval(loadLogs, 6000);
+  var v = currentView();
+  if (v === 'dashboard') pollTimers.dash = setInterval(loadDashboard, 3000);
+  if (v === 'logs' && !logPaused) pollTimers.log = setInterval(loadLogs, 6000);
+  // 任务列表/详情：引擎会主动结束任务（下单成功、乘客校验失败）、账号会掉线，
+  // 状态必须自己刷新，否则页面会一直停在进入时的旧结论上
+  if (v === 'jobs') pollTimers.jobs = setInterval(loadJobs, 5000);
+  // 新建任务页与账号管理页都要实时反映账号登录状态：
+  // 否则登出后仍显示「在线」（建任务会卡在 wait_for_ready 且无提示），
+  // 反过来登录成功后也必须马上变「在线 · 已就绪」，不该等手动刷新。
+  if (v === 'new') pollTimers.ntacc = setInterval(loadAccountsForNew, 5000);
+  if (v === 'accounts') pollTimers.acc = setInterval(loadAccounts, 5000);
 }
-
-/* ---------- 视图路由 ---------- */
+// 任务状态：单一事实来源（后端 _job_status 产出这些值）
+var JOB_STATUS = {
+  running:   { text: '运行中',     cls: 'ok',    dot: true },
+  paused:    { text: '已暂停',     cls: 'muted' },
+  pending:   { text: '待启动',     cls: 'warn' },
+  blocked:   { text: '账号未登录', cls: 'warn' },
+  completed: { text: '已完成',     cls: 'ok' },
+  finished:  { text: '已结束',     cls: 'muted' }
+};
+function jobStatusTag(st) {
+  var s = JOB_STATUS[st] || { text: st || '未知', cls: 'muted' };
+  return '<span class="tag ' + s.cls + '">' + (s.dot ? '<span class="d"></span>' : '') + esc(s.text) + '</span>';
+}
+// 任务已结束的任务不再可操作（引擎已销毁实例）；重新启用由用户点 ▶ 触发
+function jobDone(st) { return st === 'completed' || st === 'finished'; }
 var TITLES = { dashboard: '总览', jobs: '抢票任务', 'new': '新建抢票任务', detail: '任务详情', monitor: '车票查询', order: '确认订单', accounts: '12306 账号', logs: '运行日志', settings: '系统设置' };
 function currentView() {
   var v = document.querySelector('.view.is-active');
@@ -315,13 +337,12 @@ function loadDashboard() {
       '<div class="stat"><div class="ic ok">' + ICONS.acc + '</div><div><div class="v">' + s.accounts_total + '</div><div class="k">12306 账号</div><div class="t" style="color:var(--ok)">' + s.accounts_online + ' 个在线</div></div></div>';
 
     // 任务表
-    var stTag = { running: '<span class="tag ok"><span class="d"></span>运行中</span>', paused: '<span class="tag muted">已暂停</span>', stopped: '<span class="tag warn">待启动</span>' };
     $('dashJobs').innerHTML = d.jobs.length ? d.jobs.map(function (j) {
       var route = (j.stations || []).map(function (p) { return p.left + ' → ' + p.arrive; }).join('、') || '—';
       var seats = (j.seats || []).join(' / ') || '—';
       var dates = (j.left_dates || []).map(shortDate).join('、') || '—';
       var last = j.last_hit_at ? esc(String(j.last_hit_at).slice(5, 16)) + ' 命中' : '暂无记录';
-      return '<tr style="cursor:pointer" data-job="' + j.job_id + '"><td><b>' + esc(j.job_name || '未命名') + '</b></td><td>' + esc(route) + '</td><td>' + esc(dates) + '</td><td>' + esc(seats) + '</td><td>' + stTag[j.status] + '</td><td style="color:var(--sub)">' + last + '</td></tr>';
+      return '<tr style="cursor:pointer" data-job="' + j.job_id + '"><td><b>' + esc(j.job_name || '未命名') + '</b></td><td>' + esc(route) + '</td><td>' + esc(dates) + '</td><td>' + esc(seats) + '</td><td>' + jobStatusTag(j.status) + '</td><td style="color:var(--sub)">' + last + '</td></tr>';
     }).join('') : '<tr><td colspan="6" style="color:var(--faint)">暂无任务，点左侧「新建任务」开始</td></tr>';
     $('dashJobs').querySelectorAll('tr[data-job]').forEach(function (tr) {
       tr.addEventListener('click', function () { go('detail', { job_id: tr.dataset.job }); });
@@ -347,6 +368,12 @@ function clip(s) {
   s = String(s).replace(/^[\d\-\s:]+/, '');
   return s.length > 46 ? s.slice(0, 46) + '…' : s;
 }
+// 列表型标签（车次 / 乘客）：超过 5 项就截断成「前5 等 N 项」
+function clipList(arr, max) {
+  var a = (arr || []).map(function (x) { return String(x); });
+  var n = max || 5;
+  return a.length > n ? a.slice(0, n).join('、') + ' 等 ' + a.length + ' 项' : a.join('、');
+}
 
 /* ---------- 2. 任务列表 ---------- */
 function loadJobs() {
@@ -363,23 +390,51 @@ function loadJobs() {
     jobs.forEach(function (j) { JOB_INDEX[j.job_id] = j; });
     $('jobsList').innerHTML = jobs.map(function (j) {
       var routes = (j.stations || []).map(function (p) { return esc(p.left) + ' <b style="color:var(--red);margin:0 6px">→</b> ' + esc(p.arrive); });
-      var stTag = j.status === 'running' ? '<span class="tag ok"><span class="d"></span>运行中</span>' : j.status === 'paused' ? '<span class="tag muted">已暂停</span>' : '<span class="tag warn">待启动</span>';
+      var stTag = jobStatusTag(j.status);
+      // 卡片要能直接看到「抢哪些车次」「谁坐」——只写「指定 N 车次」看不到具体车次，
+      // 也无法确认乘车人是否选对。车次多时做截断，避免卡片被撑成一长条。
+      var trains = j.train_numbers || [];
+      var trainTag = trains.length
+        ? '<span class="tag muted">车次：' + esc(clipList(trains)) + '</span>'
+        : (j.except_train_numbers && j.except_train_numbers.length
+          ? '<span class="tag muted">排除：' + esc(clipList(j.except_train_numbers)) + '</span>'
+          : '<span class="tag muted">不限车次</span>');
+      var members = (j.members || []).filter(Boolean);
+      var paxTag = members.length
+        ? '<span class="tag muted">乘客：' + esc(clipList(members)) + '</span>'
+        : '<span class="tag warn">未选乘客</span>';
       var tags = '<span class="tag info">' + esc((j.left_dates || []).map(shortDate).join(' / ') || '未设日期') + '</span>' +
         (j.seats || []).map(function (s) { return '<span class="tag hot">' + esc(s) + '</span>'; }).join('') +
-        (j.train_numbers && j.train_numbers.length ? '<span class="tag muted">指定 ' + j.train_numbers.length + ' 车次</span>' : '') +
-        (j.except_train_numbers && j.except_train_numbers.length ? '<span class="tag muted">排除 ' + j.except_train_numbers.length + ' 车次</span>' : '');
+        trainTag + paxTag;
       var hit = j.hit_count ? '<span class="hit">命中 ' + j.hit_count + ' 次</span>' : '尚未命中';
+      var done = jobDone(j.status);
+      // 状态提示：账号未登录 / 下单成功（待支付）/ 已结束原因
+      var hint = '';
+      if (j.status === 'blocked') {
+        // 账号未就绪 → 引擎会卡在 wait_for_ready()，一条查询也发不出去，必须明确提示
+        hint = '<div class="job-hint">账号<b>' + esc(j.account_name || j.account_key || '') + '</b>当前未登录，任务已中止。'
+          + '<button class="link-btn" type="button" data-act="goacc">去账号管理登录</button></div>';
+      } else if (j.status === 'completed') {
+        // 已生成订单 —— 时效性强（12306 要求 30 分钟内支付），置顶醒目展示
+        hint = '<div class="job-hint pay"><b>下单成功</b>' + esc(j.order_message || '订单已生成，请到 12306 核对')
+          + (j.order_train ? '（' + esc(j.order_train) + '）' : '') + '</div>';
+      } else if (done && j.finish_reason) {
+        hint = '<div class="job-hint done">' + esc(j.finish_reason)
+          + (j.finished_at ? '（' + esc(String(j.finished_at).slice(5, 16)) + '）' : '') + '</div>';
+      }
       // 右上角操作：开始/暂停 · 编辑 · 详情 · 删除（对齐设计稿）
       var acts = '<div class="acts">' +
-        '<button class="icon-btn" type="button" data-act="toggle" data-id="' + j.job_id + '" data-active="' + (j.is_active ? 1 : 0) + '" title="' + (j.is_active ? '暂停' : '开始') + '" aria-label="' + (j.is_active ? '暂停任务' : '开始任务') + '">' + (j.is_active ? ICONS.pause : ICONS.play) + '</button>' +
+        '<button class="icon-btn" type="button" data-act="toggle" data-id="' + j.job_id + '" data-active="' + ((j.is_active && !done) ? 1 : 0) + '" title="' + (done ? '重新开始' : (j.is_active ? '暂停' : '开始')) + '" aria-label="' + (done ? '重新开始任务' : (j.is_active ? '暂停任务' : '开始任务')) + '">' + ((j.is_active && !done) ? ICONS.pause : ICONS.play) + '</button>' +
         '<button class="icon-btn" type="button" data-act="edit" data-id="' + j.job_id + '" title="编辑" aria-label="编辑任务">' + ICONS.edit + '</button>' +
         '<button class="icon-btn" type="button" data-act="detail" data-id="' + j.job_id + '" title="查看详情" aria-label="查看任务详情">' + ICONS.eye + '</button>' +
         '<button class="icon-btn danger" type="button" data-act="del" data-id="' + j.job_id + '" title="删除" aria-label="删除任务">' + ICONS.trash + '</button>' +
         '</div>';
-      return '<div class="job' + (j.status !== 'running' ? ' paused' : '') + '">' +
-        '<div class="l1"><span class="route">' + routes.join('；') + '</span>' + stTag + acts + '</div>' +
+      return '<div class="job' + (j.status === 'running' ? '' : ' paused') + '">' +
+        '<div class="l1"><span class="jname">' + esc(j.job_name || '未命名任务') + '</span>' +
+          '<span class="route">' + routes.join('；') + '</span>' + stTag + acts + '</div>' +
+        hint +
         '<div class="l2">' + tags + '</div>' +
-        '<div class="l3"><span>' + hit + '</span><span>创建 ' + esc(j.created_at || '') + '</span><span>账号 ' + esc(j.account_key || '—') + '</span></div></div>';
+        '<div class="l3"><span>' + hit + '</span><span>创建 ' + esc(j.created_at || '') + '</span><span>账号 ' + esc(j.account_name || j.account_key || '—') + '</span></div></div>';
     }).join('');
     $('jobsList').querySelectorAll('button[data-act]').forEach(function (b) {
       var act = b.dataset.act, id = b.dataset.id;
@@ -389,6 +444,7 @@ function loadJobs() {
         else if (act === 'edit') jobEdit(id);
         else if (act === 'detail') go('detail', { job_id: id });
         else if (act === 'del') jobDelete(id);
+        else if (act === 'goacc') go('accounts');
       });
     });
   }).catch(function (e) { toast(e.message, 'err'); });
@@ -407,13 +463,41 @@ document.addEventListener('click', function (e) {
 function loadDetail(job_id) {
   api('/api/jobs/' + encodeURIComponent(job_id)).then(function (j) {
     $('dName').textContent = j.job_name || '任务详情';
-    var stTag = j.status === 'running' ? '<span class="tag ok"><span class="d"></span>运行中</span>' : '<span class="tag muted">已暂停</span>';
-    $('dMeta').innerHTML = stTag + ' <span class="tag muted">创建 ' + esc(j.created_at || '—') + '</span> <span class="tag muted">账号 ' + esc(j.account && j.account.user_name || '—') + '</span>';
+    $('dMeta').innerHTML = jobStatusTag(j.status)
+      + ' <span class="tag muted">创建 ' + esc(j.created_at || '—') + '</span>'
+      + ' <span class="tag ' + (j.account_ready ? 'muted' : 'warn') + '">账号 '
+      + esc(j.account_name || (j.account && j.account.user_name) || '—')
+      + (j.account_ready ? '' : ' · 未登录') + '</span>';
     if ($('dEdit')) $('dEdit').onclick = function () { jobEdit(job_id); };
-    $('dToggle').textContent = j.is_active ? '暂停任务' : '启动任务';
+    // 已结束/已完成的任务要能重新开始（后端在 is_active=true 时会清掉结束标记）
+    var dDone = jobDone(j.status);
+    $('dToggle').textContent = dDone ? '重新开始' : (j.is_active ? '暂停任务' : '启动任务');
     $('dToggle').onclick = function () {
-      jobToggle(job_id, !j.is_active, this, function () { loadDetail(job_id); });
+      jobToggle(job_id, dDone ? true : !j.is_active, this, function () { loadDetail(job_id); });
     };
+    // 账号未登录 / 下单成功 / 任务已结束：在标题下方给出可行动的说明
+    if ($('dHint')) {
+      if (j.status === 'completed') {
+        // 已生成订单：时效性强（12306 要求 30 分钟内支付），优先展示
+        $('dHint').className = 'detail-hint pay';
+        $('dHint').innerHTML = '<b>下单成功</b>' + esc(j.order_message || '订单已生成，请到 12306 核对')
+          + (j.order_train ? '（' + esc(j.order_train) + '）' : '')
+          + (j.order_at ? '<span class="dh-t">' + esc(String(j.order_at).slice(5, 16)) + '</span>' : '');
+      } else if (j.status === 'blocked') {
+        $('dHint').className = 'detail-hint warn';
+        $('dHint').innerHTML = '账号<b>' + esc(j.account_name || j.account_key || '')
+          + '</b>当前未登录，任务已中止、不会发起任何查询。'
+          + '<button class="link-btn" type="button" id="dGoAcc">去账号管理登录</button>';
+        if ($('dGoAcc')) $('dGoAcc').onclick = function () { go('accounts'); };
+      } else if (dDone) {
+        $('dHint').className = 'detail-hint done';
+        $('dHint').innerHTML = esc(j.finish_reason || '任务已结束')
+          + (j.finished_at ? '（' + esc(String(j.finished_at).slice(5, 16)) + '）' : '');
+      } else {
+        $('dHint').className = 'detail-hint';
+        $('dHint').innerHTML = '';
+      }
+    }
     // 行程信息
     var routes = (j.stations || []).map(function (p) { return esc(p.left) + ' → ' + esc(p.arrive); });
     // 优先级结构由 job.seat_tiers 持久化（引擎不读，纯展示）；
@@ -618,36 +702,96 @@ function loadAccountsForNew() {
     var list = (d.accounts || []).slice().sort(function (a, b) {
       return (b.is_ready ? 1 : 0) - (a.is_ready ? 1 : 0);
     });
+    // 账号就绪表：创建任务前用它校验（避免选中一个已掉线的账号）
+    APP.accReady = {};
+    list.forEach(function (a) { APP.accReady[a.key] = !!a.is_ready; });
     var opts = '<option value="">（需先添加并登录账号）</option>' + list.map(function (a) {
       return '<option value="' + a.key + '" ' + (!a.is_ready ? 'disabled' : '') + '>' + esc(a.user_name) + (a.is_ready ? '（在线 · ' + a.passenger_count + ' 位乘客）' : '（离线，未就绪）') + '</option>';
     }).join('');
-    $('ntAccount').innerHTML = opts;
-    $('oAccount').innerHTML = opts;
+    // ⚠️ 重建 innerHTML 会把 selectedIndex 重置到第 0 项（= 空选项），
+    // 而本函数现在会被轮询反复调用 → 必须先记住当前选择，重建后再恢复，
+    // 否则用户选好的账号每 5 秒被清一次。
+    var ntSel = $('ntAccount'), oSel = $('oAccount');
+    var ntPrev = ntSel.value, oPrev = oSel.value;
+    ntSel.innerHTML = opts;
+    oSel.innerHTML = opts;
+    if (ntPrev && APP.accReady[ntPrev]) ntSel.value = ntPrev;
+    if (oPrev && APP.accReady[oPrev]) oSel.value = oPrev;
+    // ⚠️ 必须在恢复之后用 **重建前的选择** 判断是否掉线：
+    // 上面「仍在线才恢复」的写法会让掉线账号的 value 静默变回 ''，
+    // 于是后面 `if (cur && !ready[cur])` 永不成立 → 乘车人一直留着旧账号的人
+    // （用户报的「账号离线后乘车人还是旧的那批」）。
+    var dropped = (ntPrev && !APP.accReady[ntPrev]) ? ntPrev : '';
     // 编辑态：账号列表可能比 applyJobToForm 晚到，这里补选任务原账号
     if (APP.pendingAccount) {
-      $('ntAccount').value = APP.pendingAccount;
+      var want = APP.pendingAccount;
       APP.pendingAccount = null;
-      loadPassengersFor($('ntAccount').value);
-      return;
+      if (APP.accReady[want]) {
+        ntSel.value = want;
+        loadPassengersFor(want);
+        return;
+      }
+      // 任务原账号已掉线：不选中（它是 disabled 项），并本轮直接走掉线分支
+      dropped = dropped || want;
     }
-    // 默认选中第一个在线账号，减少手动步骤
-    if (!$('ntAccount').value) {
-      var first = Array.prototype.find.call($('ntAccount').options, function (o) { return o.value && !o.disabled; });
-      if (first) { $('ntAccount').value = first.value; loadPassengersFor(first.value); }
+    // 冷启动默认选中第一个在线账号，减少手动步骤（只做一次，之后尊重用户选择）
+    if (!APP.accInit) {
+      APP.accInit = 1;
+      var first = Array.prototype.find.call(ntSel.options, function (o) { return o.value && !o.disabled; });
+      if (first) { ntSel.value = first.value; loadPassengersFor(first.value); return; }
+    }
+    // 选中的账号已掉线（或本就选中一个掉线账号）→ 必须清空账号与乘车人。
+    // 不清空的话：提交时会带一个不可用账号，任务建好后卡在引擎的
+    // wait_for_ready()，界面毫无提示（用户报的「卡住」）。
+    var lost = dropped || (function () {
+      var c = ntSel.value;
+      return (c && !APP.accReady[c]) ? c : '';
+    })();
+    if (lost) {
+      var hit = list.filter(function (a) { return a.key === lost; })[0] || {};
+      ntSel.value = '';
+      clearNtPassengers('账号未登录');
+      if (APP.accWarned !== lost) {
+        APP.accWarned = lost;
+        toast('账号「' + (hit.user_name || lost) + '」当前未登录，已取消选择；请到「账号管理」重新登录', 'err', 5000);
+      }
+    } else if (APP.accWarned && (!ntSel.value || APP.accReady[ntSel.value])) {
+      APP.accWarned = null;   // 恢复在线后允许下次再提醒
     }
   }).catch(function () { });
 }
+// 清空乘车人（账号不可用时必须走这里，避免残留上一个账号的人）
+function clearNtPassengers(reason) {
+  APP.paxAll = []; APP.paxSel = [];
+  var box = $('ntPassengers');
+  if (box) {
+    box.innerHTML = '<span style="color:var(--faint);font-size:12.5px">'
+      + (reason ? esc(reason) + '，乘车人不可用' : '请先在上方选择账号') + '</span>';
+  }
+  if ($('ntPaxHint')) $('ntPaxHint').textContent = reason || '需选择账号后加载';
+  updateNtSummary();
+}
 function loadPassengersFor(key) {
   if (!key) {
-    $('ntPassengers').innerHTML = '<span style="color:var(--faint);font-size:12.5px">请先在上方选择账号</span>';
-    $('ntPaxHint').textContent = '需选择账号后加载';
-    APP.paxAll = []; APP.paxSel = [];
+    clearNtPassengers('');
+    return;
+  }
+  // ⚠️ 账号未就绪时不该展示乘车人：引擎此时取不到乘客，界面却列着一批人，
+  // 用户会以为可选（然后建出的任务卡在 wait_for_ready）。
+  // 在这里统一兜住，比在每个调用点判更可靠 —— 轮询/编辑回填/默认选中都会经过它。
+  if (APP.accReady && APP.accReady[key] === false) {
+    clearNtPassengers('账号未登录');
     return;
   }
   APP.paxAll = []; APP.paxSel = [];
   $('ntPassengers').innerHTML = '<span style="color:var(--faint);font-size:12.5px">加载中…</span>';
   $('ntPaxHint').textContent = '';
   api('/api/accounts/' + encodeURIComponent(key) + '/passengers').then(function (d) {
+    // 异步返回时账号可能已经掉线 → 结果作废，避免又把乘车人填回来
+    if (APP.accReady && APP.accReady[key] === false) {
+      clearNtPassengers('账号未登录');
+      return;
+    }
     APP.paxAll = d.passengers || [];
     if (!APP.paxAll.length) { $('ntPassengers').innerHTML = '<span style="color:var(--faint);font-size:12.5px">该账号暂无乘客</span>'; updateNtSummary(); return; }
     // 编辑态：优先用任务里已保存的乘车人，而不是默认全选
@@ -2141,6 +2285,8 @@ function clearJobEdit() {
   APP.editJobId = null;
   APP.pendingAccount = null;
   APP.pendingPax = null;
+  // 任务名回到空：否则新建任务会沿用上一个任务的名字（用户报的「默认使用上一个名称」）
+  if ($('ntName')) $('ntName').value = '';
   setEditMode(false);
 }
 function cancelJobEdit() {
@@ -2202,6 +2348,11 @@ function createNewTask(btn) {
   var f = collectNtForm();
   // 校验前移：与后端校验保持一致，尽早给出可读提示
   if (!f.account_key) { toast('请选择使用账号（未在线的账号需先到「账号管理」完成登录）', 'err', 4000); return; }
+  // 账号未就绪时任务会卡在引擎 wait_for_ready()，一条查询也发不出去 → 提前拦住
+  if (APP.accReady && APP.accReady[f.account_key] === false) {
+    toast('所选账号当前未登录，创建后任务不会查询。请先到「账号管理」完成登录', 'err', 5000);
+    return;
+  }
   if (!f.stations.length) { toast(train ? '车次缺少出发 / 到达站信息，请重新添加' : '请至少填写一组出发 / 到达', 'err'); return; }
   if (!f.left_dates.length) {
     toast(train ? '该车次缺少乘车日期：请到车票查询选中日期后再「添加到任务」' : '请至少选择一个出行日期', 'err', 4000);
@@ -2503,7 +2654,7 @@ function wireStatic() {
     a.addEventListener('click', function (e) {
       e.preventDefault();
       var v = a.dataset.view;
-      if (v === 'new') { prefillNewFromMonitor(); }
+      if (v === 'new') { prefillNewFromMonitor(); resetNtTaskName(); }
       go(v);
     });
   });
@@ -2698,6 +2849,15 @@ function saveSettings() {
 }
 function prefillNewFromMonitor() {
   // 若监控页选了车次，则进入 new 时保留现有表单
+}
+// 用户**显式**点「新建任务」时把任务名重置为空。
+// 否则会沿用上一次输入（甚至上一个任务的名字）——用户很容易把新任务建在旧名字下。
+// ⚠️ 只在导航入口调用：从车票查询「添加到任务/取消」返回的是「继续编辑同一个草稿」，
+//    那时候清空会把用户刚填好的名字抹掉。
+function resetNtTaskName() {
+  if (APP.editJobId) return;            // 编辑态保留回填的名称
+  var n = $('ntName');
+  if (n) n.value = '';
 }
 
 /* ---------- init ---------- */

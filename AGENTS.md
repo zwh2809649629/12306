@@ -39,7 +39,7 @@ D:\Anaconda\envs\12306\python.exe -m pip install -i https://pypi.tuna.tsinghua.e
 
 ### 启动 / 停止
 ```powershell
-# 启动（推荐：VS Code 集成终端；不弹外部窗口）
+# 启动（完整后台：Cdn / User / Query + 管理台）
 D:\Anaconda\envs\12306\python.exe main_web.py
 
 # 仅起管理台、不跑抢票任务（测试用）
@@ -48,13 +48,15 @@ D:\Anaconda\envs\12306\python.exe main_web.py -t
 # 健康检查（不依赖浏览器）
 curl -s -m 8 -o nul -w "%{http_code}" http://127.0.0.1:8600/api/boot   # 期望 200
 ```
-**启动方式约定（用户明确要求）**：
-- ✅ 跑在 **VS Code 集成终端**里（终端面板收起即"隐藏"，不弹外部窗口）。
-- ❌ 不要用 `cmd /c start "" /min python.exe main_web.py` —— **会弹一个控制台窗口**。
-- ❌ 不要用 `pythonw.exe`（虽然无窗口，但用户也不想要）。
-  `main_web.py` 里留了 `_ensure_streams()` 作为安全网：`pythonw` 下 `sys.stdout/stderr` 是 `None`，
-  werkzeug / click / 原版 `print` 会抛异常；该函数把为 `None` 的流重定向到 `runtime/console.log`
-  （**刻意不写进 `webx.log`**，否则每秒轮询的访问日志会淹没引擎日志）。终端模式下不触发。
+
+停止：按端口找 PID 后 `taskkill /PID <pid> /F`（**别用进程名盲杀**，`python.exe` 里可能混着
+编辑器/语言服务的进程，见下）。重启后务必确认没有两个实例并存。
+
+> `main_web.py` 的 `_ensure_streams()` 是给「无控制台解释器」（如 `pythonw.exe`，此时
+> `sys.stdout/stderr` 为 `None`）准备的兜底：werkzeug / click / 原版 `print` 都会写这两个流，
+> 为 `None` 时会抛异常。该函数把为 `None` 的流重定向到 `runtime/console.log`
+> （**刻意不写进 `webx.log`**，否则每秒轮询的访问日志会淹没引擎日志）。用 `python.exe`
+> 启动时不触发，属安全网。
 
 ### ⚠️ 重启时务必确认没有两个实例并存
 `wmic process where "..." get ProcessId /value | findstr ProcessId` 在 cmd 里**经常静默失败**
@@ -68,8 +70,9 @@ netstat -ano | Select-String ':8600' | Select-String 'LISTENING'
 taskkill /PID <pid> /F
 # 3) 确认端口已释放
 netstat -ano | Select-String ':8600' | Select-String 'LISTENING'
-# 4) 核对没有多余实例（可只留着 pythonw；python.exe 那个可能是别的工具）
-Get-Process python*,pythonw* | Select-Object Id, ProcessName, MainWindowTitle
+# 4) 核对没有多余实例（python.exe 里可能混着编辑器/语言服务，别按名字盲杀）
+Get-Process python*,pythonw* -ErrorAction SilentlyContinue |
+  Select-Object Id, ProcessName, StartTime
 ```
 ⚠️ `python.exe` 里可能混着 **ms-python.isort 的 LSP**（`lsp_server.py`），与本项目无关，**别误杀**。
 
@@ -189,12 +192,12 @@ def _hook_something():
 ```
 约定：标记 `_webx_wrapped` / `_webx_original`；`install()` 幂等；回调内 `try/except` 兜底。
 
-### 当前已装的 9 个钩子（`engine_hooks.install()`）
+### 当前已装的 11 个钩子（`engine_hooks.install()`）
 
 | 钩子 | 目的 |
 |---|---|
 | `Request.request` → 挂 `Request.json` | **最关键**：修复 `response.json()` 不返回 `Dict`（§5.2） |
-| `Job.do_order` | 余票命中落库 → `hit_log` + `order_log(submitted)` |
+| `Job.do_order` | 余票命中落库 + 按账号串行下单、失败退避 |
 | `Order.order_did_success` | 下单成功 → `order_log(success)` + 停用 `[即时]` 任务 |
 | `UserJob.save_user` | **空会话落盘守卫**（§5.3） |
 | `Query/UserJob.request_device_id(_2)` | 防无界递归（§5.4） |
@@ -202,6 +205,8 @@ def _hook_something():
 | `UserJob.get_user_info` | 登录态确认改用「能拉到乘客」判定（§5.1） |
 | `UserJob.get_user_passengers` | 顾客原始字段 + 防递归 |
 | `UserJob.can_access_passengers` | 就绪探针走 webx 策略 |
+| `Query.start/update_query_jobs` | 零任务启动后，启用任务自动重启查询循环 |
+| `Request/UserJob/Order` 下单状态机 | 诚实阶段日志、initDc 保护、防重和失败落库（§5.18） |
 
 ---
 
@@ -252,7 +257,7 @@ type(r.json()) == <class 'dict'>            # 普通 dict → 点号 key 查不�
 而引擎里一堆失败路径都会走到它（`check_user_is_login` / `get_user_info` /
 `User.refresh_users → init_data()` 把 session 换成**空的新 Request** 之后）
 → 刚登录成功的会话文件被覆盖成空 jar → 账号彻底掉线。
-（实测 `卓文颢.cookie` 被反复写成 0 字节 / 0 个 cookie。）
+（实测：该账号的 cookie 文件被反复写成 0 字节 / 0 个 cookie。）
 
 **修法**：hook `UserJob.save_user` —— **空会话绝不落盘**，并把调用点（文件:行）打进日志。
 验证：空 session 调 `save_user()` 不覆盖、有 session 时正常写入。
@@ -428,6 +433,36 @@ if self.allow_train_numbers: return self.get_info_of_train_number() in ...   # �
 - `go('monitor')` 会 `MON.batch = false`。所以「点座次」在**离开再进入**监控页后会失效
   （`inBatchUI()` 为 false → 不写 `MON.sel`/`selBy`）。测试时注意，否则会误判成逻辑 bug。
 
+### 5.18 「下单请求已受理」不等于生成订单
+
+原版 `submitOrderRequest` 只要返回 `data='0'` 就打「提交订单成功」，但后面仍需
+`initDc 令牌 → checkOrderInfo → getQueueCount → confirmSingleForQueue → 订单号`。
+旧实现在 `initDc` 302/缺 token 时静默返回，导致日志看似成功、App 却无订单，
+并且每轮查询都重复提交。
+
+当前修法在 `engine_hooks._hook_order_flow_guard()`：
+- 仍使用原生 `requests_html` 会话，为下单端点补齐 Referer / Origin / Accept。
+- `initDc` 禁止自动跟随 302，防止跳登录页损坏会话；失败明确打状态/跳转目标。
+- 按当前协议处理 `ticketInfoForPassengerForm`；`getQueueCount.data.ticket` 是下一步
+  `leftTicketStr` 凭据，**不是余票数量**，不得拆逗号后判无票。
+- 无座编码：G/D/C 使用 `O`，普速使用 `1`；排队日期使用「中国标准时间」格式。
+- 同账号下单串行化；失败退避 30s，退避日志限频。
+- `order_log` 状态为 `queued → submitted → success/failed/unknown`；**只有取得订单号才算 success**。
+- `confirmSingleForQueue` 成功后若无法确认订单号，停止任务并标记 `unknown`，
+  要求到 12306 官方订单页核对，不得自动重复下单。
+- **不引入 Playwright / 无头浏览器等额外依赖**：协议修正后的原 `requests_html` 会话是唯一下单主路径。
+
+### 5.19 服务以 0 个任务启动后，新建任务不查询
+
+`Query.start()` 在 `self.jobs` 为空时会直接 `break` 返回（单线程模式）。
+服务启动时没有任务 → 循环退出；之后网页新建任务只调 `Query.update_query_jobs()`，
+又因为 `QUERY_JOB_THREAD_ENABLED = 0` 不会建线程 → **新 Job 进了内存但永远不发查询**。
+
+修法：`engine_hooks._hook_query_loop()` 同时包装 `Query.start` / `update_query_jobs`
+——用锁与运行标记保证同一时刻只有一个查询循环；任务变更后若存在可运行 Job
+且循环已退出，则以 daemon 线程重启 `start()`；刷新前先摘掉已 `destroy` 的 Job，
+使「暂停后再启用」能重建实例。
+
 ---
 
 ## 6. 前端（`static/`）协作要点
@@ -498,7 +533,7 @@ var SEAT_ORDER = ['商务座','一等座','二等座','硬卧','软卧','硬座'
 job           抢票任务（含 seat_tiers 二维优先级、start_at、interval_min/max、is_active）
 account       12306 账号（key / user_name / password / type / login_ok / active）
 user_login    管理台账号（pbkdf2(salt, hash)，无明文）
-order_log     下单记录（queued → submitted → success / cancelled）
+order_log     下单记录（queued → submitted → success / failed / cancelled）
 hit_log       余票命中记录
 daily_query   按天查询次数（由守护线程每 30s 轮询 QueryLog 差值累加）
 kv            杂项（JWT secret 等）

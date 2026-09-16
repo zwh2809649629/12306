@@ -157,6 +157,11 @@
 .picked-note b{font-weight:800}
 .link-btn{padding:0;margin:0 2px;border:0;background:none;color:inherit;font:inherit;
   font-weight:800;text-decoration:underline;cursor:pointer}
+/* 任务详情页的提示条（账号未登录 / 任务已结束原因） */
+.detail-hint{display:none;margin-bottom:12px;padding:9px 13px;border-radius:9px;font-size:12.5px;line-height:1.7}
+.detail-hint.warn{display:block;background:var(--warn-bg);color:var(--warn)}
+.detail-hint.done{display:block;background:var(--line-soft);color:var(--sub)}
+.detail-hint b{font-weight:700}
 /* ===== 座次优先级：每级一张卡，与乘车日期同一套样式 =====
    改自原来的单列表（序号 + ↑↓ + ✕ 按钮）：按钮多、调整顺序需要多次点击，
    且与日期选择器风格割裂。现在顺序 = 1..n 级，每级内部多选、级内顺序保留。 */
@@ -345,6 +350,7 @@
             <button class="btn btn-outline" id="dEdit">编辑任务</button>
           </div>
         </div>
+        <div class="detail-hint" id="dHint"></div>
         <div class="detail-layout">
           <div class="detail-stack">
             <div class="card"><div class="card-h"><h3>行程信息</h3></div><div id="dFacts" class="detail-facts" style="padding:16px 18px"></div></div>

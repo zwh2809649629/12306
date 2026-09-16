@@ -130,6 +130,13 @@ class DataStore:
                 cur.execute('ALTER TABLE job ADD COLUMN start_at TEXT')
             if 'seat_tiers' not in cols:
                 cur.execute('ALTER TABLE job ADD COLUMN seat_tiers TEXT')
+            # 引擎会主动 destroy 任务（下单成功 / 订单状态待核实 / 乘客校验失败）。
+            # 不落库的话重启或任务被摘出内存后，页面只能显示「待启动」，
+            # 与实际的「已完成 / 已结束」不符。
+            if 'finished_at' not in cols:
+                cur.execute('ALTER TABLE job ADD COLUMN finished_at TEXT')
+            if 'finish_reason' not in cols:
+                cur.execute('ALTER TABLE job ADD COLUMN finish_reason TEXT')
             self.conn.commit()
 
     # ---------------- 通用 ----------------
@@ -183,6 +190,7 @@ class DataStore:
         allowed = ['job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                    'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
                    'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'is_active',
+                   'finished_at', 'finish_reason',
                    'updated_at']
         sets, vals = [], []
         for k in allowed:
@@ -201,8 +209,22 @@ class DataStore:
         self.execute('DELETE FROM job WHERE job_id=?', (job_id,))
 
     def job_toggle_active(self, job_id, active):
-        self.execute('UPDATE job SET is_active=?, updated_at=? WHERE job_id=?',
-                     (1 if active else 0, _now(), job_id))
+        # 重新启用时清掉「已结束」标记，否则任务会一直显示为已完成/已结束
+        if active:
+            self.execute('UPDATE job SET is_active=1, finished_at=NULL, finish_reason=NULL, '
+                         'updated_at=? WHERE job_id=?', (_now(), job_id))
+        else:
+            self.execute('UPDATE job SET is_active=0, updated_at=? WHERE job_id=?', (_now(), job_id))
+
+    def job_mark_finished(self, job_id, reason=''):
+        """引擎 destroy 任务时落库（job_id 为 None 时按无关联任务忽略）"""
+        if not job_id:
+            return
+        self.execute('UPDATE job SET finished_at=?, finish_reason=?, updated_at=? WHERE job_id=?',
+                     (_now(), str(reason or ''), _now(), job_id))
+
+    def job_clear_finished(self, job_id):
+        self.execute('UPDATE job SET finished_at=NULL, finish_reason=NULL WHERE job_id=?', (job_id,))
 
     def job_record_hit(self, job_id, train_number, seat, num, left_date):
         self.execute('UPDATE job SET last_hit_at=?, hit_count=hit_count+1 WHERE job_id=?',

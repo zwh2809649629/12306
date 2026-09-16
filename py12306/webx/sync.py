@@ -245,9 +245,24 @@ class ConfigSync:
     @classmethod
     def _jobs_from_db(cls):
         out = []
-        for job in DataStore().job_list():
+        db = DataStore()
+        done_ids = _success_job_ids(db)
+        for job in db.job_list():
             if not job.get('is_active'):
                 continue  # 暂停的任务从 QUERY_JOBS 摘除（destroy 既有 Job）
+            if job.get('job_id') in done_ids:
+                # 自愈：已出票的任务不该再进 QUERY_JOBS，否则引擎会重建 Job 继续查询
+                # （列表显示「已完成」、日志却还在刷查询）。
+                # 正常情况下 _record_success 已把它停用，这里兜住历史脏数据与竞态。
+                try:
+                    db.job_toggle_active(job['job_id'], 0)
+                    if not job.get('finished_at'):
+                        db.job_mark_finished(job['job_id'], '已购票，任务自动结束')
+                    CommonLog.add_quick_log(
+                        'webx 已出票任务自动停用: %s' % (job.get('job_name') or '')).flush()
+                except Exception:
+                    pass
+                continue
             out.append(cls.job_info_dict(job))
         return out
 
@@ -267,6 +282,15 @@ class ConfigSync:
 
 
 # ---------------- 工具 ----------------
+def _success_job_ids(db):
+    """已有成功下单记录的 job_id 集合（这些任务绝不该再进入 QUERY_JOBS）"""
+    try:
+        rows = db.query("SELECT DISTINCT job_id FROM order_log WHERE status='success'")
+        return {str(r['job_id']) for r in rows if r['job_id']}
+    except Exception:
+        return set()
+
+
 def _bump_envs(key):
     """把 webx 当前值镜像进 Config.envs（去重替换），让 watcher 再跑时 envs 无 diff"""
     cfg = Config()

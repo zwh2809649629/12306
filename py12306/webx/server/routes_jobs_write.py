@@ -141,7 +141,13 @@ def update_job(job_id):
         return {'code': 1, 'msg': '任务不存在', 'data': None}, 404
     patch = {}
     if 'is_active' in body:
-        patch['is_active'] = 1 if body.get('is_active') else 0
+        on = 1 if body.get('is_active') else 0
+        patch['is_active'] = on
+        # 重新启用要清掉「已结束」标记：否则引擎 destroy 过的任务会一直停在「已完成/已结束」，
+        # 点了开始也不会回到待启动/运行中
+        if on:
+            patch['finished_at'] = None
+            patch['finish_reason'] = None
     # 新建/编辑页提交的字段名是 name；job_name 为兼容旧调用方
     if 'job_name' in body or 'name' in body:
         patch['job_name'] = str(body.get('job_name') or body.get('name') or j.get('job_name') or '')

@@ -223,13 +223,30 @@ input[type=date]:disabled,input[type=time]:disabled,input[type=datetime-local]:d
 .toolbar .sp{margin-left:auto; display:flex; gap:9px}
 .job{background:var(--card); border:1px solid var(--line); border-radius:var(--r-lg); box-shadow:var(--shadow); padding:16px 18px; margin-bottom:12px}
 .job .l1{display:flex; align-items:center; gap:10px}
-.job .route{font-size:15.5px; font-weight:700; display:flex; align-items:center; gap:8px}
+/* 任务名是主标识，区间降为副标题（之前只有区间，看不到任务名） */
+.job .jname{font-size:15.5px; font-weight:700; color:var(--ink); flex-shrink:0}
+.job .route{font-size:12.5px; font-weight:600; color:var(--sub); display:flex; align-items:center; gap:8px; min-width:0}
 .job .route svg{width:15px; height:15px; color:var(--red)}
 .job .l1 .tag{margin-left:0}
-.job .l1 .acts{margin-left:auto; display:flex; gap:4px}
+.job .l1 .acts{margin-left:auto; display:flex; gap:4px; flex-shrink:0}
+/* 账号未登录 / 任务已结束的说明条（不只靠一个标签，用户容易看漏） */
+.job .job-hint{margin-top:10px; padding:8px 11px; border-radius:8px; background:var(--warn-bg); color:var(--warn); font-size:12.5px; line-height:1.6}
+.job .job-hint b{font-weight:700}
+.job .job-hint.done{background:var(--line-soft); color:var(--sub)}
+/* 下单成功 / 待支付：时效性强（12306 要求 30 分钟内支付），用更醒目的红色系 */
+.job .job-hint.pay{background:var(--red-bg); color:var(--red)}
 .job .l2{display:flex; flex-wrap:wrap; gap:7px; margin-top:11px; align-items:center}
 .job .l3{display:flex; gap:18px; margin-top:12px; padding-top:12px; border-top:1px dashed var(--line); font-size:12.5px; color:var(--sub); flex-wrap:wrap}
 .job .l3 b{color:var(--text); font-weight:600}
+/* 任务详情页顶部的状态提示条（与卡片 .job-hint 同一套配色语义） */
+.detail-hint{display:none; margin:0 0 12px; padding:9px 12px; border-radius:8px; font-size:12.5px; line-height:1.6}
+.detail-hint:not(:empty){display:block}
+.detail-hint b{font-weight:700}
+.detail-hint .dh-t{margin-left:8px; opacity:.75}
+.detail-hint.warn{background:var(--warn-bg); color:var(--warn)}
+.detail-hint.done{background:var(--line-soft); color:var(--sub)}
+/* 下单成功 / 待支付：时效性强，用醒目红色系 */
+.detail-hint.pay{background:var(--red-bg); color:var(--red)}
 .job .l3 .hit{color:var(--red); font-weight:700}
 .job.paused{opacity:.72}
 .icon-btn{

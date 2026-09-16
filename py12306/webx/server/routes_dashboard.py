@@ -26,26 +26,25 @@ def dashboard():
                 'account_key': getattr(j, 'account_key', ''),
             })
     except Exception:
-        pass
-    running_ids = {j['job_name'] for j in running_jobs}
+        pass    # 任务状态与 /api/jobs 保持同一口径（含账号未登录 / 已完成 / 已结束），排序也一致
+    from py12306.webx.server.routes_jobs import _job_view, sort_job_views
     jobs_stat = []
     for job in jobs_db:
-        active = bool(job.get('is_active'))
-        in_memory = job.get('job_name') in running_ids
-        status = 'running' if (active and in_memory) else ('paused' if not active else 'stopped')
-        last_hit = db.query('SELECT at FROM hit_log WHERE job_id=? ORDER BY id DESC LIMIT 1',
-                            (job['job_id'],))
+        view = _job_view(job, db)
         jobs_stat.append({
-            'job_id': job['job_id'],
-            'job_name': job.get('job_name') or '',
-            'status': status,
-            'hit_count': job.get('hit_count') or 0,
-            'last_hit_at': last_hit[0]['at'] if last_hit else None,
-            'stations': json.loads(job['stations'] or '[]'),
-            'left_dates': json.loads(job['left_dates'] or '[]'),
-            'seats': json.loads(job['seats'] or '[]'),
-            'members': json.loads(job['members'] or '[]'),
+            'job_id': view['job_id'],
+            'job_name': view['job_name'],
+            'status': view['status'],
+            'hit_count': view['hit_count'],
+            'last_hit_at': view['last_hit_at'],
+            'stations': view['stations'],
+            'left_dates': view['left_dates'],
+            'seats': view['seats'],
+            'members': view['members'],
+            'train_numbers': view.get('train_numbers') or [],
+            'created_at': view.get('created_at') or '',
         })
+    jobs_stat = sort_job_views(jobs_stat)
 
     # --- 账号 ---
     accounts = db.account_list()

@@ -23,8 +23,7 @@ py12306（12306 抢票助手）的二次开发。入口是 **`main_web.py`**（�
 
 ## 环境操作
 
-- **启动**：跑在 VS Code 集成终端里 `D:\Anaconda\envs\12306\python.exe main_web.py`。
-  ❌ 不要用 `start python.exe`（会弹控制台窗口）；❌ 不要用 `pythonw.exe`。
+- **启动**：`D:\Anaconda\envs\12306\python.exe main_web.py`。
 - **重启后必须确认没有双实例**：`netstat -ano | Select-String ':8600' | Select-String 'LISTENING'`
   应**只有一行**。多一行就 `taskkill /PID <pid> /F` 再确认。
   （`wmic ... | findstr` 在 cmd 里常静默失败，别靠它。）
