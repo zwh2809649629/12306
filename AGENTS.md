@@ -189,12 +189,12 @@ def _hook_something():
 ```
 约定：标记 `_webx_wrapped` / `_webx_original`；`install()` 幂等；回调内 `try/except` 兜底。
 
-### 当前已装的 9 个钩子（`engine_hooks.install()`）
+### 当前已装的 11 个钩子（`engine_hooks.install()`）
 
 | 钩子 | 目的 |
 |---|---|
 | `Request.request` → 挂 `Request.json` | **最关键**：修复 `response.json()` 不返回 `Dict`（§5.2） |
-| `Job.do_order` | 余票命中落库 → `hit_log` + `order_log(submitted)` |
+| `Job.do_order` | 余票命中落库 + 按账号串行下单、失败退避 |
 | `Order.order_did_success` | 下单成功 → `order_log(success)` + 停用 `[即时]` 任务 |
 | `UserJob.save_user` | **空会话落盘守卫**（§5.3） |
 | `Query/UserJob.request_device_id(_2)` | 防无界递归（§5.4） |
@@ -202,6 +202,8 @@ def _hook_something():
 | `UserJob.get_user_info` | 登录态确认改用「能拉到乘客」判定（§5.1） |
 | `UserJob.get_user_passengers` | 顾客原始字段 + 防递归 |
 | `UserJob.can_access_passengers` | 就绪探针走 webx 策略 |
+| `Query.start/update_query_jobs` | 零任务启动后，启用任务自动重启查询循环 |
+| `Request/UserJob/Order` 下单状态机 | 诚实阶段日志、initDc 保护、防重和失败落库（§5.18） |
 
 ---
 
@@ -428,6 +430,28 @@ if self.allow_train_numbers: return self.get_info_of_train_number() in ...   # �
 - `go('monitor')` 会 `MON.batch = false`。所以「点座次」在**离开再进入**监控页后会失效
   （`inBatchUI()` 为 false → 不写 `MON.sel`/`selBy`）。测试时注意，否则会误判成逻辑 bug。
 
+### 5.18 「下单请求已受理」不等于生成订单
+
+原版 `submitOrderRequest` 只要返回 `data='0'` 就打「提交订单成功」，但后面仍需
+`initDc 令牌 → checkOrderInfo → getQueueCount → confirmSingleForQueue → 订单号`。
+旧实现在 `initDc` 302/缺 token 时静默返回，导致日志看似成功、App 却无订单，
+并且每轮查询都重复提交。
+
+当前修法在 `engine_hooks._hook_order_flow_guard()`：
+- 仍使用原生 `requests_html` 会话，为下单端点补齐 Referer / Origin / Accept。
+- `initDc` 禁止自动跟随 302，防止跳登录页损坏会话；失败明确打状态/跳转目标。
+- 按当前协议处理 `ticketInfoForPassengerForm`；`getQueueCount.data.ticket` 是下一步
+  `leftTicketStr` 凭据，**不是余票数量**，不得拆逗号后判无票。
+- 无座编码：G/D/C 使用 `O`，普速使用 `1`；排队日期使用「中国标准时间」格式。
+- Chromium 实现仅保留为手工诊断开关，默认关闭；不是自动下单主路径。
+- 同账号下单串行化；失败退避 30s，退避日志限频。
+- `order_log` 状态为 `queued → submitted → success/failed/unknown`；**只有取得订单号才算 success**。
+- `confirmSingleForQueue` 成功后若无法确认订单号，停止任务并标记 `unknown`，
+  要求到 12306 官方订单页核对，不得自动重复下单。
+
+Playwright 运行依赖：`python -m pip install playwright` 后执行
+`python -m playwright install chromium`。
+
 ---
 
 ## 6. 前端（`static/`）协作要点
@@ -498,7 +522,7 @@ var SEAT_ORDER = ['商务座','一等座','二等座','硬卧','软卧','硬座'
 job           抢票任务（含 seat_tiers 二维优先级、start_at、interval_min/max、is_active）
 account       12306 账号（key / user_name / password / type / login_ok / active）
 user_login    管理台账号（pbkdf2(salt, hash)，无明文）
-order_log     下单记录（queued → submitted → success / cancelled）
+order_log     下单记录（queued → submitted → success / failed / cancelled）
 hit_log       余票命中记录
 daily_query   按天查询次数（由守护线程每 30s 轮询 QueryLog 差值累加）
 kv            杂项（JWT secret 等）
