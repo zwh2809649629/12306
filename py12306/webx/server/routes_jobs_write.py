@@ -78,12 +78,27 @@ def create_job():
     except Exception:
         imin, imax = 1, 1
     imin, imax = max(0.5, imin), max(imin, min(60, imax))
+    # 座次优先级（二维）：引擎只消费上面展平的 seats，这列只为把「哪几个属同一级」
+    # 带到详情/编辑页做分级配色。**必须落库** —— 之前漏传导致该列恒为 NULL，
+    # 接口回落到一维 seats，前端按二维处理时会 "xxx.forEach is not a function"。
+    tiers = body.get('seat_tiers')
+    if isinstance(tiers, list) and tiers:
+        tiers = [[str(x).strip() for x in t if str(x).strip()]
+                 for t in tiers if isinstance(t, list)]
+        tiers = [t for t in tiers if t] or [seats]
+    else:
+        tiers = [seats]
+    # 定时开始（引擎尚未支持，先落库；格式 'YYYY-MM-DD HH:MM'，非法则视为未设置）
+    start_at = str(body.get('start_at') or '').strip()
+    if start_at and not re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$', start_at):
+        start_at = ''
     job_id = db.job_create({
         'job_name': name,
         'account_key': account_key,
         'left_dates': dates,
         'stations': stations,
         'seats': seats,
+        'seat_tiers': tiers,
         'train_numbers': train_numbers,
         'except_train_numbers': except_numbers,
         'members': [str(m) for m in (body.get('members') or []) if str(m)],
@@ -92,6 +107,7 @@ def create_job():
         'period_to': _norm_period(body.get('period_to'), '24:00'),
         'interval_min': imin,
         'interval_max': imax,
+        'start_at': start_at,
         'is_active': 1,
     })
     ConfigSync.publish_jobs()
@@ -126,15 +142,20 @@ def update_job(job_id):
     patch = {}
     if 'is_active' in body:
         patch['is_active'] = 1 if body.get('is_active') else 0
-    if 'job_name' in body:
-        patch['job_name'] = str(body.get('job_name') or j.get('job_name') or '')
+    # 新建/编辑页提交的字段名是 name；job_name 为兼容旧调用方
+    if 'job_name' in body or 'name' in body:
+        patch['job_name'] = str(body.get('job_name') or body.get('name') or j.get('job_name') or '')
     if 'account_key' in body:
         patch['account_key'] = str(body.get('account_key') or '').strip()
-    for field, key in (('left_dates', 'left_dates'), ('seats', 'seats'),
+    for field, key in (('left_dates', 'left_dates'), ('seats', 'seats'), ('seat_tiers', 'seat_tiers'),
                        ('train_numbers', 'train_numbers'), ('except_train_numbers', 'except_train_numbers'),
                        ('members', 'members'), ('stations', 'stations')):
         if key in body and isinstance(body.get(key), list):
             patch[key] = body.get(key)
+    # 定时开始：与 create 同一套校验（非法则视为未设置）
+    if 'start_at' in body:
+        sa = str(body.get('start_at') or '').strip()
+        patch['start_at'] = sa if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$', sa) else ''
     for field in ('period_from', 'period_to'):
         if field in body:
             patch[field] = _norm_period(body.get(field), j.get(field) or ('00:00' if field == 'period_from' else '24:00'))
@@ -142,6 +163,8 @@ def update_job(job_id):
         patch['interval_min'] = float(body.get('interval_min') or j.get('interval_min') or 1)
     if 'interval_max' in body:
         patch['interval_max'] = float(body.get('interval_max') or patch.get('interval_min') or 1)
+    if 'allow_less_member' in body:
+        patch['allow_less_member'] = 1 if body.get('allow_less_member') else 0
     if not patch:
         return {'code': 1, 'msg': '无可更新字段', 'data': None}
     db.job_update(job_id, patch)

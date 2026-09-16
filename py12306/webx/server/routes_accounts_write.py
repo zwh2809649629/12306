@@ -48,19 +48,51 @@ def _save_pax_file(user_name, passengers):
         return False
 
 
-def _do_login_success(key):
-    """登录成功收尾：db 标记 + 乘客预拉 + 发布会话。"""
+def _acc_name(acc):
+    """账号行里的 user_name；首次创建落的是 key 占位，视作「未知」"""
+    name = str(acc.get('user_name') or '').strip()
+    if not name or name == str(acc.get('key') or ''):
+        return ''
+    return name
+
+
+def _do_login_success(key, real_name=None):
+    """登录成功收尾：db 标记 + 乘客预拉 + 发布会话。
+
+    real_name 由调用方（qr_check / login_password）把登录过程中探到的真实用户名传进来。
+    不能只信账号行的 user_name：扫码首次登录时该字段还是 key 占位，一旦拿它当用户名，
+    cookie 会被存成 <key>.cookie 而引擎按 <key>.cookie 去 load 也「刚好」能对上，
+    但真实 cookie 实际在 <真实名>.cookie → 引擎加载失败 → 账号永远离线、乘客永远是 0 人。
+    """
     db = _db()
     acc = _get_acc(key)
     if not acc:
         return
-    w = webx12306.Webx12306(key, user_name=acc.get('user_name') or '')
-    real_name = w.user_name or acc.get('user_name') or key
+    # 优先复用进程内的扫码会话（内存里已是登录态 / 已探到真实名），其次才是无状态新实例
+    w = webx12306._QR_SESSIONS.get(str(key))
+    if w is None:
+        w = webx12306.Webx12306(key, user_name=_acc_name(acc))
+    real_name = str(real_name or '').strip()
+    if not real_name:
+        real_name = str(w.user_name or '').strip() or _acc_name(acc)
+    if not real_name:
+        real_name = str(key)
+    w.user_name = real_name
     passengers = w.fetch_passengers(real_name)
     if passengers:
         _save_pax_file(real_name, passengers)
+    # 会话 cookies 非空才落盘，避免空会话把已有 cookie 覆盖掉
+    try:
+        if len(w.session.cookies) > 0:
+            w.save_cookie()
+    except Exception:
+        pass
     db.account_update(key, {'user_name': real_name, 'login_ok': 1, 'active': 1})
+    removed = _dedupe_by_name(key, real_name)
     ConfigSync.publish_accounts()
+    if removed:
+        UserLog.add_quick_log('webx 账号去重: %s 与账号 %s 同名，已移除重复行'
+                              % (real_name, '、'.join(removed))).flush()
     UserLog.add_quick_log('webx 账号就绪: %s（乘客 %d 人）' % (real_name, len(passengers or []))).flush()
 
 
@@ -107,7 +139,7 @@ def account_qr_check(key):
     state, user_name = w.qr_check(uuid_)
     out = {'state': state}
     if state == 'success':
-        _do_login_success(key)
+        _do_login_success(key, user_name)
         out['user_name'] = user_name
     return {'code': 0, 'msg': '', 'data': out}
 
@@ -129,7 +161,7 @@ def account_login(key):
     if not ok:
         return {'code': 1, 'msg': msg or '登录失败', 'data': None}
     _db().account_update(key, {'user_name': real_name or user_name, 'password': password})
-    _do_login_success(key)
+    _do_login_success(key, real_name or user_name)
     return {'code': 0, 'msg': '登录成功', 'data': {'user_name': real_name or user_name}}
 
 
@@ -148,13 +180,42 @@ def _clear_cookie(key):
     if not acc:
         return
     name = acc.get('user_name') or key
-    for cand in (name, key):
-        p = Config().USER_DATA_DIR + str(cand) + '.cookie'
+    # 若还有其它账号行共用同一个 user_name，则 **不能** 删 <user_name>.cookie
+    # （否则删掉一个重复行会把另一个还在用的账号一起踢下线）。
+    # 重名账号由 _dedupe_by_name 在登录成功时收敛，这里只做兼容性保护。
+    want = {str(name), _acc_name(acc)} - {''}
+    shared = any(
+        str(a.get('key')) != str(key) and str(a.get('user_name') or '') in want
+        for a in _db().account_list())
+    cands = {str(key)} if shared else ({str(key)} | want)
+    for cand in cands - {''}:
+        p = Config().USER_DATA_DIR + cand + '.cookie'
         try:
             if os.path.exists(p):
                 os.remove(p)
         except Exception:
             pass
+
+
+def _dedupe_by_name(key, real_name):
+    """同一个 12306 账号只保留一行。
+
+    账号行在「点扫码」时就先建了（此时还不知道用户名），登录成功才知道真实名，
+    所以重复检测只能放在这里：把其它同名的重复行直接摘掉（用 db 删除，
+    **不**走 _clear_cookie，否则会删掉幸存者赖以工作的 <real_name>.cookie）。
+    不收敛的话：两行都会发布会话 → 两个 UserJob 抢同一个 cookie 文件 → 双双离线。
+    """
+    if not real_name:
+        return []
+    db = _db()
+    removed = []
+    for a in db.account_list():
+        if str(a.get('key')) == str(key):
+            continue
+        if str(a.get('user_name') or '') == str(real_name):
+            db.account_delete(a['key'])
+            removed.append(str(a.get('key')))
+    return removed
 
 
 @bp.route('/api/accounts/<key>/logout', methods=['POST'])

@@ -16,10 +16,14 @@ import time
 from py12306.config import Config
 from py12306.helpers.func import time_int_ms
 from py12306.helpers.api import (
-    API_BASE_LOGIN, API_USER_LOGIN, API_USER_INFO, API_USER_PASSENGERS,
+    API_BASE_LOGIN, API_USER_PASSENGERS,
     API_USER_LOGIN_CHECK, API_AUTH_QRCODE_BASE64_DOWNLOAD, API_AUTH_QRCODE_CHECK,
     API_AUTH_UAMTK, API_AUTH_UAMAUTHCLIENT, API_GET_BROWSER_DEVICE_ID,
 )
+
+# 个人中心「乘车人管理」接口 —— 实测唯一能拿到乘客的入口
+# （原 getPassengerDTOs 已 302 到 /otn/safeguard/init，initDc 已 302 到登录页）
+API_PASSENGERS_QUERY = 'https://kyfw.12306.cn/otn/passengers/query'
 
 _UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
        '(KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36')
@@ -150,17 +154,26 @@ class Webx12306:
         return None
 
     def _post_login_finalize(self):
-        """登录态建立后：取 uamtk → uamauthclient 拿真实用户名 → 存 cookie → 请求个人中心。"""
+        """登录态建立后：取 uamtk → uamauthclient 拿真实用户名 → 存 cookie。
+
+        真实用户名必须落库：引擎 UserJob.get_cookie_path() = USER_DATA_DIR + user_name + '.cookie'，
+        账号行首次创建时 user_name 落的是 key 占位，若不回写，引擎会去找 <key>.cookie
+        （该文件不存在，cookie 实际存成了 <真实名>.cookie），表现为「扫码成功但状态一直离线」。
+
+        ⚠️ 收尾不要再请求 /otn/login/userLogin 或 API_USER_INFO：
+        前者会 302 到登录页（可能清掉刚建立的 otn 会话），后者已下线（跳 12306 错误页）。
+        """
         tk = self._uamtk()
         user_name = self._uamauthclient(tk) if tk else None
         self.user_name = user_name or self.user_name
         self.info['user_name'] = self.user_name
         self.save_cookie()
-        try:
-            self.session.get(API_USER_LOGIN, allow_redirects=True)
-            self.session.get(API_USER_INFO.get('url'))
-        except Exception:
-            pass
+        if self.user_name and self.user_name != self.key:
+            try:
+                from py12306.webx.db import DataStore
+                DataStore().account_update(self.key, {'user_name': self.user_name})
+            except Exception:
+                pass
 
     # ---------------- 账号密码登录（镜像 login2）----------------
     def login_password(self):
@@ -255,15 +268,49 @@ class Webx12306:
         except Exception:
             return False
 
+    @staticmethod
+    def _pick_passengers(payload):
+        """从各种响应结构里取乘客数组（12306 各接口字段名不一致）"""
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get('data')
+        if isinstance(data, dict):
+            for key in ('normal_passengers', 'datas', 'rows', 'list'):
+                val = data.get(key)
+                if isinstance(val, list) and val:
+                    return val
+        if isinstance(data, list) and data:
+            return data
+        return None
+
     def fetch_passengers(self, user_name=None):
+        """
+        取乘客列表。策略按「实测可用性」排序：
+          1. 个人中心「乘车人管理」/otn/passengers/query  ← **实测唯一可用**（拿到 2 位乘客）
+          2. 裸 getPassengerDTOs（旧兜底；实测已 302 到 /otn/safeguard/init）
+
+        ⚠️ 不要调 initDc / /otn/login/userLogin / /otn/index/initMy12306：
+        它们会 302 到登录页，拿着浏览器 cookie 去调反而会把 otn 会话清掉，
+        导致随后的 /otn/passengers/query 前几次返回空（实测踩过）。
+        """
         self.load_cookie(user_name)
-        for _ in range(max(1, Config().REQUEST_MAX_RETRY)):
-            try:
-                resp = self.session.post(API_USER_PASSENGERS)
-                pax = self._safe_json(resp).get('data', {}).get('normal_passengers')
-                if pax:
-                    return pax
-            except Exception:
-                pass
-            time.sleep(0.3)
+        strategies = [
+            ('passengers/query',
+             lambda: self.session.post(API_PASSENGERS_QUERY,
+                                       {'pageIndex': 1, 'pageSize': 100, '_json_att': ''})),
+            ('getPassengerDTOs', lambda: self.session.post(API_USER_PASSENGERS)),
+        ]
+        self.last_passenger_probe = []
+        for name, call in strategies:
+            for _ in range(max(1, Config().REQUEST_MAX_RETRY)):
+                try:
+                    resp = call()
+                    pax = self._pick_passengers(self._safe_json(resp))
+                    self.last_passenger_probe.append((name, resp.status_code,
+                                                      len(pax) if pax else 0))
+                    if pax:
+                        return pax
+                except Exception:
+                    pass
+                time.sleep(0.3)
         return []

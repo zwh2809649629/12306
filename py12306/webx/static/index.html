@@ -28,9 +28,68 @@
 .seat small.seat-price{display:block;margin-top:3px;color:var(--faint);font-size:10px;font-weight:500}
 .seat-selectable{cursor:pointer}
 .seat-selectable:hover{background:#fff7f8}
-.seat-selected{background:#fff1f3}
-.seat-selected strong{color:var(--red-hi)}
-.results-panel.batch-mode td.actions .btn{opacity:.3;pointer-events:none}
+/* 席别选中：加深背景 + 圆角内描边 + 数字加粗变红。保留白底基调、不做整块红填充。
+   注意：原型里的 .seat-choice 在真实 DOM 中并不存在，样式必须直接作用于 td.seat */
+.seat-selected{background:#ffe6e9}
+.seat-selected strong{color:var(--red);font-weight:800}
+.view#view-monitor td.seat.seat-selectable{position:relative}
+.view#view-monitor td.seat.seat-selected{background:#ffe6e9}
+.view#view-monitor td.seat.seat-selected::after{content:"";position:absolute;inset:2px;border:1.5px solid var(--red);border-radius:7px;pointer-events:none}
+.view#view-monitor td.seat.seat-selected strong{color:var(--red);font-weight:800}
+.view#view-monitor td.seat.seat-selected .seat-price{color:#a80f27;font-weight:700}
+/* ===== 车次列表：列宽与字号统一节奏 =====
+   按实测内容宽度重新分配（原分配大量富余：车次/出发/到达各 137px 而内容仅需 ~68px，
+   二等座 119px 比其他席别列宽 47px，操作 203px 而按钮仅需 ~101px）。
+   字号收敛为 3 级：主标识 15px / 正文 12~13px / 辅助 10.5px */
+.view#view-monitor .results-panel .table{min-width:1040px}
+.view#view-monitor .results-panel .table th{padding:9px 8px;font-size:11px}
+.view#view-monitor .results-panel .table td{padding:9px 8px}
+.view#view-monitor .results-panel .table th:first-child,
+.view#view-monitor .results-panel .table td:first-child{padding-left:14px}
+
+/* 车次号 与 出发/到达时间：同级主标识（原来时间 17px 反而大于车次号 14px，主次倒置） */
+.view#view-monitor .results-panel .train b{font-size:15px;line-height:1.25}
+.view#view-monitor .results-panel .train small{font-size:10.5px;margin-top:2px;line-height:1.2}
+.view#view-monitor .results-panel td.leg b{font-size:12px;line-height:1.2}
+.view#view-monitor .results-panel td.leg .lt{font-size:15px;font-weight:700;margin-top:2px}
+
+/* 历时 / 余票 / 票价 */
+.view#view-monitor .results-panel .duration{font-size:12px}
+.view#view-monitor .results-panel td.seat strong{font-size:13px}
+.view#view-monitor .results-panel td.seat .seat-price{font-size:10.5px;margin-top:1px}
+
+/* 操作列按钮：随行高收紧 */
+.view#view-monitor .results-panel td.actions .btn{height:28px;padding:0 9px;font-size:11.5px}
+.view#view-monitor .results-panel td.actions .row-pick{min-height:28px}
+
+/* 表头行高固定：避免批量模式下因出现全选复选框（inline-block）而撑高行盒、造成列表下移 */
+.view#view-monitor .results-panel thead th{line-height:16px}
+/* 「重置选择」：放在「批量」左侧隔壁（不占「清除排序」的位置）。
+   有可重置内容时向左滑出。注意 .batch-actions 是 margin-left:auto 右对齐，
+   内容变宽只会把整个组的左缘推左，所以「批量」按钮位置不变；高度也不变 → 表头不跳 */
+.view#view-monitor .batch-actions .reset-slot{
+  display:inline-flex;max-width:0;opacity:0;overflow:hidden;visibility:hidden;pointer-events:none;
+  transition:max-width .22s ease,opacity .16s ease,margin-right .22s ease,visibility 0s linear .22s;
+}
+.view#view-monitor .batch-actions .reset-slot.on{
+  max-width:120px;opacity:1;margin-right:8px;visibility:visible;pointer-events:auto;
+  transition:max-width .22s ease,opacity .16s ease .06s,margin-right .22s ease,visibility 0s linear 0s;
+}
+.view#view-monitor .batch-actions .batch-reset{white-space:nowrap}
+/* 不设座：该车次无此席别 → 显示 '/'，弱化且不可点（与「无票」的「无」明确区分开） */
+.view#view-monitor td.seat.seat-absent{cursor:default;background:transparent}
+.view#view-monitor td.seat.seat-absent strong.absent{color:#D0D5DD;font-weight:500;font-size:13px}
+.view#view-monitor tr.ticket-row:hover td.seat.seat-absent{background:transparent}
+/* 批量模式下操作列改为该行的勾选框；按钮与本行席别文字均收起。
+  两种模式列宽一致（colgroup 固定），因此切换批量时车次列表不会跳动 */
+.view#view-monitor td.actions{display:table-cell;vertical-align:middle;text-align:center;white-space:nowrap}
+.view#view-monitor td.actions .row-pick{display:none;align-items:center;justify-content:center;min-height:30px}
+.view#view-monitor .results-panel.batch-mode td.actions .row-pick{display:flex;visibility:visible;pointer-events:auto}
+.view#view-monitor .results-panel.batch-mode td.actions .btn{display:none}
+/* 出发 / 到达：站名与对应时间合并为一栏（时间为主、站名为辅），去掉冗余的单独时间列 */
+.view#view-monitor td.leg{padding:8px 14px;line-height:1.2}
+.view#view-monitor td.leg b{display:block;font-size:11.5px;font-weight:600;color:var(--sub);white-space:nowrap}
+.view#view-monitor td.leg .lt{display:block;margin-top:3px;font-size:17px;font-weight:700;color:var(--ink);font-variant-numeric:tabular-nums}
 .qr-img{width:100%;height:160px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:10px}
 .qr-box.has-img{border-style:solid;border-color:var(--line);background:#fff}
 .set-field{grid-column:1 / -1;max-width:460px}
@@ -39,10 +98,6 @@
 .set-note{padding:10px 18px;font-size:11.5px;color:var(--faint);border-top:1px solid var(--line-soft)}
 .pass-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 .hidden{display:none!important}
-/* 勾选列：默认按设计稿收成 0，进入批量/挑选模式后展开为窄列并显示勾选框 */
-.view#view-monitor .results-panel.batch-mode .table col:first-child{width:22px!important}
-.view#view-monitor .results-panel.batch-mode th:first-child,.view#view-monitor .results-panel.batch-mode tr:not(.phead):not(.psum) td:first-child{width:22px!important;min-width:22px!important;padding-left:8px!important;padding-right:2px!important;font-size:0}
-.view#view-monitor .results-panel.batch-mode th:first-child .row-check,.view#view-monitor .results-panel.batch-mode tr:not(.phead):not(.psum) td:first-child .row-check{display:inline-block;visibility:visible;pointer-events:auto}
 .hint{margin-top:7px;font-size:11.5px;color:var(--faint)}
 .task-picker{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:7px}
 .task-picker+.task-picker{margin-top:8px}
@@ -50,6 +105,134 @@
 .task-seats{display:flex;flex-wrap:wrap;gap:6px}
 .task-seats label{display:inline-flex;align-items:center;gap:5px;background:var(--line-soft);border-radius:6px;padding:5px 10px;font-size:11.5px;cursor:pointer;user-select:none}
 .task-seats input{accent-color:var(--red)}
+/* ===== 新建任务：引擎导向的控件 ===== */
+/* 查询量预估（区间数 × 日期数 = 每轮请求数） */
+.query-load{display:flex;align-items:center;gap:8px;margin-top:10px;padding:9px 12px;border-radius:9px;
+  background:var(--info-bg);color:#1D4FBF;font-size:12px;line-height:1.5}
+.query-load.warn{background:var(--warn-bg);color:var(--warn)}
+.query-load b{font-weight:800}
+/* 旧的席别优先级列表样式（.seat-priority-list / .sp-*）已被 .tier 取代：
+   现在座次按「优先级分行 + 行内芯片组」呈现，与乘车日期同一套交互。 */
+/* 执行方式（只读说明） */
+.engine-notes{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#FCFCFD}
+.en-row{display:flex;gap:14px;padding:9px 13px;font-size:12.5px;line-height:1.55}
+.en-row+.en-row{border-top:1px solid var(--line-soft)}
+.en-row .en-k{flex:0 0 72px;color:var(--faint)}
+.en-row .en-v{flex:1;min-width:0;color:var(--text)}
+/* 车票查询带入的车次里，席别的「无票」状态直接用「（无）」表达，
+   早期的「等待放票」标签已废弃 → 对应样式 .wait-tag 已删除。 */
+/* 「待引擎支持」标记：说明该控件已预留但引擎尚未实现，避免被误当生效 */
+.pending-tag{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10px;
+  font-weight:700;color:var(--warn);background:var(--warn-bg);vertical-align:1px;cursor:help}
+/* ===== 策略：每项设置独立成卡 =====
+   提示文字必须与自己的设置同框 —— 之前两列 flex 高度不等，
+   左列（开始时间）多一个日期输入，它的提示就掉到右列（查询间隔）内容下方，
+   视觉上像是查询间隔的说明（歧义来源）。
+   auto-fit + minmax 让窄屏自然换行，且同行卡片高度自动拉齐，提示都贴卡片底部。 */
+.stg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+/* 竖列排开（查询条件面板用） */
+.stg-grid.cols-1{grid-template-columns:1fr}
+/* 卡片内的开关行：与 .switch-row 同样的排布，但不再自带边框（外面已有卡片边框） */
+.sw-line{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text)}
+.sw-line span{flex:1;min-width:0}
+/* 车次模式：车次卡片列表不需要额外上边距（.stg-card 自带 gap） */
+.stg-card .task-selection-list{gap:8px}
+.stg-card #taskAddTrain{margin-top:0}
+.stg-card .derived-rows{margin-top:0}
+/* 席别一致性：卡片内的提示不再自带外边距 */
+.stg-card .seat-sync{margin:0}
+.stg-card #ntSeatSyncCard .stg-hint{margin-top:0}
+.stg-card{display:flex;flex-direction:column;gap:9px;padding:12px 13px;
+  border:1px solid var(--line);border-radius:10px;background:#FCFCFD}
+.stg-card.wide{grid-column:1 / -1}
+.stg-head{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;color:var(--sub)}
+.stg-head .pending-tag{margin-left:0}
+.stg-head .opt-x{font-weight:400;color:var(--faint);font-size:11.5px}
+.stg-card .ctl{background:#fff}
+/* 提示推到底部：卡片内控件高度不一致时，说明文字仍对齐在各自卡片底部 */
+.stg-hint{margin-top:auto;font-size:11.5px;color:var(--faint);line-height:1.6}
+/* 区间查询模式下仍有已选车次时的提醒 */
+.picked-note{display:none;margin-bottom:14px;padding:10px 12px;border-radius:9px;font-size:12px;
+  line-height:1.7;background:var(--warn-bg);color:var(--warn)}
+.picked-note b{font-weight:800}
+.link-btn{padding:0;margin:0 2px;border:0;background:none;color:inherit;font:inherit;
+  font-weight:800;text-decoration:underline;cursor:pointer}
+/* ===== 座次优先级：每级一张卡，与乘车日期同一套样式 =====
+   改自原来的单列表（序号 + ↑↓ + ✕ 按钮）：按钮多、调整顺序需要多次点击，
+   且与日期选择器风格割裂。现在顺序 = 1..n 级，每级内部多选、级内顺序保留。 */
+.tier{padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#FCFCFD}
+.tier+.tier{margin-top:8px}
+.tier-head{display:flex;align-items:center;gap:8px}
+.tier-no{flex:none;width:22px;height:22px;border-radius:6px;background:var(--red);color:#fff;
+  font-size:11.5px;font-weight:800;display:grid;place-items:center}
+.tier-label{flex:none;font-size:12.5px;font-weight:600;color:var(--text)}
+/* 注释跟在标题右侧：`flex:1` 让它吃掉剩余宽度，把删除按钮顶到最右 */
+.tier-hint{flex:1;min-width:0;font-size:11.5px;line-height:1.5;color:var(--faint)}
+.tier-del{flex:none;width:24px;height:24px;border:1px solid var(--line);border-radius:7px;background:#fff;
+  color:var(--faint);display:grid;place-items:center;cursor:pointer;font-size:11px;line-height:1}
+.tier-del:hover{border-color:var(--red);color:var(--red);background:var(--red-bg)}
+.tier .chip-row{margin-top:9px}
+/* 级与级之间的添加入口：与「+ 添加一组区间」同款虚线块 */
+.tier-add{margin-top:8px}
+/* ===== 新建任务：双模式（区间模式 / 车次模式）=====
+   引擎的查询是 stations × left_dates 两层循环，train_numbers 只在返回结果里做过滤。
+   因此车次模式下「区间 / 时段 / 车次范围」这三项必须由已选车次推导，而不是再让用户填一遍
+   —— 用户随手改动任意一项，都可能把刚导入的车次静默排除（时段更是会覆盖白名单）。 */
+.task-flow.mode-train [data-zone="range"]{display:none}
+.task-flow.mode-range [data-zone="train"]{display:none}
+/* 车次模式下的只读推导行 */
+.derived-rows{margin-top:12px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#FCFCFD}
+.dv-row{display:flex;gap:12px;padding:9px 13px;font-size:12.5px;line-height:1.6}
+.dv-row+.dv-row{border-top:1px solid var(--line-soft)}
+.dv-row .dv-k{flex:0 0 76px;color:var(--faint)}
+.dv-row .dv-v{flex:1;min-width:0;color:var(--text)}
+.dv-row .dv-v small{display:block;color:var(--faint);font-size:11px;margin-top:1px}
+/* 席别一致性提示：引擎只有一份全局席别表，无法按车次区分，不一致时必须显式告知 */
+.seat-sync{display:none;margin:0 0 10px;padding:9px 12px;border-radius:9px;font-size:12px;line-height:1.6;
+  background:var(--warn-bg);color:var(--warn)}
+.seat-sync.ok{background:var(--info-bg);color:#1D4FBF}
+.seat-sync b{font-weight:800;margin-right:4px}
+.seat-sync i{font-style:normal;font-weight:700}
+/* ===== 车票查询：日期条「未开售」屏蔽 ===== */
+.view#view-monitor .dates{align-items:center}
+.view#view-monitor .date.dis{color:#C7CCD6;background:#F3F4F7;cursor:not-allowed;position:relative}
+.view#view-monitor .date.dis b{color:#C7CCD6}
+.view#view-monitor .date.dis small.dis-tag{color:#C7CCD6;font-size:10px;margin-top:1px}
+.view#view-monitor .date.dis:hover{background:#F3F4F7}
+.view#view-monitor .date.dis::after{content:"";position:absolute;left:12px;right:12px;top:50%;height:1px;background:#DFE2E8;transform:rotate(-12deg)}
+/* 日期条「预售期」提示：独立成行，避免塞进 label 里把该列撑成两行导致输入框错位 */
+.view#view-monitor .query-hint{grid-column:1 / -1;font-size:11.5px;color:var(--faint);line-height:1.5;margin-top:-2px}
+.view#view-monitor .query-hint:empty{display:none}
+/* 查询条件标签统一单行，防止任何标签换行破坏字段对齐 */
+.view#view-monitor .query .field label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 出发地 / 目的地 + 「交换」按钮
+   不用绝对定位叠在两框之间——按钮 26px 而列间距仅 12px，无论怎么摆都会侵入输入框各 7px
+   （之前靠白色光圈遮盖，属于绕过而非解决）。改为把这对字段做成嵌套网格：span 4 列，
+   内部 `1fr auto 1fr` 让按钮占一个真实列，因此**完全不重叠**，且不影响其余字段的列对齐。 */
+.view#view-monitor .query .field.route-pair{
+  grid-column:span 4;display:grid;grid-template-columns:1fr auto 1fr;
+  column-gap:6px;align-items:end;
+}
+.view#view-monitor .route-pair .rp-item{min-width:0}
+.view#view-monitor .swap-btn{
+  width:26px;height:26px;border-radius:50%;margin-bottom:5px;
+  /* 用 flex 居中：grid + place-items:center 在「单个隐式轨道」时轨道按内容尺寸生成
+     且靠起始边放置，居中会失效（实测图标偏左上 4.8px） */
+  display:flex;align-items:center;justify-content:center;
+  background:#fff;border:1px solid var(--line);color:var(--sub);cursor:pointer;
+  box-shadow:0 1px 3px rgba(16,24,40,.10);transition:.15s;
+}
+/* 必须显式 position:static —— app.css 的 `.route-input svg{position:absolute;right:10px;top:10px}`
+   （设计稿里给输入框搜索图标用的）会命中按钮内的 svg，使其脱离文档流、flex 居中失效（实测偏左上 4.8px） */
+.view#view-monitor .swap-btn svg{position:static;width:14px;height:14px;stroke-width:2;color:currentColor;display:block}
+.view#view-monitor .swap-btn:hover{border-color:var(--red);color:var(--red);background:var(--red-bg)}
+.view#view-monitor .swap-btn:active{transform:scale(.9)}
+@media(max-width:560px){
+  /* 单列堆叠：按钮独立成行居中，并旋转 90° 与上下方向一致 */
+  .view#view-monitor .query .field.route-pair{grid-template-columns:1fr;row-gap:6px}
+  .view#view-monitor .swap-btn{justify-self:center;margin-bottom:0;transform:rotate(90deg)}
+  .view#view-monitor .swap-btn:active{transform:rotate(90deg) scale(.9)}
+}
 </style>
 </head>
 <body>
@@ -159,6 +342,7 @@
           <div class="detail-title"><h2 id="dName">任务详情</h2><div class="meta" id="dMeta"></div></div>
           <div class="detail-actions">
             <button class="btn btn-outline" id="dToggle">暂停任务</button>
+            <button class="btn btn-outline" id="dEdit">编辑任务</button>
           </div>
         </div>
         <div class="detail-layout">
@@ -177,46 +361,156 @@
       <!-- 新建任务（对齐设计稿 task-flow 布局） -->
       <section class="view" id="view-new">
         <div class="order-toolbar task-toolbar">
-          <button class="btn back-order" id="taskHeaderBack" type="button" aria-label="返回">‹</button><div><h2>新建抢票任务</h2><span class="cnt">创建后将立即参与热重载，无需重启服务</span></div>
+          <button class="btn back-order" id="taskHeaderBack" type="button" aria-label="返回">‹</button><div><h2 id="newTitle">新建抢票任务</h2><span class="cnt" id="newSub">创建后将立即参与热重载，无需重启服务</span></div>
         </div>
-        <div class="task-flow" id="taskFlow">
+        <div class="task-flow mode-train" id="taskFlow">
           <div class="task-flow-grid">
             <div>
-              <div class="task-flow-panel on" data-task-panel="1"><div class="form-sec"><div class="fh"><span class="no">1</span><h3>确认车次与席别</h3><span class="sub">从车票查询添加，可为每个车次选择多个席别</span></div><div class="fb">
-                <div class="task-flow-query"><span>查询余票后勾选需要预定的车次，再添加到当前任务。</span><button class="btn btn-outline" id="taskOpenTicketQuery" type="button">前往车票查询添加</button></div>
-                <div class="task-selection-list" id="taskSelectionList"></div>
-                <div class="task-flow-empty" id="taskSelectionEmpty">尚未添加车次，请先前往车票查询选择需要预定的车票（不添加则按下方区间查询全部车次）。</div>
-                <div class="f-lab" style="margin:12px 0 8px">出发日期<span class="opt-x" id="ntDateCnt">请选择，可多选</span></div>
-                <div id="ntDates" class="date-chips"></div>
-                <div class="f-lab" style="margin:12px 0 8px">出发 / 到达<span class="opt-x">可添加多组区间，成功率更高</span></div>
-                <div id="ntPairs">
-                  <div class="pair"><input class="stn" type="text" data-role="left" value="北京"><span class="arr">→</span><input class="stn" type="text" data-role="arrive" value="深圳"><span class="del">✕</span></div>
+              <!-- 1 任务名称 + 查询方式（默认车次查询），与其它面板同一套分块样式 -->
+              <div class="task-flow-panel on" data-task-panel="1"><div class="form-sec"><div class="fh"><span class="no">1</span><h3>任务名称与查询方式</h3><span class="sub">两种方式互斥，可在下方随时切换</span></div><div class="fb">
+                <div class="stg-grid">
+                  <div class="stg-card">
+                    <div class="stg-head">任务名称<span class="opt-x">留空自动命名</span></div>
+                    <input class="ctl" id="ntName" type="text" placeholder="例如：国庆回深圳">
+                  </div>
+                  <div class="stg-card">
+                    <!-- 注释与「任务名称」一致地跟在标题右侧（文案已精简到一行内） -->
+                    <div class="stg-head">查询方式<span class="opt-x" id="ntModeHint"></span></div>
+                    <div class="seg" id="ntModeSeg">
+                      <button type="button" class="seg-btn on" data-nt-mode="train">车次查询</button>
+                      <button type="button" class="seg-btn" data-nt-mode="range">区间查询</button>
+                    </div>
+                  </div>
                 </div>
-                <div class="pair-add" id="ntAddPair">+ 添加一组区间</div>
-                <div class="hint">支持输入车站全称或简称，如「北京」「深圳北」。</div>
               </div></div></div>
-              <div class="task-flow-panel" data-task-panel="2"><div class="form-sec"><div class="fh"><span class="no">2</span><h3>选择账号与乘客</h3><span class="sub">乘客列表跟随所选账号</span></div><div class="fb">
-                <div class="frow">
-                  <div class="f-col"><div class="f-lab">使用账号</div><select class="ctl" id="ntAccount"><option value="">（需先添加并登录账号）</option></select></div>
-                  <div class="f-col"><div class="f-lab">任务名称<span class="opt-x">留空按站点自动命名</span></div><input class="ctl" id="ntName" type="text" placeholder="例如：国庆回深圳"></div>
+
+              <!-- 2 车次（车次查询模式）
+                   座次与日期都由「车次卡片勾选 / 车票查询日期」派生，不再放可编辑控件，
+                   只在下方推导行里展示结果 + 说明，避免与车票查询页重复设置。 -->
+              <div class="task-flow-panel" data-zone="train"><div class="form-sec"><div class="fh"><span class="no">2</span><h3>车次</h3><span class="sub">来自车票查询；区间 / 时段 / 座次 / 日期均由车次推导</span></div><div class="fb">
+                <div class="stg-grid cols-1">
+                  <div class="stg-card">
+                    <div class="stg-head">车次列表<span class="opt-x" id="ntTrainCnt">尚未添加</span></div>
+                    <div class="task-selection-list" id="taskSelectionList"></div>
+                    <!-- 与区间模式的「+ 添加一组区间」同一样式，两种模式的操作入口保持一致 -->
+                    <div class="pair-add" id="taskAddTrain">+ 添加车次</div>
+                    <div class="stg-hint">任务只会抢下列车次（引擎 train_numbers 白名单）。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">由车次推导</div>
+                    <div class="derived-rows" id="ntDerived"></div>
+                  </div>
+                  <div class="stg-card" id="ntSeatSyncCard">
+                    <div class="stg-head">席别一致性</div>
+                    <div class="seat-sync" id="ntSeatSync"></div>
+                  </div>
                 </div>
-                <div class="f-lab" style="margin-top:14px">乘车人<span class="opt-x" id="ntPaxHint">需选择账号后加载</span></div>
-                <div class="order-people" id="ntPassengers"></div>
-                <div class="switch-row" style="margin-top:14px;max-width:460px"><span>允许余票不足时提交部分乘客</span><label class="tgl"><input id="ntLessMember" type="checkbox"><i></i></label></div>
               </div></div></div>
-              <div class="task-flow-panel" data-task-panel="3"><div class="form-sec"><div class="fh"><span class="no">3</span><h3>设置抢票策略</h3><span class="sub">控制查询频率与席别优先级</span></div><div class="fb">
-                <div class="task-config-grid">
-                  <div><div class="f-lab">席别偏好（可多选，按勾选顺序降级尝试）</div><div class="chips" id="ntSeats"></div></div>
-                  <div><div class="f-lab">出发时间段</div><div style="display:flex;align-items:center;gap:9px"><select class="ctl" id="ntFromT"><option>00:00</option><option>06:00</option><option>08:00</option></select><span style="color:var(--faint)">—</span><select class="ctl" id="ntToT"><option>24:00</option><option>22:00</option><option>18:00</option></select></div></div>
-                  <div class="task-interval-field"><div class="f-lab">查询间隔</div><div class="task-interval-presets" id="ntIntervalPresets"><button class="task-interval-preset" type="button" data-min="0.5" data-max="1">快速 0.5–1s</button><button class="task-interval-preset on" type="button" data-min="1" data-max="1">均衡 1s</button><button class="task-interval-preset" type="button" data-min="1" data-max="2">稳健 1–2s</button><button class="task-interval-preset" type="button" data-custom="true">自定义</button></div><div class="task-interval-custom"><div><div class="f-lab">最小间隔（秒）</div><input class="ctl" id="ntIntMin" type="number" min="0.5" step="0.1" value="1"></div><div><div class="f-lab">最大间隔（秒）</div><input class="ctl" id="ntIntMax" type="number" min="0.5" step="0.1" value="1"></div></div></div>
-                  <div><div class="f-lab">指定车次（只抢列表内）</div><div class="tagbox" id="ntTrainBox"><input type="text" id="ntTrainInput" placeholder="输入车次回车添加"></div><div class="hint">留空表示不限车次。</div></div>
-                  <div><div class="f-lab">排除车次<span class="opt-x">与指定车次二选一</span></div><div class="tagbox" id="ntExceptBox"><input type="text" id="ntExceptInput" placeholder="输入车次回车排除"></div></div>
+
+              <!-- 2 查询条件（区间查询模式）
+                   与策略面板用同一套分块样式，竖列排开（.stg-grid.cols-1）。 -->
+              <div class="task-flow-panel" data-zone="range"><div class="form-sec"><div class="fh"><span class="no">2</span><h3>查询条件</h3><span class="sub">区间地点 · 日期 · 出发时段 · 座次</span></div><div class="fb">
+                <div class="picked-note" id="ntPickedHint"></div>
+                <div class="stg-grid cols-1">
+                  <div class="stg-card">
+                    <div class="stg-head">区间地点<span class="opt-x">可添加多组，依次轮询</span></div>
+                    <div id="ntPairs">
+                      <div class="pair"><input class="stn" type="text" data-role="left" value="北京"><span class="arr">→</span><input class="stn" type="text" data-role="arrive" value="深圳"><span class="del">✕</span></div>
+                    </div>
+                    <div class="pair-add" id="ntAddPair">+ 添加一组区间</div>
+                    <div class="stg-hint">支持输入车站全称或简称，如「北京」「深圳北」。多组区间会<b>依次轮询</b>，区间越多每轮请求越多。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">乘车日期<span class="opt-x" id="ntDateCnt">请选择，可多选</span></div>
+                    <div id="ntDates" class="chip-row"></div>
+                    <div class="picker" id="ntDatePick" hidden></div>
+                    <div class="stg-hint">可多选；引擎会对每个日期各查一遍，日期越多每轮请求越多。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">出发时段<span class="opt-x">按车次出发时刻筛选</span></div>
+                    <div style="display:flex;align-items:center;gap:8px;max-width:280px"><input class="ctl" id="ntFromT" type="time" value="00:00"><span style="color:var(--faint)">—</span><input class="ctl" id="ntToT" type="time" value="23:59"></div>
+                    <div class="stg-hint">HH:MM；结束时间 23:59 视为当天结束（提交为 24:00）。<b>该时间窗会额外过滤车次白名单</b>，已明确要抢的车次请确保落在窗口内。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">座次<span class="opt-x" id="ntSeatHint">按优先级从上到下逐个尝试，命中即下单</span></div>
+                    <div id="ntSeats"></div>
+                    <div class="pair-add tier-add" id="ntAddTier">+ 添加下一优先级</div>
+                    <div class="stg-hint" id="ntSeatFoot">同一优先级内的座次按先后顺序尝试；上一级都没票才会看下一级。</div>
+                  </div>
                 </div>
+              </div></div></div>
+              <div class="task-flow-panel" data-task-panel="3"><div class="form-sec"><div class="fh"><span class="no">3</span><h3>账号与乘车人</h3><span class="sub">乘车人列表跟随所选账号，未就绪的账号不可用</span></div><div class="fb">
+                <div class="stg-grid cols-1">
+                  <div class="stg-card">
+                    <div class="stg-head">使用账号</div>
+                    <select class="ctl" id="ntAccount"><option value="">（需先添加并登录账号）</option></select>
+                    <div class="stg-hint">下单与取乘客都用这个账号；未就绪（离线）的账号不可选。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">乘车人<span class="opt-x" id="ntPaxHint">需选择账号后加载</span></div>
+                    <div class="order-people" id="ntPassengers"></div>
+                    <div class="stg-hint">勾选本次要下单的乘车人，人数会参与「余票 ≥ 人数」的判断。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">余票不足时</div>
+                    <div class="sw-line"><span>允许按实际余票数减人提交</span>
+                      <label class="tgl"><input id="ntLessMember" type="checkbox"><i></i></label></div>
+                    <div class="stg-hint" id="ntLessNote">关闭时：余票 &lt; 人数则不提交</div>
+                  </div>
+                </div>
+              </div></div></div>
+              <div class="task-flow-panel" data-task-panel="4"><div class="form-sec"><div class="fh"><span class="no">4</span><h3>策略</h3><span class="sub">开始时间 · 查询间隔 · 车次筛选</span></div><div class="fb">
+                <!-- 策略：每项设置独立成卡（.stg-card），提示文字在自己的卡片内。
+                     之前是两列 flex 且高度不等：左列（开始时间）多一个日期输入，
+                     它的提示就掉到了右列（查询间隔）内容的下方，读起来像是查询间隔的说明。 -->
+                <div class="stg-grid">
+                  <div class="stg-card">
+                    <div class="stg-head">开始时间<span class="pending-tag" title="需要 py12306 抢票引擎支持，当前版本保存后尚未生效">待引擎支持</span></div>
+                    <div class="seg" id="ntStartMode">
+                      <button type="button" class="seg-btn on" data-start="now">立即开始</button>
+                      <button type="button" class="seg-btn" data-start="at">定时开始</button>
+                    </div>
+                    <input class="ctl" id="ntStartAt" type="datetime-local" disabled>
+                    <div class="stg-hint">选「定时开始」后需填写开始时间；需引擎侧新增调度能力才会生效。</div>
+                  </div>
+                  <div class="stg-card">
+                    <div class="stg-head">查询间隔（秒）<span class="pending-tag" title="需要 py12306 抢票引擎支持，当前版本保存后尚未生效">待引擎支持</span></div>
+                    <div style="display:flex;align-items:center;gap:8px">
+                      <input class="ctl" id="ntIntMin" type="number" min="0.5" max="60" step="0.5" value="1">
+                      <span style="color:var(--faint)">—</span>
+                      <input class="ctl" id="ntIntMax" type="number" min="0.5" max="60" step="0.5" value="1">
+                    </div>
+                    <div class="stg-hint">引擎当前使用全局间隔 <b id="ntIntervalNote">—</b>；本项需引擎侧改动后生效。</div>
+                  </div>
+                  <div class="stg-card wide" data-zone="range">
+                    <div class="stg-head">车次筛选<span class="opt-x">三种模式互斥</span></div>
+                    <div class="seg" id="ntTrainMode">
+                      <button type="button" class="seg-btn on" data-mode="all">不限车次</button>
+                      <button type="button" class="seg-btn" data-mode="allow">只抢指定</button>
+                      <button type="button" class="seg-btn" data-mode="except">排除指定</button>
+                    </div>
+                    <div class="frow" style="margin:0">
+                      <div class="f-col" id="ntAllowWrap" style="display:none"><div class="f-lab">只抢这些车次</div><div class="tagbox" id="ntTrainBox"><input type="text" id="ntTrainInput" placeholder="输入车次回车添加，如 G79"></div><div class="stg-hint">仅列表内车次会被抢。</div></div>
+                      <div class="f-col" id="ntExceptWrap" style="display:none"><div class="f-lab">排除这些车次</div><div class="tagbox" id="ntExceptBox"><input type="text" id="ntExceptInput" placeholder="输入车次回车添加，如 K105"></div><div class="stg-hint">列表外车次都可抢。</div></div>
+                    </div>
+                  </div>
+                  <div class="stg-card wide" data-zone="train">
+                    <div class="stg-head">车次筛选</div>
+                    <div class="stg-hint">由上方车次列表决定：只抢列表内车次（引擎 <b>train_numbers</b> 白名单）。</div>
+                  </div>
+                </div>
+                <div class="engine-notes" style="margin-top:12px">
+                  <div class="en-row"><span class="en-k">命中规则</span><span class="en-v">按座次优先级依次检查，首个「余票 ≥ 乘车人数」的席别立即提交下单</span></div>
+                  <div class="en-row"><span class="en-k">余票不足</span><span class="en-v" id="ntMemberNote">—</span></div>
+                  <div class="en-row"><span class="en-k">任务结束</span><span class="en-v">下单成功即自动结束该任务（一次性）</span></div>
+                  <div class="en-row"><span class="en-k">当前不支持</span><span class="en-v">候补购票；开始时间与任务级查询间隔已预留，待引擎侧实现</span></div>
+                </div>
+                <div class="query-load" id="ntQueryLoadHint" style="margin-top:12px">—</div>
               </div></div></div>
             </div>
             <aside class="summary"><div class="card"><div class="sh"><h3>任务摘要</h3><div class="sub">随当前选择实时更新</div></div>
               <div class="sum-rows" id="ntSummary"></div>
-              <div class="sum-foot"><button class="btn btn-primary" id="taskFlowNext" type="button">创建任务</button></div>
+              <div class="sum-foot"><button class="btn btn-primary" id="taskFlowNext" type="button">创建任务</button><button class="btn btn-outline hidden" id="taskFlowCancel" type="button">取消编辑</button></div>
             </div></aside>
           </div>
         </div>
@@ -226,12 +520,16 @@
       <section class="view" id="view-monitor">
         <div class="panel">
           <div class="query">
-            <div class="field"><label>出发地</label><div class="route-input"><input id="mFrom" type="text" value="北京"><div class="stn-suggest hidden" id="mFromSug"></div></div></div>
-            <div class="field"><label>目的地</label><div class="route-input"><input id="mTo" type="text" value="深圳"><div class="stn-suggest hidden" id="mToSug"></div></div></div>
+            <div class="field route-pair">
+              <div class="rp-item"><label>出发地</label><div class="route-input"><input id="mFrom" type="text" value="北京"><div class="stn-suggest hidden" id="mFromSug"></div></div></div>
+              <button class="swap-btn" id="mSwap" type="button" title="交换出发地 / 目的地" aria-label="交换出发地 / 目的地"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg></button>
+              <div class="rp-item"><label>目的地</label><div class="route-input"><input id="mTo" type="text" value="深圳"><div class="stn-suggest hidden" id="mToSug"></div></div></div>
+            </div>
             <div class="field"><label>出发日期</label><input id="mDate" type="date"></div>
             <div class="field"><label>返程日期（可选）</label><input id="mBackDate" type="date" placeholder="不填则单程"></div>
             <div class="field"><label>乘客类型</label><select class="ctl" id="mPassType"><option>成人</option><option>学生</option><option>儿童</option></select></div>
             <button class="btn btn-primary" id="mSearch" style="background:var(--red);color:#fff;border-color:var(--red)">查询车票</button>
+            <div class="query-hint" id="mPresaleNote"></div>
           </div>
           <div class="dates" id="mDates"></div>
           <div class="filter" id="mFilter">
@@ -287,6 +585,7 @@
                 <label class="filter-option"><input type="checkbox" value="second"><span>二等座</span></label>
                 <label class="filter-option"><input type="checkbox" value="hardSleeper"><span>硬卧</span></label>
                 <label class="filter-option"><input type="checkbox" value="hardSeat"><span>硬座</span></label>
+                <label class="filter-option"><input type="checkbox" value="noSeat"><span>无座</span></label>
               </div>
             </div>
             <div class="filter-row">
@@ -310,32 +609,30 @@
             <div><h2 id="mRoute">— → —</h2><small id="mSummary"></small></div>
             <span class="status">即时结果 · 点击表头排序</span><button class="clear-sort" id="mClearSort" type="button">清除排序</button>
             <div class="batch-actions">
+              <span class="reset-slot"><button class="btn btn-outline batch-reset" id="mSelReset" type="button">重置选择</button></span>
               <button class="btn batch-toggle" id="mBatchToggle" type="button" aria-pressed="false">批量</button>
-              <button class="btn batch-operation" id="mBatchBind" type="button">批量关联</button>
-              <button class="btn batch-operation" id="mBatchCreate" type="button">批量新建任务</button>
             </div>
           </div>
-          <div class="selection-bar" id="mSelBar"><strong id="mSelCount">已选 0 条</strong><small>已勾选车次</small>
+          <div class="selection-bar" id="mSelBar"><strong id="mSelCount">已选 0 条</strong><small id="mSelRule">勾选车次后，该行有票席别会自动带上</small>
             <div class="floating-actions">
-              <button class="btn btn-outline normal-batch-only" id="mFloatPrefill" type="button">预填任务 / 预填本段</button>
+              <button class="btn btn-outline normal-batch-only" id="mFloatPrefill" type="button">新建任务</button>
               <button class="btn btn-outline normal-batch-only" id="mFloatBind" type="button">关联任务</button>
+              <!-- 任务上下文（从新建任务页「继续添加」进来）：需要明确提交或放弃，
+                   所以两个按钮：「添加到任务」= 保存本次修改，「取消」= 回滚到进入前的草稿 -->
               <button class="btn btn-primary task-pick-only" id="mFloatAddTask" type="button">添加到任务</button>
-              <span class="reset-actions"><button class="btn btn-outline" id="mSelReset" type="button">重置选择</button></span>
+              <button class="btn btn-outline task-pick-only" id="mFloatCancel" type="button">取消</button>
             </div>
           </div>
           <div class="scroll">
-            <table class="table"><colgroup><col style="width:4%"><col style="width:10%"><col style="width:7.54%"><col style="width:6.5%"><col style="width:5.96%"><col style="width:5.96%"><col style="width:8.2%"><col style="width:5.8%"><col style="width:5.8%"><col style="width:8.88%"><col style="width:5.8%"><col style="width:5.8%"><col style="width:5.8%"><col style="width:13.96%"></colgroup>
+            <table class="table"><colgroup><col style="width:9.5%"><col style="width:9.5%"><col style="width:9.5%"><col style="width:8%"><col style="width:8.5%"><col style="width:8.5%"><col style="width:8.5%"><col style="width:8.5%"><col style="width:8.5%"><col style="width:8.5%"><col style="width:12.5%"></colgroup>
             <thead><tr>
-              <th><input class="row-check" id="mSelAll" type="checkbox" aria-label="全选当前结果"></th>
               <th><button class="sort-head" data-sort="type" type="button">车次<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
-              <th>出发站</th>
-              <th>到达站</th>
-              <th><button class="sort-head" data-sort="depart" type="button">出发<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
-              <th><button class="sort-head" data-sort="arrive" type="button">到达<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th><button class="sort-head" data-sort="depart" type="button" title="出发站 / 出发时间，点击按出发时间排序">出发<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
+              <th><button class="sort-head" data-sort="arrive" type="button" title="到达站 / 到达时间，点击按到达时间排序">到达<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
               <th><button class="sort-head" data-sort="duration" type="button">历时<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
               <th>商务座</th><th>一等座</th>
-              <th><button class="sort-head" data-sort="tickets" type="button">二等座 / 余票<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
-              <th>硬卧</th><th>硬座</th><th>无座</th><th>操作</th>
+              <th>二等座</th>
+              <th>硬卧</th><th>硬座</th><th>无座</th><th class="th-actions">操作</th>
             </tr></thead><tbody id="mResults"></tbody></table>
             <div class="empty hidden" id="mEmpty"><b>没有符合条件的车次</b>请调整筛选条件后重新查看。</div>
           </div>
@@ -371,6 +668,9 @@
                 </div>
                 <div class="f-lab" style="margin-top:14px">乘车人</div>
                 <div class="order-people" id="oPassengers"></div>
+              </div></div>
+              <div class="form-sec"><div class="fh"><span class="no">3</span><h3>下单记录</h3><span class="sub">命中余票后由后台自动提交，此处可撤销未出票的单</span><div style="margin-left:auto"><button class="btn btn-outline btn-sm" id="oHistoryRefresh" type="button">刷新</button></div></div><div class="fb" style="padding:0">
+                <table class="table"><thead><tr><th>状态</th><th>车次</th><th>日期</th><th>席别</th><th>乘车人</th><th>说明</th><th style="text-align:right">操作</th></tr></thead><tbody id="oHistory"></tbody></table>
               </div></div>
             </div>
             <aside class="summary order-summary"><div class="card"><div class="sh"><h3>订单摘要</h3><div class="sub">随选择实时更新</div></div>

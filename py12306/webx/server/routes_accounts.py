@@ -69,23 +69,58 @@ def account_passengers(key):
     acc = db.account_get(key)
     if not acc:
         return {'code': 1, 'msg': '账号不存在', 'data': None}, 404
+    return {'code': 0, 'msg': '', 'data': {'passengers': load_passengers(key)}}
+
+
+def load_passengers(key):
+    """
+    账号乘客列表（已归一化，供新建任务/下单页/下单接口复用）。
+    取数优先级：引擎内存 UserJob.passengers → runtime/user/<user_name>_passengers.json
+    """
+    acc = DataStore().account_get(key) or {}
+    raw = None
     try:
         from py12306.user.user import User
         u = User().get_user(key)
         if u and getattr(u, 'passengers', None):
-            return {'code': 0, 'msg': '', 'data': {'passengers': list(u.passengers)}}
+            raw = list(u.passengers)
     except Exception:
-        pass
-    # 兜底：读 runtime/user/<user_name>_passengers.json
-    import os
-    import json
-    user_name = acc.get('user_name') or ''
-    if user_name:
-        path = Config().USER_PASSENGERS_FILE % user_name
-        if os.path.exists(path):
-            try:
-                with open(path, encoding='utf-8') as f:
-                    return {'code': 0, 'msg': '', 'data': {'passengers': json.load(f)}}
-            except Exception:
-                pass
-    return {'code': 0, 'msg': '', 'data': {'passengers': []}}
+        raw = None
+    if raw is None:
+        import os
+        import json
+        user_name = acc.get('user_name') or ''
+        if user_name:
+            path = Config().USER_PASSENGERS_FILE % user_name
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding='utf-8') as f:
+                        raw = json.load(f)
+                except Exception:
+                    raw = None
+    return _normalize_passengers(raw or [])
+
+
+def _normalize_passengers(raw):
+    """
+    12306 normal_passengers → 前端统一结构 {name, type, no, code, mobile}
+    未归一化的原始乘客只有 passenger_name / passenger_id_no / passenger_type_name，
+    直接回显会让前端把 name/no 渲染成 undefined，也会让任务 members 写坏。
+    同时兼容已是归一化结构的数据（幂等）。
+    """
+    out = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        name = p.get('name') or p.get('passenger_name') or ''
+        if not name:
+            continue
+        out.append({
+            'name': name,
+            'type': p.get('type_text') or p.get('type') or p.get('passenger_type_name') or '',
+            'type_code': p.get('passenger_type') or '',
+            'no': p.get('no') or p.get('passenger_id_no') or '',
+            'code': p.get('code') or '',
+            'mobile': p.get('mobile') or p.get('mobile_no') or '',
+        })
+    return out

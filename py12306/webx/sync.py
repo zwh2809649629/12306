@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import hashlib
+import json
 import secrets
 import string
 
@@ -155,6 +156,40 @@ class ConfigSync:
                         'password': acc.get('password') or '', 'type': acc.get('type') or 'qr'})
         return out
 
+    @staticmethod
+    def _live_accounts(accounts):
+        """
+        只保留「引擎里确实存在 UserJob」的账号。
+        引擎 User.refresh_users 遇到 old 里有、但 self.users 里没有的 key 时，
+        会直接 get_user(key).init_data() → 'NoneType' object has no attribute 'init_data'，
+        结果整批账号一个都刷不进去。过滤后这些 key 走「新增」分支（init_user + 线程），反而能自愈。
+        """
+        try:
+            from py12306.user.user import User
+            live = {getattr(u, 'key', None) for u in (User().users or [])}
+        except Exception:
+            return accounts
+        return [a for a in (accounts or []) if a.get('key') in live]
+
+    @staticmethod
+    def _prune_dead_users():
+        """
+        引擎 User.users 只增不减：destroy() 只把 is_alive 置 False，不摘除列表项。
+        而 User.get_user(key) 返回**第一个**匹配项 —— 重新扫码登录时 refresh_users 会
+        init_user() 新建一个 UserJob，旧的僵尸项仍排在前面，于是
+        get_passenger_for_members → wait_for_ready() 会在死对象上无限递归（每次 sleep 3s），
+        表现为「下单一直卡住」。这里在发布前把 is_alive 为 False 的项就地摘掉。
+        """
+        try:
+            from py12306.user.user import User
+            u = User()
+            users = u.users or []
+            alive = [x for x in users if getattr(x, 'is_alive', True)]
+            if len(alive) != len(users):
+                users[:] = alive  # 原地修改，保持类属性引用不变
+        except Exception:
+            pass
+
     @classmethod
     def publish_accounts(cls, first=False, auto=None):
         new = cls._accounts_from_db()
@@ -162,12 +197,23 @@ class ConfigSync:
         Config().USER_ACCOUNTS = new
         _bump_envs('USER_ACCOUNTS')
         if auto is None: auto = not first
-        if auto and new != old:
-            try:
-                from py12306.user.user import User
-                User().update_user_accounts(auto=auto, old=old)
-            except Exception as e:
-                CommonLog.add_quick_log('webx 账号发布刷新失败: %s' % e).flush()
+        try:
+            from py12306.user.user import User
+        except Exception:
+            return
+        # User 是单例，__init__ 只跑一次：若它在 startup 之前已被创建
+        # （管理台 WebX.run() 起 Flask 后，任意一次 /api/accounts、/api/dashboard 都会 User()），
+        # user_accounts 会固化成 startup 时的值，之后 User.run() → init_users() 遍历的
+        # 就是这个陈旧列表 → users 为空 → 账号永远「离线」。这里显式同步；
+        # User.__init__ 只读配置、不发网络请求，可安全提前创建。
+        User().user_accounts = new
+        if not (auto and new != old):
+            return
+        cls._prune_dead_users()
+        try:
+            User().update_user_accounts(auto=auto, old=cls._live_accounts(old))
+        except Exception as e:
+            CommonLog.add_quick_log('webx 账号发布刷新失败: %s' % e).flush()
 
     # ---------------- 任务（db → Config）----------------
     @staticmethod
@@ -175,17 +221,23 @@ class ConfigSync:
         """
         固定键序模板（对齐 Job.init_data 的消费字段）。
         md5=md5(json.dumps(dict)) 按插入序，键序固定 → Query.refresh_jobs 的 id 稳定。
+
+        注意：DataStore.job_list() 返回的是 SQLite 原始行，其中
+        left_dates / stations / seats / members / train_numbers / except_train_numbers
+        都是 **JSON 文本**。必须 json.loads 后再交给引擎，否则 Job.init_data 会拿到字符串，
+        在 `self.stations[0]['left']` 处抛 "string indices must be integers"
+        （此前发布链路因此从未成功，任务只写进了 db 却没被引擎加载）。
         """
         return {
             'job_name': job.get('job_name') or '',
             'account_key': _safe_key(job.get('account_key')),
-            'left_dates': job.get('left_dates') or [],
-            'stations': job.get('stations') or [{'left': '', 'arrive': ''}],
-            'members': job.get('members') or [],
+            'left_dates': _json_list(job.get('left_dates')),
+            'stations': _json_list(job.get('stations')) or [{'left': '', 'arrive': ''}],
+            'members': _json_list(job.get('members')),
             'allow_less_member': 1 if job.get('allow_less_member') else 0,
-            'seats': job.get('seats') or [],
-            'train_numbers': job.get('train_numbers') or [],
-            'except_train_numbers': job.get('except_train_numbers') or [],
+            'seats': _json_list(job.get('seats')),
+            'train_numbers': _json_list(job.get('train_numbers')),
+            'except_train_numbers': _json_list(job.get('except_train_numbers')),
             'period': {'from': job.get('period_from') or '00:00',
                        'to': job.get('period_to') or '24:00'},
         }
@@ -227,6 +279,22 @@ def _bump_envs(key):
 def _safe_key(value):
     """account_key 以 str 存（Job.init_data 内会 str() 化：self.account_key = str(info.get('account_key'))）"""
     return value
+
+
+def _json_list(value):
+    """
+    SQLite TEXT 列 → list。已是 list 时原样返回（幂等）。
+    解析失败返回 []，避免脏数据让整条发布链路失败。
+    """
+    if isinstance(value, list):
+        return value
+    if not value:
+        return []
+    try:
+        out = json.loads(value)
+        return out if isinstance(out, list) else []
+    except Exception:
+        return []
 
 
 def _pbkdf2(password, salt):

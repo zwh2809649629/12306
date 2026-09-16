@@ -40,6 +40,7 @@ def create_app():
     from py12306.webx.server.routes_jobs_write import bp as jobs_write_bp
     from py12306.webx.server.routes_settings_write import bp as settings_write_bp
     from py12306.webx.server.routes_accounts_write import bp as accounts_write_bp
+    from py12306.webx.server.routes_orders import bp as orders_bp
     app.register_blueprint(auth_bp)
     app.register_blueprint(dashboard_bp)
     app.register_blueprint(jobs_bp)
@@ -50,6 +51,7 @@ def create_app():
     app.register_blueprint(jobs_write_bp)
     app.register_blueprint(settings_write_bp)
     app.register_blueprint(accounts_write_bp)
+    app.register_blueprint(orders_bp)
 
     # 统一 JSON 响应
     def ok(data=None, msg=''):

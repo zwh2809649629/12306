@@ -10,7 +10,7 @@ from py12306.helpers.func import singleton
 WEBX_DEFAULTS = {
     'version': 1,
     'server': {'port': 8600, 'host': '0.0.0.0'},
-    'query': {'interval': 1, 'request_max_retry': 5, 'thread_enabled': 0, 'job_timeout': 3},
+    'query': {'interval': 1, 'request_max_retry': 5, 'thread_enabled': 0, 'job_timeout': 3, 'presale_days': 15},
     'user': {'heartbeat_interval': 120},
     'cdn': {'enabled': 0, 'check_time_out': 1},
     'log': {'to_file': 1, 'path': 'runtime/webx.log'},

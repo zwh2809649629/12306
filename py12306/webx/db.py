@@ -54,7 +54,9 @@ class DataStore:
                     account_key TEXT,
                     left_dates TEXT,            -- JSON Array[str]
                     stations TEXT,              -- JSON [{left,arrive}]
-                    seats TEXT,                 -- JSON Array[str] 有序
+                    seats TEXT,                 -- JSON Array[str] 有序（引擎消费的是这个，已是展平的）
+                    seat_tiers TEXT,            -- JSON Array[Array[str]] 优先级结构；**仅用于展示**
+                                                -- （引擎只接受一维 seats，这里存二维仅为把分级配色带到详情页）
                     train_numbers TEXT,         -- JSON Array[str]
                     except_train_numbers TEXT,  -- JSON Array[str]
                     members TEXT,               -- JSON Array[str/int]
@@ -63,6 +65,7 @@ class DataStore:
                     period_to TEXT DEFAULT '24:00',
                     interval_min REAL,
                     interval_max REAL,
+                    start_at TEXT,              -- 定时开始时间 'YYYY-MM-DD HH:MM'（引擎待支持）
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT,
                     updated_at TEXT,
@@ -119,6 +122,14 @@ class DataStore:
                 CREATE INDEX IF NOT EXISTS idx_hit_job ON hit_log(job_id);
                 CREATE INDEX IF NOT EXISTS idx_order_job ON order_log(job_id);
             ''')
+            # 幂等迁移：早期库没有 start_at（CREATE TABLE IF NOT EXISTS 不会补列）。
+            # 必须直接用 cur 查询：self.query() 会再取一次 self.lock，
+            # 而 threading.Lock 不可重入 → 在持锁块内调用它必然死锁（启动就卡住）
+            cols = {r['name'] for r in cur.execute('PRAGMA table_info(job)').fetchall()}
+            if 'start_at' not in cols:
+                cur.execute('ALTER TABLE job ADD COLUMN start_at TEXT')
+            if 'seat_tiers' not in cols:
+                cur.execute('ALTER TABLE job ADD COLUMN seat_tiers TEXT')
             self.conn.commit()
 
     # ---------------- 通用 ----------------
@@ -156,9 +167,9 @@ class DataStore:
         data.setdefault('job_id', uuid.uuid4().hex[:16])
         data['created_at'] = _now()
         data['updated_at'] = _now()
-        cols = ['job_id', 'job_name', 'account_key', 'left_dates', 'stations', 'seats',
+        cols = ['job_id', 'job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                 'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-                'period_from', 'period_to', 'interval_min', 'interval_max', 'is_active',
+                'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'is_active',
                 'created_at', 'updated_at']
         vals = []
         for c in cols:
@@ -169,9 +180,9 @@ class DataStore:
         return data['job_id']
 
     def job_update(self, job_id, data):
-        allowed = ['job_name', 'account_key', 'left_dates', 'stations', 'seats',
+        allowed = ['job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                    'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-                   'period_from', 'period_to', 'interval_min', 'interval_max', 'is_active',
+                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'is_active',
                    'updated_at']
         sets, vals = [], []
         for k in allowed:
@@ -196,6 +207,17 @@ class DataStore:
     def job_record_hit(self, job_id, train_number, seat, num, left_date):
         self.execute('UPDATE job SET last_hit_at=?, hit_count=hit_count+1 WHERE job_id=?',
                      (_now(), job_id))
+
+    def job_id_by_name(self, job_name):
+        """引擎侧只有 job_name，落库时反查 db job_id（查不到返回 None，允许无关联）"""
+        if not job_name:
+            return None
+        rows = self.query('SELECT job_id FROM job WHERE job_name=? ORDER BY id DESC LIMIT 1', (job_name,))
+        return rows[0]['job_id'] if rows else None
+
+    def job_list_active_by_prefix(self, prefix):
+        return self.query('SELECT * FROM job WHERE is_active=1 AND job_name LIKE ?',
+                          (str(prefix) + '%',))
 
     # ---------------- account ----------------
     def account_list(self):
@@ -255,6 +277,39 @@ class DataStore:
         if job_id:
             return self.query('SELECT * FROM order_log WHERE job_id=? ORDER BY id DESC LIMIT ?', (job_id, limit))
         return self.query('SELECT * FROM order_log ORDER BY id DESC LIMIT ?', (limit,))
+
+    def order_list_with_job(self, limit=100, job_id=None):
+        """下单记录 + 关联任务名（订单页/总览展示用）"""
+        limit = max(1, min(int(limit or 100), 500))
+        base = ('SELECT o.*, j.job_name FROM order_log o '
+                'LEFT JOIN job j ON j.job_id = o.job_id ')
+        if job_id:
+            return self.query(base + 'WHERE o.job_id=? ORDER BY o.id DESC LIMIT ?', (job_id, limit))
+        return self.query(base + 'ORDER BY o.id DESC LIMIT ?', (limit,))
+
+    def order_get(self, order_id):
+        rows = self.query('SELECT * FROM order_log WHERE id=?', (order_id,))
+        return rows[0] if rows else None
+
+    def order_update_status(self, order_id, status, message=None):
+        if message is None:
+            self.execute('UPDATE order_log SET status=? WHERE id=?', (status, order_id))
+        else:
+            self.execute('UPDATE order_log SET status=?, message=? WHERE id=?', (status, message, order_id))
+
+    def order_promote(self, job_id, train_date, train_number, message):
+        """把最近一条 submitted 记录升级为 success（避免同一单出现两条记录）；返回记录 id"""
+        rows = self.query(
+            "SELECT id FROM order_log WHERE job_id IS ? AND train_date=? AND train_number=? "
+            "AND status='submitted' ORDER BY id DESC LIMIT 1", (job_id, train_date, train_number))
+        if not rows:
+            return None
+        order_id = rows[0]['id']
+        self.execute("UPDATE order_log SET status='success', message=? WHERE id=?", (message, order_id))
+        return order_id
+
+    def order_pending_count(self):
+        return (self.query("SELECT COUNT(*) AS c FROM order_log WHERE status IN ('queued','submitted')")[0])['c']
 
     # ---------------- hit_log ----------------
     def hit_add(self, job_id, job_name, train_number, seat, num, left_date):
