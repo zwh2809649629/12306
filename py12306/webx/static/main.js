@@ -347,8 +347,8 @@ function loadDashboard() {
   api('/api/dashboard').then(function (d) {
     var s = d.stats;
     // 侧边栏徽标原来只由 loadJobs() 更新，停在总览页时不会刷新（看起来像 bug）
-    var navCnt = $('navJobCount');
-    if (navCnt) navCnt.textContent = s.jobs_total;
+    // 语义：徽标 = **正在运行的抢票任务数**（不是任务总数）
+    setNavJobBadge(s.jobs_running);
     $('dashStats').innerHTML =
       '<div class="stat"><div class="ic red">' + ICONS.jobs + '</div><div><div class="v">' + s.jobs_total + '</div><div class="k">抢票任务</div><div class="t" style="color:var(--ok)">' + s.jobs_running + ' 个运行中</div></div></div>' +
       '<div class="stat"><div class="ic info">' + ICONS.query + '</div><div><div class="v">' + s.query_today + '</div><div class="k">今日查询次数</div><div class="t" style="color:var(--faint)">累计 ' + s.query_total + '</div></div></div>' +
@@ -393,13 +393,40 @@ function clipList(arr, max) {
   var n = max || 5;
   return a.length > n ? a.slice(0, n).join('、') + ' 等 ' + a.length + ' 项' : a.join('、');
 }
+// 千分位（查询次数很容易上万）
+function fmtNum(n) {
+  var v = Number(n) || 0;
+  return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+// 秒 → 「1小时23分」/「45 秒」/「—」
+// ⚠️ 不要叫 fmtDur：上面已有一个按**分钟**的 fmtDur（车票历时用），
+// 函数声明会提升、后定义者胜 → 同名会把历时显示成「29 秒」而不是「29 分钟」。
+function fmtDurSec(sec) {
+  if (sec == null || isNaN(sec)) return '—';
+  var s = Math.max(0, Math.round(sec));
+  if (s < 60) return s + ' 秒';
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + ' 分 ' + (s % 60) + ' 秒';
+  var h = Math.floor(m / 60);
+  if (h < 24) return h + ' 小时 ' + (m % 60) + ' 分';
+  return Math.floor(h / 24) + ' 天 ' + (h % 24) + ' 小时';
+}
+// 导航做标：展示「正在运行的任务数」（0 时隐藏，避免红色 0 看着像报错）
+function setNavJobBadge(n) {
+  var el = $('navJobCount');
+  if (!el) return;
+  var v = Number(n) || 0;
+  el.textContent = v;
+  el.title = '正在运行的抢票任务 ' + v + ' 个';
+  el.classList.toggle('zero', v === 0);
+}
 
 /* ---------- 2. 任务列表 ---------- */
 function loadJobs() {
   api('/api/jobs').then(function (d) {
     var jobs = d.jobs;
     var running = jobs.filter(function (j) { return j.status === 'running'; }).length;
-    $('navJobCount').textContent = jobs.length;
+    setNavJobBadge(running);
     $('jobsCnt').textContent = '共 ' + jobs.length + ' 个 · 运行中 ' + running;
     if (!jobs.length) {
       $('jobsList').innerHTML = '<div class="empty" style="background:#fff;border:1px dashed var(--line)"><b>还没有抢票任务</b>点击「新建任务」配置区间后即刻开始查询。</div>';
@@ -425,7 +452,10 @@ function loadJobs() {
       var tags = '<span class="tag info">' + esc((j.left_dates || []).map(shortDate).join(' / ') || '未设日期') + '</span>' +
         (j.seats || []).map(function (s) { return '<span class="tag hot">' + esc(s) + '</span>'; }).join('') +
         trainTag + paxTag;
-      var hit = j.hit_count ? '<span class="hit">命中 ' + j.hit_count + ' 次</span>' : '尚未命中';
+      // 查询次数与命中次数是两件事：查询多但从不命中 = 条件太紧 / 车次不经过；
+      // 两者差得越大越说明「在正常跑，只是还没放票」。
+      var stat = '<span class="q"><b>' + fmtNum(j.query_count || 0) + '</b> 已查询</span>'
+        + '<span class="h"><b>' + fmtNum(j.hit_count || 0) + '</b> 命中</span>';
       var done = jobDone(j.status);
       // 状态提示：账号未登录 / 下单成功（待支付）/ 已结束原因
       var hint = '';
@@ -452,7 +482,7 @@ function loadJobs() {
           '<span class="route">' + routes.join('；') + '</span>' + stTag + acts + '</div>' +
         hint +
         '<div class="l2">' + tags + '</div>' +
-        '<div class="l3"><span>' + hit + '</span><span>创建 ' + esc(j.created_at || '') + '</span><span>账号 ' + esc(j.account_name || j.account_key || '—') + '</span></div></div>';
+        '<div class="l3"><span class="l3stat">' + stat + '</span><span>创建 ' + esc(j.created_at || '') + '</span><span>账号 ' + esc(j.account_name || j.account_key || '—') + '</span></div></div>';
     }).join('');
     $('jobsList').querySelectorAll('button[data-act]').forEach(function (b) {
       var act = b.dataset.act, id = b.dataset.id;
@@ -481,8 +511,10 @@ document.addEventListener('click', function (e) {
 function loadDetail(job_id) {
   api('/api/jobs/' + encodeURIComponent(job_id)).then(function (j) {
     $('dName').textContent = j.job_name || '任务详情';
+    // 创建/结束时间放在标题行（详情页要一屏装满，不再单占一张卡）
     $('dMeta').innerHTML = jobStatusTag(j.status)
       + ' <span class="tag muted">创建 ' + esc(j.created_at || '—') + '</span>'
+      + (j.finished_at ? ' <span class="tag muted">结束 ' + esc(j.finished_at) + '</span>' : '')
       + ' <span class="tag ' + (j.account_ready ? 'muted' : 'warn') + '">账号 '
       + esc(j.account_name || (j.account && j.account.user_name) || '—')
       + (j.account_ready ? '' : ' · 未登录') + '</span>';
@@ -528,29 +560,134 @@ function loadDetail(job_id) {
       var ti = tierOf[s] == null ? 0 : tierOf[s];
       return '<i class="p' + (ti % 8 + 1) + '">' + esc(s) + '</i>';
     }).join('');
+    // ---------- 任务配置（创建任务时的全部条件，不再只展示 5 项）----------
+    var ivMin = j.interval && j.interval.min != null ? j.interval.min : '—';
+    var ivMax = j.interval && j.interval.max != null ? j.interval.max : '—';
+    var trains = j.train_numbers || [];
+    var excepts = j.except_train_numbers || [];
+    var members = (j.members || []).filter(Boolean);
+    var isTrainMode = trains.length > 0;
+    var scope = trains.length
+      ? esc(clipList(trains, 12)) + '<small>共 ' + trains.length + ' 个（只抢这些）</small>'
+      : (excepts.length
+        ? '排除 ' + esc(clipList(excepts, 12)) + '<small>其余均抢</small>'
+        : '不限车次<small>区间内全部车次</small>');
     $('dFacts').innerHTML =
-      '<div class="detail-fact"><span>区间</span><b>' + (routes.join('；') || '—') + '</b></div>' +
-      '<div class="detail-fact"><span>出行日期</span><b>' + esc((j.left_dates || []).map(shortDate).join('、') || '—') + '</b></div>' +
-      '<div class="detail-fact"><span>乘车人</span><b>' + esc((j.members || []).join('、') || '—') + '</b></div>' +
-      '<div class="detail-fact"><span>席别优先级</span><b class="seat-priority">' + (seatPri || '—') + '</b></div>' +
-      '<div class="detail-fact"><span>车次策略</span><b>' + ((j.train_numbers || []).length ? esc(j.train_numbers.join('、')) : (j.except_train_numbers || []).length ? '排除 ' + esc(j.except_train_numbers.join('、')) : '不限') + '</b></div>';
-    // 4 指标
+      dvGroup('行程') +
+      dv('查询方式', isTrainMode ? '车次查询<small>只抢列表内车次</small>' : '区间查询<small>查询区间内全部车次</small>') +
+      dv('区间', (routes.join('；') || '—') + '<small>' + (j.stations || []).length + ' 组，依次轮询</small>') +
+      dv('出行日期', esc((j.left_dates || []).map(shortDate).join('、') || '—') +
+        '<small>共 ' + (j.left_dates || []).length + ' 天</small>') +
+      dv('车次范围', scope) +
+      dvGroup('席别与乘客') +
+      dv('席别优先级', seatPri || '—') +
+      dv('乘车人', members.length
+        ? esc(clipList(members, 12)) + '<small>' + members.length + ' 人 · ' +
+          (j.allow_less_member ? '允许部分先行' : '余票不足则不提交') + '</small>'
+        : '<span style="color:var(--faint)">未选乘客</span>') +
+      dvGroup('执行参数') +
+      dv('查询时段', esc(j.period.from) + ' – ' + esc(j.period.to) +
+        (isTrainMode ? '<small>车次已指定，引擎强制全天</small>' : '<small>按出发时刻筛选</small>')) +
+      dv('查询间隔', '<b>' + esc(ivMin) + '–' + esc(ivMax) + '</b> 秒<small>本任务专用；待引擎支持后生效</small>') +
+      dv('开始时间', (j.start_at ? esc(j.start_at) : '立即开始') +
+        (j.start_at ? '<small>待引擎支持后生效</small>' : ''));
+    // ---------- 量化指标（全宽带）----------
+    var m = j.metrics || {};
+    var stat = function (k, v, sub, cls) {
+      return '<div class="card detail-stat ' + (cls || '') + '"><span>' + k + '</span><b>' + v +
+        '</b>' + (sub ? '<em>' + sub + '</em>' : '') + '</div>';
+    };
+    var payLeft = '';
+    if (j.order_paying && j.order_elapsed != null && j.pay_window) {
+      payLeft = '剩 ' + Math.max(0, Math.ceil((j.pay_window - j.order_elapsed) / 60)) + ' 分';
+    }
     $('dStats').innerHTML =
-      '<div class="card detail-stat"><span>累计命中</span><b>' + j.hit_count + '</b></div>' +
-      '<div class="card detail-stat"><span>查询频率</span><b>' + esc(j.interval.min) + '–' + esc(j.interval.max) + '<small>s</small></b></div>' +
-      '<div class="card detail-stat"><span>查询时间段</span><b style="font-size:13px">' + esc(j.period.from) + ' – ' + esc(j.period.to) + '</b></div>' +
-      '<div class="card detail-stat"><span>最后命中</span><b style="font-size:13px">' + (j.last_hit_at ? esc(String(j.last_hit_at).slice(5, 16)) : '—') + '</b></div>';
+      stat('已查询', fmtNum(m.query_count || 0), '次请求') +
+      // 命中率只在「查询次数 ≥ 命中次数」时才有意义：老数据的命中发生在计数功能上线之前，
+      // 直接相除会得到 >100% 的荒谬值（实测 36/1 = 3600%）。
+      stat('命中', fmtNum(m.hit_count || 0),
+        (m.query_count && m.query_count >= m.hit_count)
+          ? '命中率 ' + (m.hit_count / m.query_count * 100).toFixed(2) + '%'
+          : (m.hit_count ? '次命中（早于计数统计）' : '尚未命中'),
+        m.hit_count ? 'hot' : '') +
+      stat('命中→下单', m.hit_to_order == null ? '—' : fmtDurSec(m.hit_to_order),
+        m.hit_to_request == null ? '尚未成单' : '受理耗时 ' + fmtDurSec(m.hit_to_request)) +
+      stat('每轮请求', fmtNum(m.requests_per_round || 0),
+        (j.stations || []).length + ' 区间 × ' + (j.left_dates || []).length + ' 日期') +
+      stat('运行时长', m.alive == null ? '—' : fmtDurSec(m.alive), j.status === 'running' ? '仍在运行' : '已计') +
+      stat('最后命中', m.since_last_hit == null ? '—' : fmtDurSec(m.since_last_hit) + '前',
+        j.last_hit_at ? esc(String(j.last_hit_at).slice(5, 16)) : '尚未命中') +
+      stat('支付剩余', payLeft || '—', j.order_success ? '30 分钟支付窗口' : '未出票');
     // 命中表
     $('dHits').innerHTML = (j.hits || []).length ? j.hits.map(function (h) {
       return '<tr><td><b>' + esc(h.train_number) + '</b></td><td>' + esc(h.seat) + '</td><td>' + esc(h.num) + '</td><td>' + esc(h.left_date) + '</td><td style="color:var(--sub)">' + esc(h.at) + '</td></tr>';
     }).join('') : '<tr><td colspan="5" style="color:var(--faint);text-align:center">暂无命中记录</td></tr>';
-    // 时间线
+    // 下单阶段时序（命中 → 受理 → 确认页 → 校验 → 排队 → 确认 → 成单/失败）
+    // 每条带「距上一步耗时」，直接看出卡在哪一步。
+    var evs = j.events || [];
+    if (!evs.length) {
+      $('dStages').innerHTML = '<div class="dv-empty">还没有下单动作。命中余票后，这里会按时间依次列出下单各阶段与每步耗时。</div>';
+    } else {
+      var prevAt = null;
+      $('dStages').innerHTML = evs.slice(-30).map(function (e) {
+        var t = String(e.at || '').slice(5, 19);
+        var gap = '';
+        if (prevAt) {
+          var d = (Date.parse(e.at.replace(' ', 'T')) - Date.parse(prevAt.replace(' ', 'T'))) / 1000;
+          if (!isNaN(d)) gap = '<em>+' + fmtDurSec(d) + '</em>';
+        }
+        prevAt = e.at;
+        return '<div class="it ev-' + esc(e.kind) + '"><time>' + esc(t) + '</time><i class="fdot"></i><div>' +
+          '<b>' + esc(e.label) + '</b> ' + esc(e.message || '') + gap + '</div></div>';
+      }).join('');
+    }
+    // 执行轨迹：下单阶段 / 命中轨迹 共用一张卡片（分段切换）。
+    // 默认优先显示下单阶段（它是「为什么没买到票」的直接答案）；没有阶段事件时回落到命中轨迹。
+    JOB_DETAIL_EVENTS = !!evs.length;
+    if (!TRACK.userSet) TRACK.mode = JOB_DETAIL_EVENTS ? 'stage' : 'hit';
+    applyTrackMode();
+    // 命中轨迹
     $('dTimeline').innerHTML = (j.hit_timeline || []).length ? j.hit_timeline.slice(0, 15).map(function (h) {
-      return '<div class="it"><time>' + esc(String(h.at).slice(5, 16).replace(' ', ' ')) + '</time><i class="fdot" style="background:var(--red);border:3px solid var(--red-bg);border-radius:50%;width:12px;height:12px"></i><div><b>' + esc(h.train_number) + '</b> 命中 <b>' + esc(h.seat) + '</b> × ' + esc(h.num) + ' <span style="color:var(--faint)">(' + esc(shortDate(h.left_date)) + ')</span></div></div>';
-    }).join('') : '<div style="padding:16px;color:var(--faint);font-size:12px">还没有执行记录，任务启动后这里会实时展示查询与命中轨迹。</div>';
-    // 日志
-    $('dLog').innerHTML = (j.logs || []).length ? j.logs.slice(-60).map(function (l) { return '<div class="' + logLineClass(l) + '">' + esc(l) + '</div>'; }).join('') : '<div style="color:var(--faint)">暂无日志</div>';
+      return '<div class="it"><time>' + esc(String(h.at).slice(5, 16)) + '</time><i class="fdot"></i><div><b>' + esc(h.train_number) + '</b> 命中 <b>' + esc(h.seat) + '</b> × ' + esc(h.num) + ' <span style="color:var(--faint)">(' + esc(shortDate(h.left_date)) + ')</span></div></div>';
+    }).join('') : '<div class="dv-empty">还没有命中记录。任务启动后这里会实时展示查询与命中轨迹。</div>';
+    // 日志（后端已按任务名过滤且取最新，见 routes_jobs._job_logs）
+    var logs = j.logs || [];
+    if ($('dLogSub')) $('dLogSub').textContent = logs.length ? '最新 ' + logs.length + ' 行 · 已按任务名过滤' : '';
+    $('dLog').innerHTML = logs.length ? logs.map(function (l) { return '<div class="' + logLineClass(l) + '">' + esc(l) + '</div>'; }).join('') : '<div style="color:var(--faint)">暂无日志</div>';
   }).catch(function (e) { toast(e.message, 'err'); go('jobs'); });
+}
+// 执行轨迹的租户：TRACK.mode = 'stage'（下单阶段）| 'hit'（命中轨迹）。
+// userSet 记录「用户主动切过」，避免每次轮询刷新都把选择重置回默认值。
+var TRACK = { mode: 'stage', userSet: false };
+var JOB_DETAIL_EVENTS = false;
+function applyTrackMode() {
+  var stage = TRACK.mode === 'stage';
+  var s = $('dStages'), h = $('dTimeline');
+  if (s) s.hidden = !stage;
+  if (h) h.hidden = stage;
+  var seg = document.querySelectorAll('#dTrackSeg .seg-btn');
+  for (var i = 0; i < seg.length; i++) seg[i].classList.toggle('on', seg[i].dataset.track === TRACK.mode);
+  if ($('dTrackSub')) {
+    $('dTrackSub').textContent = stage
+      ? '命中 → 排队 → 成单，含每步耗时'
+      : '最近 15 次余票命中';
+  }
+}
+// 每次进详情页都重新绑定（事件委托在 document 上，只需绑一次）
+document.addEventListener('click', function (e) {
+  var b = e.target.closest && e.target.closest('#dTrackSeg .seg-btn');
+  if (!b) return;
+  TRACK.mode = b.dataset.track;
+  TRACK.userSet = true;
+  applyTrackMode();
+});
+// 配置行：<span>标题</span><b>值 + 可选小字说明</b>
+function dv(k, v) {
+  return '<div class="detail-fact"><span>' + k + '</span><b>' + v + '</b></div>';
+}
+// 配置分组标题（行程 / 席别与乘客 / 执行参数 / 时间）
+function dvGroup(title) {
+  return '<div class="dv-group">' + title + '</div>';
 }
 function logLineClass(line) {
   if (/失败|错误|Error|Exception|放弃/.test(line)) return 'l-ERROR';
@@ -1027,6 +1164,38 @@ function ntQueryLoad() {
   var st = ntPairs().length, dt = (APP.selDates || []).length;
   return { stations: st, dates: dt, perRound: st * dt };
 }
+// 预估金额（单个乘车人）：取「优先级最高的席别」在已选车次里的估算票价。
+// 只有车次查询模式算得了（区间模式还没确定车次，拿不到席别与历时）。
+// ⚠️ 单价是 seatPrice 的粗略估算（历时 × 单价），长距离会偏低 → 文案写「预估」。
+function ntEstimateUnitPrice() {
+  var seats = APP.selSeats || [];
+  var picked = APP.taskPicked || [];
+  if (!seats.length || !picked.length) return null;
+  for (var i = 0; i < seats.length; i++) {
+    var k = SEAT_KEY[seats[i]];
+    if (!k) continue;
+    for (var j = 0; j < picked.length; j++) {
+      var leg = picked[j] && picked[j].leg;
+      if (leg && seatOffered(leg, k)) {
+        var p = seatPrice(leg, k);
+        if (p) return { price: p, seat: seats[i], train: leg.n || leg.tn || '' };
+      }
+    }
+  }
+  return null;
+}
+function ntEstimateLabel() {
+  var unit = ntEstimateUnitPrice();
+  var pax = (APP.paxSel || []).length;
+  if (!unit) {
+    return '<span style="color:var(--faint)">—</span><small>' +
+      (ntMode() === 'train' ? '选定车次与座次后可预估' : '区间模式未定车次，无法预估') + '</small>';
+  }
+  var total = unit.price * (pax || 1);
+  return '<b style="color:var(--red)">¥' + fmtNum(total) + '</b>' +
+    '<small>' + esc(unit.seat) + ' 约 ¥' + fmtNum(unit.price) + ' × ' + (pax || 1) +
+    ' 人（按历时估算，仅供参考）</small>';
+}
 function refreshNtQueryLoad() {
   var L = ntQueryLoad();
   var box = $('ntQueryLoadHint');
@@ -1274,7 +1443,8 @@ function updateNtSummary() {
       : esc(ntPeriodLabel()) + '<small>按出发时刻筛选</small>') +
     row('开始时间', esc(ntStartLabel()) + '<small>需引擎支持后生效</small>') +
     row('查询间隔', iv.min + '–' + iv.max + ' 秒<small>本任务专用；需引擎支持后生效</small>') +
-    row('每轮请求', load.perRound ? '<b>' + load.perRound + '</b> 次<small>' + load.stations + ' 区间 × ' + load.dates + ' 日期</small>' : '—');
+    row('每轮请求', load.perRound ? '<b>' + load.perRound + '</b> 次<small>' + load.stations + ' 区间 × ' + load.dates + ' 日期</small>' : '—') +
+    row('预估金额', ntEstimateLabel());
   // 允许部分乘客：说明引擎在该开关下的实际行为
   if ($('ntLessNote')) $('ntLessNote').textContent = $('ntLessMember').checked
     ? '开启时：按实际余票数减人提交'
@@ -2401,6 +2571,12 @@ function createNewTask(btn) {
 // 保证「看到的 / 能点的 / 会带进任务的」完全一致
 var MON_SEAT_KEYS = ['business', 'first', 'second', 'hardSleeper', 'hardSeat', 'noSeat'];
 var SEAT_NAME = { business: '商务座', first: '一等座', second: '二等座', hardSleeper: '硬卧', hardSeat: '硬座', softSleeper: '软卧', special: '特等座', noSeat: '无座' };
+// 中文名 → key（席别优先级存的是中文名，算价要用 key）
+var SEAT_KEY = (function () {
+  var m = {};
+  Object.keys(SEAT_NAME).forEach(function (k) { m[SEAT_NAME[k]] = k; });
+  return m;
+})();
 function loadAccounts() {
   api('/api/accounts').then(function (d) {
     $('accCnt').textContent = '共 ' + d.accounts.length + ' 个';
@@ -2736,6 +2912,10 @@ function wireStatic() {
   $('mFloatBind').addEventListener('click', openTaskBindModal);
   // 任务上下文（从新建任务页进来）：「添加到任务」= 保存本次修改，然后返回
   $('mFloatAddTask').addEventListener('click', function () {
+    // 兜底：这个按钮只在「任务上下文」下可见，但若被程序化触发（或状态残留）时
+    // syncDraftFromSelection() 会因 inTaskPick() 为假直接返回，
+    // 结果是「提示已保存、其实什么都没加」。此时按「新建任务」处理才符合直觉。
+    if (!inTaskPick()) { pickAddToTask(); return; }
     commitPick();
     // 勾选已转入任务，查询页的临时勾选清掉：否则会残留「看不见的选中态」，
     // 让「重置选择」按钮一直亮着

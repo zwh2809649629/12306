@@ -312,7 +312,7 @@
           <div style="min-width:0">
             <div class="card" style="margin-bottom:16px">
               <div class="card-h"><h3>任务运行状态</h3><span class="sub">每 3s 自动刷新</span><div class="act"><a class="btn btn-outline btn-sm" data-view="jobs">查看全部</a></div></div>
-              <table class="table"><thead><tr><th>任务</th><th>区间</th><th>日期</th><th>席位</th><th>状态</th><th>最近动态</th></tr></thead><tbody id="dashJobs"></tbody></table>
+              <div class="tbl-scroll"><table class="table"><thead><tr><th>任务</th><th>区间</th><th>日期</th><th>席位</th><th>状态</th><th>最近动态</th></tr></thead><tbody id="dashJobs"></tbody></table></div>
             </div>
             <div class="card">
               <div class="card-h"><h3>近 7 日查询轮次</h3><span class="sub">单位：次</span></div>
@@ -351,15 +351,26 @@
           </div>
         </div>
         <div class="detail-hint" id="dHint"></div>
+        <!-- 量化指标：跨两列铺开，一眼看到「跑了多少 / 中了多少 / 花了多久」 -->
+        <div class="detail-stats" id="dStats"></div>
         <div class="detail-layout">
           <div class="detail-stack">
-            <div class="card"><div class="card-h"><h3>行程信息</h3></div><div id="dFacts" class="detail-facts" style="padding:16px 18px"></div></div>
-            <div class="detail-stats" id="dStats"></div>
-            <div class="card"><div class="card-h"><h3>命中记录</h3></div><div class="detail-table-wrap"><table class="table"><thead><tr><th>车次</th><th>席别</th><th>余票</th><th>日期</th><th>时间</th></tr></thead><tbody id="dHits"></tbody></table></div></div>
+            <div class="card"><div class="card-h"><h3>任务配置</h3><span class="sub">创建任务时的全部条件</span></div><div id="dFacts" class="detail-facts"></div></div>
+            <div class="card"><div class="card-h"><h3>命中记录</h3><span class="sub">最近 20 条</span></div><div class="detail-table-wrap"><table class="table"><thead><tr><th>车次</th><th>席别</th><th>余票</th><th>日期</th><th>时间</th></tr></thead><tbody id="dHits"></tbody></table></div></div>
           </div>
           <div class="detail-stack">
-            <div class="card"><div class="card-h"><h3>执行轨迹</h3></div><div class="detail-timeline" id="dTimeline"></div></div>
-            <div class="card"><div class="card-h"><h3>实时日志</h3></div><div class="detail-log" id="dLog"></div></div>
+            <!-- 下单阶段与命中轨迹都是「按时间的列表」，合成一个卡片用分段切换，
+                 省下一整张卡的高度（详情页要一屏装满） -->
+            <div class="card"><div class="card-h"><h3>执行轨迹</h3>
+              <div class="seg seg-mini" id="dTrackSeg">
+                <button type="button" class="seg-btn on" data-track="stage">下单阶段</button>
+                <button type="button" class="seg-btn" data-track="hit">命中轨迹</button>
+              </div>
+              <span class="sub" id="dTrackSub"></span></div>
+              <div class="detail-timeline" id="dStages"></div>
+              <div class="detail-timeline" id="dTimeline" hidden></div>
+            </div>
+            <div class="card"><div class="card-h"><h3>实时日志</h3><span class="sub" id="dLogSub"></span></div><div class="detail-log" id="dLog"></div></div>
           </div>
         </div>
       </section>

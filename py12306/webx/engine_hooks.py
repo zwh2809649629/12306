@@ -29,6 +29,125 @@ main_web.py 中 ConfigSync.startup() 之后调用 install()。幂等，重复调
 
 ONE_SHOT_PREFIX = '[即时] '
 
+# 引擎 Job.id（= md5(job_info_dict)）→ db job_id 的缓存。
+# 引擎侧只有 job_name 和这个 md5；**必须用 md5 定位任务行**：
+# 同名任务的 job_name 是一样的，按名字反查会全部落到「最新那一行」，
+# 导致命中/计数/结束状态记到错的任务上（实测踩过）。
+# 缓存 5 秒；不缓存 None（任务可能还没入库，下次应重试）。
+_JOB_ID_BY_ENGINE = {}
+_JOB_ID_CACHE_AT = 0.0
+_JOB_ID_CACHE_TTL = 5.0
+
+# {thread_id: job_name} —— 「当前线程正在下单的任务」。
+# 下单链路里 `request_init_dc_page` 挂在 UserJob 上（拿不到 job_name），
+# 而它前面一步 `submit_order_request` 挂在 Order 上（有 self.query_ins.job_name）。
+# 两步同线程、同一账号串行 → 用线程局部把任务名递过去。
+_ORDER_CTX = {}
+
+
+def _set_cur_job(job):
+    try:
+        import threading
+        _ORDER_CTX[threading.get_ident()] = getattr(job, 'job_name', '') or ''
+    except Exception:
+        pass
+
+
+def _cur_job_name():
+    try:
+        import threading
+        return _ORDER_CTX.get(threading.get_ident(), '') or ''
+    except Exception:
+        return ''
+
+
+def _engine_job_index():
+    """{Job.id: db job_id}；5 秒 TTL（任务行增删改都由网页触发，量很小）"""
+    global _JOB_ID_BY_ENGINE, _JOB_ID_CACHE_AT
+    import time
+    now = time.time()
+    if _JOB_ID_BY_ENGINE and (now - _JOB_ID_CACHE_AT) < _JOB_ID_CACHE_TTL:
+        return _JOB_ID_BY_ENGINE
+    try:
+        from py12306.webx.sync import ConfigSync
+        _JOB_ID_BY_ENGINE = ConfigSync.engine_job_index()
+        _JOB_ID_CACHE_AT = now
+    except Exception:
+        pass
+    return _JOB_ID_BY_ENGINE
+
+
+def _job_id_for(job):
+    """
+    引擎侧自己 → db job_id。
+
+    `job` 可以是 Job 实例、`{'job': Job}`、或 job_name 字符串：
+      · 传 Job 实例 → 用 `job.id`（唯一）精确匹配；
+      · 传名字 → 只能按名字回落（同名任务会有歧义，尽量别用）。
+    """
+    if job is None:
+        return None
+    if isinstance(job, str):
+        engine_id, name = '', job
+    else:
+        engine_id = str(getattr(job, 'id', '') or '')
+        name = str(getattr(job, 'job_name', '') or '')
+    idx = _engine_job_index()
+    if engine_id and engine_id in idx:
+        return idx[engine_id]
+    if engine_id:
+        # 缓存没命中（可能刚建任务 / 刚改过配置）→ 立刻重建一次
+        try:
+            from py12306.webx.sync import ConfigSync
+            global _JOB_ID_BY_ENGINE, _JOB_ID_CACHE_AT
+            import time
+            _JOB_ID_BY_ENGINE = ConfigSync.engine_job_index()
+            _JOB_ID_CACHE_AT = time.time()
+            if engine_id in _JOB_ID_BY_ENGINE:
+                return _JOB_ID_BY_ENGINE[engine_id]
+        except Exception:
+            pass
+        return None
+    if not name:
+        return None
+    try:
+        from py12306.webx.db import DataStore
+        return DataStore().job_id_by_name(name)
+    except Exception:
+        return None
+
+
+def _jn(obj):
+    """日志前缀：带上任务名。
+
+    详情页的「实时日志」是按任务名过滤日志文件的（`_job_logs`），
+    而下单流程的日志原本不带任务名 → 排队/提交订单那些行**根本不会出现在任务详情里**。
+    """
+    try:
+        name = getattr(obj, 'job_name', '') or ''
+        if not name and getattr(obj, 'query_ins', None) is not None:
+            name = getattr(obj.query_ins, 'job_name', '') or ''
+    except Exception:
+        name = ''
+    if not name:
+        name = _cur_job_name()
+    return ('[%s] ' % name) if name else ''
+
+
+def _evjob(job, kind, message=''):
+    """记一条下单阶段事件（失败不影响主流程）
+
+    job 可以是 Job 实例、`{'job': Job}`，或直接传任务名字符串（不推荐，同名会有歧义）。
+    """
+    try:
+        job_id = _job_id_for(job)
+        if not job_id:
+            return
+        from py12306.webx.db import DataStore
+        DataStore().job_event_add(job_id, kind, message)
+    except Exception:
+        pass
+
 
 def install():
     """安装引擎钩子；失败只记日志，不影响启动"""
@@ -46,6 +165,7 @@ def install():
         _hook_get_user_info()
         _hook_can_access_passengers()
         _hook_query_loop()
+        _hook_query_count()
         _hook_job_destroy()
         _hook_order_flow_guard()
         try:
@@ -54,8 +174,9 @@ def install():
                 'webx 引擎钩子已安装: response.json(Dict 修复) / do_order / order_did_success / '
                 'save_user(空会话守卫) / request_device_id(防递归) / qr_login(让位网页扫码) / '
                 'get_user_passengers / get_user_info(登录态确认) / can_access_passengers(就绪探针) / '
-                'query_loop(启用任务后自动查询) / job_destroy(结束状态落库) / '
-                'order_flow(订单状态机+防重复提交)').flush()
+                'query_loop(启用任务后自动查询) / query_count(按任务计数) / '
+                'job_destroy(结束状态落库) / '
+                'order_flow(订单状态机+阶段事件+防重复提交)').flush()
         except Exception:
             pass
         return True
@@ -142,6 +263,32 @@ def _hook_query_loop():
 # 这里把结束状态与原因落库。**不修改 py12306 原文件。**
 # 原因文案尽量可行动：区分「已购票」「待核对」「乘客校验失败」三种。
 
+def _hook_query_count():
+    """
+    按任务统计「已查询次数」。
+
+    `Job.query_by_date` 每调用一次 = 一条余票查询请求（引擎是
+    `for station in stations: for date in left_dates` 两层循环），
+    正好就是界面上「已查询」的含义。
+    """
+    from py12306.query.job import Job
+    if getattr(Job.query_by_date, '_webx_wrapped', False):
+        return
+    original = Job.query_by_date
+
+    def query_by_date(self, *args, **kwargs):
+        try:
+            from py12306.webx.db import DataStore
+            DataStore().job_record_query(_job_id_for(self))
+        except Exception:
+            pass
+        return original(self, *args, **kwargs)
+
+    query_by_date._webx_wrapped = True
+    query_by_date._webx_original = original
+    Job.query_by_date = query_by_date
+
+
 def _hook_job_destroy():
     from py12306.query.job import Job
     if getattr(Job.destroy, '_webx_wrapped', False):
@@ -161,7 +308,11 @@ def _hook_job_destroy():
 
 
 def _record_job_finished(job):
-    """把「任务已被引擎结束」写进 job 表（按 job_name 反查）。
+    """把「任务已被引擎结束」写进 job 表。
+
+    ⚠️ 用 `Job.id`（唯一）定位任务行。早期用 job_name 反查，同名任务会全部落到
+    「最新那一行」→ 结束状态记到错的任务上（界面就会出现「已暂停的那条被写成已结束」，
+    或者两个同名任务中只有一个能拿到结束原因）。
 
     ⚠️ 必须跳过「用户主动暂停」：暂停会从 QUERY_JOBS 摘除任务 → 引擎
     `Query.refresh_jobs()` 对不在白名单里的 Job 调 `destroy()` → 如果这里无脑落
@@ -170,8 +321,7 @@ def _record_job_finished(job):
     """
     from py12306.webx.db import DataStore
     db = DataStore()
-    job_name = getattr(job, 'job_name', '') or ''
-    job_id = db.job_id_by_name(job_name)
+    job_id = _job_id_for(job)
     if not job_id:
         return
     try:
@@ -244,6 +394,28 @@ def _order_flow_fail(user, message):
     state['last_error'] = str(message or '下单流程未完成')
 
 
+# 排队阶段服务端明确拒单（未生成订单）时的结论标记。
+# 这些原因意味着「这一轮没抢到」，不是「可能已下单」。
+WAIT_REJECTED = 'rejected'
+
+
+def _must_stop_job(order):
+    """
+    下单未拿到订单号时，是否需要**停用任务**以避免重复下单。
+
+    只在「已提交排队确认」且「结果状态不明」时才需要停：
+    那时服务端**可能已经占座**，重复提交会产生重复订单，只能人工去 12306 核对。
+
+    ⚠️ 但「服务端明确拒单」（如「没有足够的票!」「排队人数现已超过余票数」）
+    并不意味着可能已下单 —— 12306 一张票都没出，**继续下一轮查询才是正确的**。
+    旧实现只看 `_webx_queue_confirmed`，于是把这些情况也当成状态不明
+    把任务停掉（实测踩过：票没抢到，任务却「已结束」，不再查询）。
+    """
+    if not getattr(order, '_webx_queue_confirmed', False):
+        return False
+    return getattr(order, '_webx_wait_outcome', '') != WAIT_REJECTED
+
+
 def _order_attempt_update(order, status, message):
     """更新本次最近的下单记录；仅改 queued/submitted，不覆盖 success。"""
     try:
@@ -252,7 +424,7 @@ def _order_attempt_update(order, status, message):
         job = getattr(order, 'query_ins', None)
         if job is None:
             return
-        job_id = db.job_id_by_name(getattr(job, 'job_name', '') or '')
+        job_id = _job_id_for(job)
         train_number = _call(job, 'get_info_of_train_number')
         train_date = getattr(job, 'left_date', None) or _call(job, 'get_info_of_left_date')
         rows = db.query(
@@ -442,15 +614,17 @@ def _hook_order_flow_guard():
                 message = ('initDc 被 12306 重定向到 %s，未取得订单令牌'
                            % (location or '未知地址'))
                 _order_flow_fail(self, message)
+                _evjob(_cur_job_name(), 'fail', message)
                 OrderLog.add_quick_log(
-                    'webx 下单第二步失败：%s；%.0f 秒后再试'
+                    _jn(self) + 'webx 下单第二步失败：%s；%.0f 秒后再试'
                     % (message, _ORDER_RETRY_SECONDS)).flush()
                 return False, False, html
             if status != 200:
                 message = 'initDc HTTP %s，未取得订单令牌' % (status or '无响应')
                 _order_flow_fail(self, message)
+                _evjob(_cur_job_name(), 'fail', message)
                 OrderLog.add_quick_log(
-                    'webx 下单第二步失败：%s；%.0f 秒后再试'
+                    _jn(self) + 'webx 下单第二步失败：%s；%.0f 秒后再试'
                     % (message, _ORDER_RETRY_SECONDS)).flush()
                 return False, False, html
 
@@ -476,8 +650,9 @@ def _hook_order_flow_guard():
                 message = ('initDc 确认页不完整（%s，title=%s，len=%d，Content-Type=%s）'
                            % (flags, title, len(html), ctype or '未知'))
                 _order_flow_fail(self, message)
+                _evjob(_cur_job_name(), 'fail', message)
                 OrderLog.add_quick_log(
-                    'webx 下单第二步失败：%s；%.0f 秒后再试'
+                    _jn(self) + 'webx 下单第二步失败：%s；%.0f 秒后再试'
                     % (message, _ORDER_RETRY_SECONDS)).flush()
                 return False, False, html
 
@@ -486,7 +661,8 @@ def _hook_order_flow_guard():
             state['last_error'] = ''
             slide_val = re.search(r"var if_check_slide_passcode.*='(\d?)'", html)
             is_slide = bool(slide_val and int(slide_val.group(1)) == 1)
-            OrderLog.add_quick_log('webx 订单确认令牌获取成功').flush()
+            _evjob(_cur_job_name(), 'initdc', '取得订单确认令牌（检查订单信息、排队下单的前提）')
+            OrderLog.add_quick_log(_jn(self) + 'webx 订单确认令牌获取成功（已进入订单确认页）').flush()
             return True, is_slide, html
 
         request_init_dc_page._webx_wrapped = True
@@ -499,6 +675,8 @@ def _hook_order_flow_guard():
 
         def submit_order_request(self):
             import urllib.parse
+            # 记下「本线程正在下单的任务」，供后续 initDc（挂在 UserJob 上）拼日志前缀
+            _set_cur_job(getattr(self, 'query_ins', None))
             data = {
                 'secretStr': urllib.parse.unquote(self.query_ins.get_info_of_secret_str()),
                 'train_date': self.query_ins.left_date,
@@ -514,13 +692,20 @@ def _hook_order_flow_guard():
             payload = response.json()
             accepted = bool(payload.get('status') is True or str(payload.get('data')) == '0')
             if accepted:
-                OrderLog.add_quick_log(OrderLog.MESSAGE_SUBMIT_ORDER_REQUEST_SUCCESS).flush()
+                OrderLog.add_quick_log(
+                    _jn(self) + OrderLog.MESSAGE_SUBMIT_ORDER_REQUEST_SUCCESS).flush()
+                _evjob(self.query_ins, 'request',
+                       '12306 已受理下单请求：%s %s（%s）' % (
+                           getattr(self.query_ins, 'left_date', '') or '',
+                           _call(self.query_ins, 'get_info_of_train_number'),
+                           getattr(self.query_ins, 'current_seat_name', '') or ''))
                 _order_attempt_update(
                     self, 'submitted',
                     '12306 已受理下单请求，正在获取确认令牌（尚未生成订单）')
                 return True
             error = payload.get('messages') or payload.get('validateMessages') or '网络错误'
-            OrderLog.add_quick_log('提交订单请求失败，错误原因 %s' % error).flush()
+            OrderLog.add_quick_log(_jn(self) + '提交订单请求失败，错误原因 %s' % error).flush()
+            _evjob(self.query_ins, 'fail', '提交订单请求被拒: %s' % error)
             return False
 
         submit_order_request._webx_wrapped = True
@@ -551,11 +736,15 @@ def _hook_order_flow_guard():
             response_data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
             success = payload.get('status') is True and response_data.get('submitStatus') is True
             if success:
-                OrderLog.add_quick_log(OrderLog.MESSAGE_CHECK_ORDER_INFO_SUCCESS).flush()
+                OrderLog.add_quick_log(
+                    _jn(self) + OrderLog.MESSAGE_CHECK_ORDER_INFO_SUCCESS).flush()
+                _evjob(self.query_ins, 'check', '乘客与订单信息校验通过')
                 self.is_need_auth_code = response_data.get('ifShowPassCode') != 'N'
                 return True
             error = response_data.get('errMsg') or payload.get('messages') or '响应内容异常'
-            OrderLog.add_quick_log(OrderLog.MESSAGE_CHECK_ORDER_INFO_FAIL.format(error)).flush()
+            OrderLog.add_quick_log(
+                _jn(self) + OrderLog.MESSAGE_CHECK_ORDER_INFO_FAIL.format(error)).flush()
+            _evjob(self.query_ins, 'fail', '订单信息校验失败: %s' % error)
             return False
 
         check_order_info._webx_wrapped = True
@@ -603,7 +792,9 @@ def _hook_order_flow_guard():
                     error = result.get('messages', result.get('validateMessages', '响应内容异常'))
                     _order_flow_fail(getattr(self, 'user_ins', None),
                                      '排队接口拒绝: %s' % error)
-                    OrderLog.add_quick_log('排队失败，错误原因 %s' % error).flush()
+                    _evjob(self.query_ins, 'fail', '获取排队信息失败: %s' % error)
+                    OrderLog.add_quick_log(
+                        _jn(self) + '排队失败，错误原因 %s' % error).flush()
                     return False
 
                 queue = result.get('data') or {}
@@ -613,31 +804,192 @@ def _hook_order_flow_guard():
                     info['leftTicketStr'] = queue_ticket
                 self._webx_queue_data = queue
                 position = queue.get('count', queue.get('countT', '--'))
-                OrderLog.add_quick_log('获取排队信息成功，当前队列人数 %s' % position).flush()
+                _evjob(self.query_ins, 'queue', '已进入 12306 下单队列，前方 %s 人' % position)
+                OrderLog.add_quick_log(
+                    _jn(self) + '已进入下单队列，获取排队信息成功，当前队列人数 %s' % position).flush()
                 return True
             except Exception as exc:
                 message = '排队信息解析失败: %s' % exc
                 _order_flow_fail(getattr(self, 'user_ins', None), message)
-                OrderLog.add_quick_log(message).flush()
+                _evjob(self.query_ins, 'fail', message)
+                OrderLog.add_quick_log(_jn(self) + message).flush()
                 return False
 
         get_queue_count._webx_wrapped = True
         get_queue_count._webx_original = original_queue_count
         Order.get_queue_count = get_queue_count
 
+    # 确认排队：这条是**最高频的失败点**（实测热门车次几乎每轮都栽在
+    # 「出票失败，错误原因 余票不足！」）。复刻一遍是为了拿到真实原因：
+    # 原实现把原因只写进日志、不返回，调用方只能得到 False，
+    # 于是界面/事件里只能显示笼统的「下单流程未完成」。
     if not getattr(Order.confirm_single_for_queue, '_webx_wrapped', False):
         original_confirm_queue = Order.confirm_single_for_queue
 
         def confirm_single_for_queue(self):
-            result = original_confirm_queue(self)
-            if result:
-                # 从此刻起服务端可能已占座；后续状态不明时不得重复提交。
-                self._webx_queue_confirmed = True
-            return result
+            from py12306.log.common_log import CommonLog
+
+            info = getattr(self.user_ins, 'ticket_info_for_passenger_form', None) or {}
+            data = {
+                'passengerTicketStr': self.passenger_ticket_str,
+                'oldPassengerStr': self.old_passenger_str,
+                'randCode': '',
+                'purpose_codes': info.get('purpose_codes'),
+                'key_check_isChange': info.get('key_check_isChange'),
+                'leftTicketStr': info.get('leftTicketStr'),
+                'train_location': info.get('train_location'),
+                'choose_seats': '',
+                'seatDetailType': '000',
+                'whatsSelect': '1',
+                'roomType': '00',
+                'dwAll': 'N',
+                '_json_att': '',
+                'REPEAT_SUBMIT_TOKEN': getattr(
+                    self.user_ins, 'global_repeat_submit_token', ''),
+            }
+            if getattr(self, 'is_need_auth_code', False):
+                # 目前好像是都不需要了，有问题再处理
+                pass
+            try:
+                result = self.session.post(API_CONFIRM_SINGLE_FOR_QUEUE, data).json()
+            except Exception as exc:
+                self._webx_confirm_reason = '排队确认请求异常: %s' % exc
+                OrderLog.add_quick_log(
+                    '%s%s' % (_jn(self), self._webx_confirm_reason)).flush()
+                return False
+
+            if 'data' in result:
+                if result.get('data.submitStatus'):     # 成功
+                    # 从此刻起服务端可能已占座；后续状态不明时不得重复提交。
+                    self._webx_queue_confirmed = True
+                    self._webx_confirm_reason = ''
+                    _evjob(self.query_ins, 'confirm',
+                           '已提交排队确认（服务端可能已占座，待返回订单号）')
+                    OrderLog.add_quick_log(
+                        '%s%s' % (_jn(self),
+                                  OrderLog.MESSAGE_CONFIRM_SINGLE_FOR_QUEUE_SUCCESS)).flush()
+                    return True
+                reason = result.get('data.errMsg') or '余票不足'
+                OrderLog.add_quick_log(
+                    '%s%s' % (_jn(self), OrderLog.MESSAGE_CONFIRM_SINGLE_FOR_QUEUE_ERROR.format(
+                        result.get('data.errMsg', CommonLog.MESSAGE_RESPONSE_EMPTY_ERROR)))).flush()
+            else:
+                reason = result.get('messages') or result.get('validateMessages') or '排队确认被拒'
+                OrderLog.add_quick_log(
+                    '%s%s' % (_jn(self), OrderLog.MESSAGE_CONFIRM_SINGLE_FOR_QUEUE_FAIL.format(
+                        result.get('messages', CommonLog.MESSAGE_RESPONSE_EMPTY_ERROR)))).flush()
+            self._webx_confirm_reason = str(reason)
+            _evjob(self.query_ins, 'fail', '排队确认失败：%s' % reason)
+            return False
 
         confirm_single_for_queue._webx_wrapped = True
         confirm_single_for_queue._webx_original = original_confirm_queue
         Order.confirm_single_for_queue = confirm_single_for_queue
+
+    # 排队轮询：必须区分「服务端明确拒单（未生成订单）」与「状态不明（可能已占座）」。
+    #
+    # 原实现两种结果都只返回 False，调用方**无法分辨**。而 `confirm_single_for_queue`
+    # 一旦成功我们就置了 `_webx_queue_confirmed`，于是像
+    # 「排队失败，错误原因 没有足够的票!」这种**明确没抢到票**的情况也被当成
+    # 「可能已下单」→ 停用任务 + 记为 unknown
+    # （实测：12306 一张票都没出，任务却被结束，不再继续下一轮查询下单）。
+    #
+    # 这里复刻一遍轮询分支（与原实现逐分支等价），额外把结论写进
+    # `self._webx_wait_outcome`：'ordered' / 'rejected' / 'unknown'。
+    # 顺带给这些日志补上任务名前缀 —— 它们原本不带任务名，
+    # 详情页按任务名过滤日志时**根本看不到排队过程**。
+    if not getattr(Order.query_order_wait_time, '_webx_wrapped', False):
+        original_wait_time = Order.query_order_wait_time
+
+        def query_order_wait_time(self):
+            import random as _random
+            import urllib.parse as _urlparse
+            from py12306.helpers.func import stay_second
+            from py12306.log.common_log import CommonLog
+
+            self.current_queue_wait = self.max_queue_wait
+            self.queue_num = 0
+            # 默认「状态不明」——只有明确判明才降级为 rejected
+            self._webx_wait_outcome = 'unknown'
+            self._webx_wait_reason = ''
+            while self.current_queue_wait:
+                self.current_queue_wait -= self.wait_queue_interval
+                self.queue_num += 1
+                data = {
+                    'random': str(_random.random())[2:],
+                    'tourFlag': 'dc',
+                    '_json_att': '',
+                    'REPEAT_SUBMIT_TOKEN': getattr(
+                        self.user_ins, 'global_repeat_submit_token', ''),
+                }
+                try:
+                    result = self.session.get(
+                        API_QUERY_ORDER_WAIT_TIME.format(_urlparse.urlencode(data))).json()
+                except Exception as exc:
+                    OrderLog.add_quick_log(
+                        '%s排队状态查询异常: %s' % (_jn(self), exc)).flush()
+                    return False
+
+                if result.get('status') and 'data' in result:
+                    result_data = result['data'] or {}
+                    order_id = result_data.get('orderId')
+                    if order_id:
+                        self._webx_wait_outcome = 'ordered'
+                        return order_id
+                    if 'waitTime' in result_data:
+                        wait_time = int(result_data.get('waitTime') or 0)
+                        if wait_time == -1:
+                            # 原实现这里注释「不应该走到这」：视为未知，不当作成功
+                            return order_id
+                        elif wait_time == -100:      # 重新获取订单号
+                            pass
+                        elif wait_time >= 0:         # 仍在排队，继续等
+                            OrderLog.add_quick_log(
+                                '%s' % _jn(self)
+                                + OrderLog.MESSAGE_QUERY_ORDER_WAIT_TIME_WAITING.format(
+                                    result_data.get('waitCount', 0), wait_time)).flush()
+                        else:
+                            # -2 失败 / -3 订单已撤销 → 服务端明确没成单
+                            self._webx_wait_outcome = 'rejected'
+                            self._webx_wait_reason = str(result_data.get('msg') or '')
+                            OrderLog.add_quick_log(
+                                '%s' % _jn(self)
+                                + OrderLog.MESSAGE_QUERY_ORDER_WAIT_TIME_FAIL.format(
+                                    result_data.get('msg'))).flush()
+                            return False
+                    elif result_data.get('msg'):
+                        # 实测常见：「没有足够的票!」「排队人数现已超过余票数…」
+                        # → 明确未成单，属于「这一轮没抢到」，应继续下一轮
+                        self._webx_wait_outcome = 'rejected'
+                        self._webx_wait_reason = str(result_data.get('msg') or '')
+                        OrderLog.add_quick_log(
+                            '%s' % _jn(self)
+                            + OrderLog.MESSAGE_QUERY_ORDER_WAIT_TIME_FAIL.format(
+                                result_data.get('msg',
+                                                CommonLog.MESSAGE_RESPONSE_EMPTY_ERROR))).flush()
+                        stay_second(self.retry_time)
+                        return False
+                elif result.get('messages') or result.get('validateMessages'):
+                    self._webx_wait_outcome = 'rejected'
+                    self._webx_wait_reason = str(
+                        result.get('messages', result.get('validateMessages')) or '')
+                    OrderLog.add_quick_log(
+                        '%s' % _jn(self)
+                        + OrderLog.MESSAGE_QUERY_ORDER_WAIT_TIME_FAIL.format(
+                            result.get('messages', result.get('validateMessages')))).flush()
+                    return False
+
+                OrderLog.add_quick_log(
+                    '%s' % _jn(self)
+                    + OrderLog.MESSAGE_QUERY_ORDER_WAIT_TIME_INFO.format(self.queue_num)).flush()
+                stay_second(self.wait_queue_interval)
+
+            # 轮询超时：没拿到订单号，但服务端也没明确拒单 → 状态不明
+            return False
+
+        query_order_wait_time._webx_wrapped = True
+        query_order_wait_time._webx_original = original_wait_time
+        Order.query_order_wait_time = query_order_wait_time
 
     # 整条链路未获得订单号时，不让记录永久停在 submitted。
     if not getattr(Order.normal_order, '_webx_wrapped', False):
@@ -649,10 +1001,16 @@ def _hook_order_flow_guard():
             except Exception as exc:
                 message = '下单链路异常: %s' % exc
                 _order_flow_fail(getattr(self, 'user_ins', None), message)
-                OrderLog.add_quick_log(message).flush()
+                _evjob(self.query_ins, 'fail', message)
+                OrderLog.add_quick_log(_jn(self) + message).flush()
                 result = False
             if not result:
-                if getattr(self, '_webx_queue_confirmed', False):
+                # 「服务端明确拒单」不等于「状态不明」：
+                # 前者（如「没有足够的票!」「排队人数现已超过余票数」）12306 **没有生成任何订单**，
+                # 继续下一轮查询下单才是正确行为；只有真的无法确认订单号时，
+                # 才需要停任务防重复下单（那时服务端**可能已经占座**）。
+                # 判定见 `_must_stop_job`。
+                if _must_stop_job(self):
                     message = ('订单已提交排队，但未能确认订单号；'
                                '任务已停止以避免重复下单，请到 12306 官方订单页核对')
                     _order_attempt_update(self, 'unknown', message)
@@ -660,17 +1018,32 @@ def _hook_order_flow_guard():
                         from py12306.webx.db import DataStore
                         db = DataStore()
                         job = getattr(self, 'query_ins', None)
-                        job_id = db.job_id_by_name(getattr(job, 'job_name', '') or '')
+                        job_id = _job_id_for(job)
                         if job_id:
                             db.job_toggle_active(job_id, 0)
                         if job is not None and getattr(job, 'is_alive', False):
                             job.destroy()
                     except Exception:
                         pass
-                    OrderLog.add_quick_log(message).flush()
+                    OrderLog.add_quick_log(_jn(self) + message).flush()
                 else:
-                    state = _order_flow_state(getattr(self, 'user_ins', None))
-                    message = state.get('last_error') or '下单流程未完成，12306 未返回订单号'
+                    # 优先用最具体的原因：排队轮询的拒单原因 > 排队确认的拒单原因 > 兜底
+                    reason = (getattr(self, '_webx_wait_reason', '')
+                              or getattr(self, '_webx_confirm_reason', ''))
+                    if reason:
+                        message = '本轮下单未成功：%s（任务继续查询，等待下一轮余票）' % reason
+                    else:
+                        state = _order_flow_state(getattr(self, 'user_ins', None))
+                        message = state.get('last_error') or '下单流程未完成，12306 未返回订单号'
+                    _evjob(self.query_ins, 'fail', message)
+                    OrderLog.add_quick_log(_jn(self) + message).flush()
+                    # ⚠️ **任何「未成单」都必须退避**，否则下一轮余票查询会立刻再提交一次下单请求。
+                    # 实测（查询间隔 1s、余票一直挂着）会变成每 1~2 秒打一遍
+                    # submitOrderRequest → initDc → confirmSingleForQueue，
+                    # 直接触发 12306 的「由于您取消次数过多，今日将不能继续受理您的订票请求」。
+                    # 排队确认失败（confirmSingleForQueue 返回 False）这条路径原本没人调
+                    # `_order_flow_fail`，所以完全没有退避 —— 这里统一补上。
+                    _order_flow_fail(getattr(self, 'user_ins', None), message)
                     _order_attempt_update(self, 'failed', message)
             return result
 
@@ -1030,7 +1403,7 @@ def _hook_job_do_order():
             if time.time() - float(state.get('last_log') or 0) >= 5:
                 state['last_log'] = time.time()
                 OrderLog.add_quick_log(
-                    'webx 下单退避中，还需 %.0f 秒（%s）'
+                    _jn(self) + 'webx 下单退避中，还需 %.0f 秒（%s）'
                     % (remaining, state.get('last_error') or '上次下单未完成')).flush()
             return False
         if not state['lock'].acquire(blocking=False):
@@ -1057,9 +1430,12 @@ def _record_hit(job, user):
     train_date = getattr(job, 'left_date', None) or _call(job, 'get_info_of_left_date')
     seat = getattr(job, 'current_seat_name', '') or ''
     rest = _rest_num(job)
-    job_id = db.job_id_by_name(job.job_name)
+    # 用 Job.id（唯一）而不是 job_name：同名任务会被归到同一个任务行上
+    job_id = _job_id_for(job)
 
     db.hit_add(job_id, getattr(job, 'job_name', '') or '', train_number, seat, rest, train_date)
+    _evjob(job, 'hit', '命中余票：%s %s（%s）余票 %s' % (
+        train_date or '', train_number or '', seat or '—', rest or '未知'))
     db.order_add(
         job_id=job_id,
         account_key=_account_key(user),
@@ -1105,7 +1481,9 @@ def _record_success(order):
     train_date = getattr(job, 'left_date', None) or _call(job, 'get_info_of_left_date')
     seat = getattr(job, 'current_seat_name', '') or ''
     message = '订单号 %s，请 30 分钟内登录 12306 完成支付' % (order_id or '未知')
-    job_id = db.job_id_by_name(job.job_name)
+    job_id = _job_id_for(job)
+    _evjob(job, 'success', '下单成功：订单号 %s（%s %s %s）' % (
+        order_id or '未知', train_date or '', train_number or '', seat or '—'))
 
     promoted = db.order_promote(job_id, train_date, train_number, message)
     if not promoted:

@@ -132,6 +132,10 @@ def _start_webx_daemons():
                 last = cur
             except Exception:
                 pass
+            try:
+                _reconcile_paused_jobs()
+            except Exception:
+                pass
             time.sleep(30)
 
     t = threading.Thread(target=daily_counter)
@@ -139,6 +143,44 @@ def _start_webx_daemons():
     t.start()
     # 只在主线程打一条（避免与守护线程并发 flush 造成日志重复）
     CommonLog.add_quick_log('webx 后台守护已启动: daily_query 按天累计（每 30s 轮询差值）').flush()
+
+
+def _reconcile_paused_jobs():
+    """自愈：DB 里已暂停、引擎却还在跑的任务，重新摘掉。
+
+    暂停走的是 PATCH（**先写 db 再 publish_jobs**）：正常情况下
+    `Query.refresh_jobs()` 会对不在 QUERY_JOBS 里的 Job 调 `destroy()`。
+    但引擎若正卡在长耗时的下单/排队链路里（`query_order_wait_time` 最长能轮询
+    60 秒 × 3 秒 sleep），`is_alive=False` 要等该链路返回才被循环检查到；
+    期间界面上已经是「已暂停」，日志却还在刷查询 —— 用户看到的就是
+    「显示已暂停但后台还在运行」。
+
+    这里每 30 秒对一次账：只要有「引擎里存活、但 db 已不是 active」的任务，
+    就重新发布一次任务列表让引擎把它摘除，并记一条日志说明发生了什么。
+    **只在真的不一致时才动作**，正常情况零开销。
+    """
+    from py12306.query.query import Query
+    ins = Query.__dict__.get('__it__')
+    if ins is None:
+        return
+    from py12306.helpers.func import md5
+    from py12306.webx.sync import ConfigSync
+    allowed = set()
+    for job in DataStore().job_list():
+        if not job.get('is_active'):
+            continue
+        try:
+            allowed.add(md5(ConfigSync.job_info_dict(job)))
+        except Exception:
+            pass
+    stale = [j for j in (getattr(ins, 'jobs', None) or [])
+             if getattr(j, 'is_alive', True) and str(getattr(j, 'id', '')) not in allowed]
+    if not stale:
+        return
+    names = sorted({str(getattr(j, 'job_name', '') or '') for j in stale})
+    ConfigSync.publish_jobs()
+    CommonLog.add_quick_log(
+        'webx 对账：任务已暂停但引擎仍在运行，已重新摘除 → %s' % '、'.join(names)).flush()
 
 
 def main():

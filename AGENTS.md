@@ -448,8 +448,27 @@ if self.allow_train_numbers: return self.get_info_of_train_number() in ...   # �
 - 无座编码：G/D/C 使用 `O`，普速使用 `1`；排队日期使用「中国标准时间」格式。
 - 同账号下单串行化；失败退避 30s，退避日志限频。
 - `order_log` 状态为 `queued → submitted → success/failed/unknown`；**只有取得订单号才算 success**。
-- `confirmSingleForQueue` 成功后若无法确认订单号，停止任务并标记 `unknown`，
-  要求到 12306 官方订单页核对，不得自动重复下单。
+- ⚠️ **「服务端明确拒单」≠「状态不明」，不能一概停任务**（本节最容易踩的坑）。
+  `confirmSingleForQueue` 成功后若拿不到订单号，服务端**可能已占座** → 必须停任务防重复下单，
+  标记 `unknown` 并让人去 12306 官方订单页核对。
+  但如果排队轮询**明确返回了拒单原因**（实测：「没有足够的票!」「排队人数现已超过余票数」，
+  以及 `waitTime = -2/-3` 失败/已撤销、`messages` 字段），说明 12306 **一张票都没出** ——
+  这时候停任务是大错：用户看到「排队失败」下一秒就是「任务已结束」，再也不查询了。
+  - 实现：`Order.query_order_wait_time` 被复刻包装，把结论写进 `self._webx_wait_outcome`：
+    `'ordered'`（拿到订单号）/ `'rejected'`（明确拒单，未成单）/ `'unknown'`（超时或异常）。
+  - 判定集中在 `engine_hooks._must_stop_job(order)`：
+    仅当「已 `_webx_queue_confirmed`」**且**「outcome ≠ rejected」才停任务。
+  - `rejected` 时：`order_log` 记 `failed` + 原因，写一条 `job_event`，按账号退避 30s，
+    **任务保持运行继续下一轮查询下单**。
+  - ⚠️ **退避必须覆盖所有「未成单」路径**。`confirmSingleForQueue` 返回 False
+    （日志「出票失败，错误原因 排队人数现已超过余票数…」）这条路径原本**没人调
+    `_order_flow_fail`** → 完全没有退避。实测（查询间隔 1s、余票一直挂着）会变成
+    **每 1~2 秒**打一遍 `submitOrderRequest → initDc → confirmSingleForQueue`，
+    直接触发 12306 的「由于您取消次数过多，今日将不能继续受理您的订票请求」。
+    现在 `normal_order` 的「不停任务」分支统一调 `_order_flow_fail` + 记 `failed`。
+  - 该阶段的日志原文**不带任务名**（`MESSAGE_QUERY_ORDER_WAIT_TIME_INFO/FAIL`），
+    而详情页日志是按任务名子串过滤的 → 「第 N 次排队」「排队失败，错误原因 …」在任务详情里
+    **根本看不到**。包装里已补 `_jn()` 前缀。
 - **不引入 Playwright / 无头浏览器等额外依赖**：协议修正后的原 `requests_html` 会话是唯一下单主路径。
 
 ### 5.19 服务以 0 个任务启动后，新建任务不查询
@@ -462,6 +481,60 @@ if self.allow_train_numbers: return self.get_info_of_train_number() in ...   # �
 ——用锁与运行标记保证同一时刻只有一个查询循环；任务变更后若存在可运行 Job
 且循环已退出，则以 daemon 线程重启 `start()`；刷新前先摘掉已 `destroy` 的 Job，
 使「暂停后再启用」能重建实例。
+
+### 5.20 ★ 任务只能用 `Job.id` 定位，不能用 `job_name`
+
+**症状**：两个同名任务（用户很容易建两个「广州南→马踏·2026/10/01」）时
+「显示已暂停，后台还在运行」、命中/查询次数记到错的任务上、结束原因写错行。
+
+**根因**：`Job.id = md5(job_info_dict)`，而 `job_info_dict` 原来**没有任何唯一字段** →
+  - 配置完全相同的两个任务会算出**同一个 md5** → `Query.refresh_jobs()` 按 id 匹配，
+    第二行复用第一行的 Job 实例（其中一个永不运行）；暂停其中一个时另一个仍在
+    `QUERY_JOBS` → 引擎继续查询那个「已暂停」的任务。
+  - webx 侧一律用 `db.job_id_by_name()` 反查任务行 →
+    同名任务全部落到「最新那一行」（`ORDER BY id DESC LIMIT 1`）→
+    命中/查询/事件/结束状态**全记到错的任务上**。
+
+**修法**（两处必须一起改）：
+1. `sync.job_info_dict()` 加 `'webx_id': job_id` → 每行的 `Job.id` 唯一。
+   （副作用：既有任务 id 变化 → 引擎一次性重建，无害。）
+2. `sync.ConfigSync.engine_job_index()` 提供 `{Job.id: db job_id}`；
+   `engine_hooks._job_id_for(job)` / `routes_jobs._job_alive()` 改用它。
+   **所有落库点都传 Job 实例**（`_record_hit` / `_record_success` / `_record_job_finished` /
+   `_order_attempt_update` / `_hook_query_count` / `_evjob`），不再传 job_name。
+   `job_id_by_name()` 只作为「拿不到 Job.id」时的兜底。
+3. `routes_jobs._engine_jobs()` 改为 `{Job.id: is_alive}`（原来按 job_name，
+   同名任务共享同一个存活状态），并在 `_job_view` 暴露 `engine_alive` 便于核对。
+
+**自愈兜底**：`main_web._reconcile_paused_jobs()`（挂在 30s 守护里）——
+若有「引擎里存活、但 db 已不是 active」的任务就重新 `publish_jobs()` 摘掉并记日志。
+对付「暂停时引擎正卡在长耗时下单/排队链路（`query_order_wait_time` 最长 60s×3s sleep），
+`is_alive=False` 要等该链路返回才被循环检查到」。
+
+### 5.21 账号登录后要立刻显示「已登录」
+
+**症状**：扫码/密码登录成功，界面仍显示「离线」，要过一会儿（最长 2 分钟）才翻过来。
+
+**根因**：界面「在线」取自引擎 `UserJob.is_ready`，而它只在
+`check_heartbeat() → user_did_load()` 里被置 True。但 `check_heartbeat()` 开头有短路：
+
+```python
+if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Config().USER_HEARTBEAT_INTERVAL:
+    return True          # ← 连 check_user_is_login() 都不调，更不会置 is_ready
+```
+
+`USER_HEARTBEAT_INTERVAL` 默认 **120 秒**（实测确认：故意把心跳设新 → `calls=[]`、
+`is_ready` 仍为 False）。重新登录后上次心跳可能还在窗口内 → 界面「离线」最长 2 分钟。
+
+**修法**：
+- `routes_accounts_write._force_engine_ready(key)`：清心跳时间戳（解除短路）+
+  让引擎读一次刚落盘的 cookie（`load_user() → did_loaded_user() → user_did_load()`
+  → `is_ready=True`）。`_do_login_success()` 里在 `publish_accounts()` 之后调用。
+  实测：`is_ready` 立即变 True。
+- `routes_accounts.accounts_list()`：引擎里**还没有该账号对象**时（全新账号刚扫码、尚未发布到引擎）
+  用 db 的 `login_ok && active` 兜底。⚠️ **只在引擎没有该对象时兜底** ——
+  引擎有对象且 `is_ready=False` 说明会话真的失效，不能谎报在线（否则掉线被静默掩盖）。
+- 前端 `checkQr()` 在 `state=success` 时已经立即调 `loadAccounts()`，无需改动。
 
 ---
 

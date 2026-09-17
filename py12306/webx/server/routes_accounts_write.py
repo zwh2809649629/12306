@@ -56,6 +56,47 @@ def _acc_name(acc):
     return name
 
 
+def _force_engine_ready(key):
+    """
+    让引擎**立刻**认得刚写好的会话，而不是等它自己的心跳周期。
+
+    背景（用户反馈「账号登录了但状态没立马更新」）：
+    界面上的「在线」取自引擎内存 `UserJob.is_ready`，而它只在
+    `check_heartbeat()` → `user_did_load()` 里被置 True。
+    但 `check_heartbeat()` 开头有这么一条短路：
+
+        if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < USER_HEARTBEAT_INTERVAL:
+            return True          # ← 直接返回，不会重新判定、也不置 is_ready
+
+    `USER_HEARTBEAT_INTERVAL` 默认 **120 秒**。所以重新扫码/登录之后，
+    只要上一次心跳还在窗口内，界面就会一直显示「离线」，最长要等 2 分钟才翻过来。
+
+    这里主动：清掉心跳时间戳（解除上述短路）→ 让引擎读一次刚落盘的 cookie
+    （`load_user()` → `did_loaded_user()` → `user_did_load()` → `is_ready = True`）。
+    `did_loaded_user` 内部用的 `check_user_is_login()` / `can_access_passengers()`
+    都已被 webx 钩子改成现代 12306 可用的判定，所以这一步是同步且立即生效的。
+    引擎里还没有这个账号对象（全新账号尚未发布）时直接跳过 —— 发布流程会自己加载。
+    """
+    try:
+        from py12306.user.user import User
+        u = User().get_user(str(key))
+        if u is None:
+            return False
+        try:
+            u.set_last_heartbeat(0)
+        except Exception:
+            pass
+        ok = bool(u.load_user())
+        if ok:
+            try:
+                u.user_did_load()
+            except Exception:
+                pass
+        return ok
+    except Exception:
+        return False
+
+
 def _do_login_success(key, real_name=None):
     """登录成功收尾：db 标记 + 乘客预拉 + 发布会话。
 
@@ -90,6 +131,7 @@ def _do_login_success(key, real_name=None):
     db.account_update(key, {'user_name': real_name, 'login_ok': 1, 'active': 1})
     removed = _dedupe_by_name(key, real_name)
     ConfigSync.publish_accounts()
+    _force_engine_ready(key)
     if removed:
         UserLog.add_quick_log('webx 账号去重: %s 与账号 %s 同名，已移除重复行'
                               % (real_name, '、'.join(removed))).flush()

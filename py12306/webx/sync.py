@@ -5,7 +5,7 @@ import secrets
 import string
 
 from py12306.config import Config
-from py12306.helpers.func import singleton
+from py12306.helpers.func import md5, singleton
 from py12306.log.common_log import CommonLog
 from py12306.webx.config_store import ConfigStore
 from py12306.webx.db import DataStore
@@ -227,8 +227,21 @@ class ConfigSync:
         都是 **JSON 文本**。必须 json.loads 后再交给引擎，否则 Job.init_data 会拿到字符串，
         在 `self.stations[0]['left']` 处抛 "string indices must be integers"
         （此前发布链路因此从未成功，任务只写进了 db 却没被引擎加载）。
+
+        ⚠️ `webx_id` 是**任务行的唯一标识**，必须保留：
+        `Job.id = md5(info)`，而 info 里原来没有任何唯一字段 ——
+        两个「配置完全一样」的任务会算出**同一个 md5**，于是
+          · refresh_jobs 按 id 匹配，第二行复用第一行的 Job 实例（其中一个永不运行）；
+          · 暂停其中一个时另一个仍在 QUERY_JOBS → 引擎继续查询那个「已暂停」的任务。
+        加上 webx_id 后每个任务行的 Job.id 唯一，上述问题才根治。
+        （副作用：既有任务的 id 会变化 → 引擎一次性重建，无害。）
+
+        另外 **webx 侧一律不要再用 job_name 反查任务行**（`job_id_by_name`）：同名任务
+        会落到「最新那一行」，导致命中/计数/结束状态记到错的任务上。
+        请用 `ConfigSync.engine_job_index()` 按 Job.id 精确反查。
         """
         return {
+            'webx_id': str(job.get('job_id') or ''),
             'job_name': job.get('job_name') or '',
             'account_key': _safe_key(job.get('account_key')),
             'left_dates': _json_list(job.get('left_dates')),
@@ -241,6 +254,25 @@ class ConfigSync:
             'period': {'from': job.get('period_from') or '00:00',
                        'to': job.get('period_to') or '24:00'},
         }
+
+    @classmethod
+    def engine_job_index(cls, active_only=False):
+        """
+        {引擎 Job.id (md5 of job_info_dict): db job_id}
+
+        引擎侧只有 `Job.id`（= md5(info)）能唯一标识一个任务实例，
+        而 webx 的各种钩子（命中/下单/结束）都要落到具体的 db 行。
+        用 job_name 反查在同名任务上会串行，必须用这个索引。
+        """
+        out = {}
+        try:
+            for job in DataStore().job_list():
+                if active_only and not job.get('is_active'):
+                    continue
+                out[md5(cls.job_info_dict(job))] = job['job_id']
+        except Exception:
+            pass
+        return out
 
     @classmethod
     def _jobs_from_db(cls):

@@ -121,6 +121,17 @@ class DataStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_hit_job ON hit_log(job_id);
                 CREATE INDEX IF NOT EXISTS idx_order_job ON order_log(job_id);
+                -- 下单各阶段事件（命中/受理/initDc/排队/确认/成单/失败），
+                -- 用于详情页的阶段时序与「命中→下单」耗时统计。
+                -- order_log 是就地更新（promote），拿不到各阶段时间，所以单独记一份。
+                CREATE TABLE IF NOT EXISTS job_event (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT,
+                    kind TEXT,
+                    message TEXT,
+                    at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_evt_job ON job_event(job_id);
             ''')
             # 幂等迁移：早期库没有 start_at（CREATE TABLE IF NOT EXISTS 不会补列）。
             # 必须直接用 cur 查询：self.query() 会再取一次 self.lock，
@@ -137,6 +148,9 @@ class DataStore:
                 cur.execute('ALTER TABLE job ADD COLUMN finished_at TEXT')
             if 'finish_reason' not in cols:
                 cur.execute('ALTER TABLE job ADD COLUMN finish_reason TEXT')
+            # 按任务统计的查询次数（卡片要分别展示「已查询」与「命中」）
+            if 'query_count' not in cols:
+                cur.execute('ALTER TABLE job ADD COLUMN query_count INTEGER DEFAULT 0')
             self.conn.commit()
 
     # ---------------- 通用 ----------------
@@ -229,6 +243,25 @@ class DataStore:
     def job_record_hit(self, job_id, train_number, seat, num, left_date):
         self.execute('UPDATE job SET last_hit_at=?, hit_count=hit_count+1 WHERE job_id=?',
                      (_now(), job_id))
+
+    def job_record_query(self, job_id):
+        """每发出一条余票查询请求计数 +1（详情/卡片展示「已查询 N 次」）"""
+        if not job_id:
+            return
+        self.execute('UPDATE job SET query_count=COALESCE(query_count, 0) + 1 WHERE job_id=?',
+                     (job_id,))
+
+    # ---------------- job_event（下单阶段时序）----------------
+    def job_event_add(self, job_id, kind, message=''):
+        """记一条下单阶段事件；job_id 为空（任务未入库）时直接忽略"""
+        if not job_id:
+            return
+        self.execute('INSERT INTO job_event(job_id, kind, message, at) VALUES(?,?,?,?)',
+                     (job_id, str(kind or ''), str(message or ''), _now()))
+
+    def job_event_list(self, job_id, limit=200):
+        return self.query('SELECT kind, message, at FROM job_event WHERE job_id IS ? '
+                          'ORDER BY id DESC LIMIT ?', (job_id, limit))
 
     def job_id_by_name(self, job_name):
         """引擎侧只有 job_name，落库时反查 db job_id（查不到返回 None，允许无关联）"""

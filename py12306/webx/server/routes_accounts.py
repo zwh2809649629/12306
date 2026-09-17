@@ -46,7 +46,21 @@ def accounts_list():
     out = []
     for a in db.account_list():
         key = str(a['key'])
-        rt = runtime.get(key, {})
+        rt = runtime.get(key)
+        # 引擎里还没有这个账号对象（刚点「添加账号」扫码成功、尚未发布到引擎，
+        # 或服务刚起还没 init_users）→ 用 DB 里的「已验证登录」兜底，
+        # 否则刚扫码成功的那一刻界面仍显示「离线」，看起来像登录没生效。
+        # ⚠️ 只在**引擎没有该对象**时兜底：引擎有对象且 is_ready=False 说明会话真的失效，
+        # 这时不能谎报「在线」，否则账号掉线会被静默掩盖。
+        if rt is None:
+            verified = bool(a.get('login_ok')) and bool(a.get('active'))
+            rt = {
+                'online': verified,
+                'is_ready': verified,
+                'last_heartbeat': None,
+                'login_num': 0,
+                'passenger_count': 0,
+            }
         out.append({
             'key': a['key'],
             'user_name': _mask(a.get('user_name')),
