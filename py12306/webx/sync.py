@@ -172,6 +172,12 @@ class ConfigSync:
         return [a for a in (accounts or []) if a.get('key') in live]
 
     @staticmethod
+    def prune_dead_users():
+        """公开入口：摘掉引擎 `User.users` 里 is_alive=False 的僵尸账号对象。
+        见 `_prune_dead_users` 的说明（main_web 的 30s 守护会定期调它）。"""
+        ConfigSync._prune_dead_users()
+
+    @staticmethod
     def _prune_dead_users():
         """
         引擎 User.users 只增不减：destroy() 只把 is_alive 置 False，不摘除列表项。
@@ -253,6 +259,11 @@ class ConfigSync:
             'except_train_numbers': _json_list(job.get('except_train_numbers')),
             'period': {'from': job.get('period_from') or '00:00',
                        'to': job.get('period_to') or '24:00'},
+            # webx 自有字段：引擎的 `Job.init_data` 不认这个键，但 webx 的
+            # `Job.init_data` 包装（engine_hooks._hook_job_init_data）会把它挂到实例上，
+            # 供 `_hook_station_filter` 判断「同城站扩展 / 仅指定站名」。
+            # ⚠️ 加进这个 dict 会改变 md5 → 既有任务的 Job.id 变化 → 一次性重建（无害）。
+            'webx_station_mode': _station_mode(job.get('station_mode')),
         }
 
     @classmethod
@@ -351,6 +362,16 @@ def _json_list(value):
         return out if isinstance(out, list) else []
     except Exception:
         return []
+
+
+def _station_mode(value):
+    """
+    站点匹配方式：`exact`（仅指定站名，新建任务的默认）/ `expand`（同城站扩展）。
+    ⚠️ 读不到值时兜底 `expand`：该列是后加的，`ALTER TABLE ... DEFAULT 'expand'`
+    给历史行填的就是 expand —— 保持老任务原行为，不要静默改变语义。
+    """
+    v = str(value or '').strip().lower()
+    return v if v in ('expand', 'exact') else 'expand'
 
 
 def _pbkdf2(password, salt):

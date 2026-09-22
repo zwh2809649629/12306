@@ -57,6 +57,32 @@ def create_job():
     ]
     if not stations:
         return {'code': 1, 'msg': '请至少填一组出发/到达', 'data': None}
+    # 站点匹配方式：exact=仅指定站名（**默认**，引擎只抢与输入完全同名的站）/ expand=同城站扩展。
+    # 12306 的余票结果本来就会混入同城其它站（AGENTS.md §5.25），默认取最不容易买错站的一种。
+    station_mode = str(body.get('station_mode') or '').strip().lower()
+    if station_mode not in ('expand', 'exact'):
+        station_mode = 'exact'
+    # 站名校验：站名写错时引擎的 `Station.get_station_key_by_name()` 会抛 KeyError，
+    # 或（改名/新站时）拿不到电报码 → 查询静默失败、任务看起来在跑但永远没结果。
+    # 这里提前拦住，并把「这个输入会匹配哪些站」一并回给前端，让同城扩展规则可见。
+    try:
+        from py12306.webx import stations as st_mod
+        bad, hints = [], []
+        for s in stations:
+            for role, name in (('出发', s['left']), ('到达', s['arrive'])):
+                info = st_mod.describe(name, station_mode)
+                if not info['known']:
+                    bad.append('%s站「%s」' % (role, name))
+                elif station_mode == 'exact' and not info['exact']:
+                    bad.append('%s站「%s」不是完整站名' % (role, name))
+                else:
+                    hints.append(info)
+        if bad:
+            tail = '（「仅指定站名」模式需从下拉里选完整站名）' if station_mode == 'exact' else '（可在输入框下拉里选择）'
+            return {'code': 1, 'msg': '未收录或不合法：%s。请检查站名%s' % ('、'.join(bad), tail),
+                    'data': None}
+    except Exception:
+        hints = None
     dates = [str(d).strip() for d in (body.get('left_dates') or []) if str(d).strip()]
     if not dates:
         return {'code': 1, 'msg': '请至少选择一个出行日期', 'data': None}
@@ -108,11 +134,20 @@ def create_job():
         'interval_min': imin,
         'interval_max': imax,
         'start_at': start_at,
+        'query_mode': 'train' if body.get('query_mode') == 'train' else 'range',
+        'station_mode': station_mode,
         'is_active': 1,
     })
     ConfigSync.publish_jobs()
     CommonLog.add_quick_log('webx 创建任务: %s (%s)' % (name, job_id)).flush()
-    return {'code': 0, 'msg': '已创建', 'data': {'job_id': job_id}}
+    # 把「区间 → 实际匹配的车站」回给前端写进日志：同城扩展是引擎侧的过滤规则，
+    # 不写出来用户根本不知道「广州」= 6 个站、「广州南」= 只 1 个站。
+    if hints:
+        for h in hints:
+            CommonLog.add_quick_log('webx 区间站点(%s): %s → %s'
+                                    % (station_mode, h['input'], h['note'])).flush()
+    return {'code': 0, 'msg': '已创建',
+            'data': {'job_id': job_id, 'station_notes': hints or [], 'station_mode': station_mode}}
 
 
 @bp.route('/api/jobs/toggle', methods=['POST'])
@@ -158,6 +193,15 @@ def update_job(job_id):
                        ('members', 'members'), ('stations', 'stations')):
         if key in body and isinstance(body.get(key), list):
             patch[key] = body.get(key)
+    # 站点匹配方式（exact / expand）；非法值就保持任务原有设置，不要强行重置
+    if 'station_mode' in body:
+        sm = str(body.get('station_mode') or '').strip().lower()
+        if sm in ('expand', 'exact'):
+            patch['station_mode'] = sm
+    if 'query_mode' in body:
+        qm = str(body.get('query_mode') or '').strip().lower()
+        if qm in ('train', 'range'):
+            patch['query_mode'] = qm
     # 定时开始：与 create 同一套校验（非法则视为未设置）
     if 'start_at' in body:
         sa = str(body.get('start_at') or '').strip()

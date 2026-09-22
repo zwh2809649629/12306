@@ -136,6 +136,15 @@ def _start_webx_daemons():
                 _reconcile_paused_jobs()
             except Exception:
                 pass
+            try:
+                # 引擎 User.users 只增不减（destroy 只置 is_alive=False）。
+                # 僵尸对象留在列表最前面时，get_passenger_for_members 会一直卡在
+                # 那个永不就绪的对象上（每 3s 刷「账号正在登录中」）。
+                # 发布账号时已会摘一次，但那只在账号列表变化时跑，这里定期兜底。
+                from py12306.webx.sync import ConfigSync
+                ConfigSync.prune_dead_users()
+            except Exception:
+                pass
             time.sleep(30)
 
     t = threading.Thread(target=daily_counter)

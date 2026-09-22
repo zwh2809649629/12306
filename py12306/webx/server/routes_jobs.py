@@ -260,6 +260,12 @@ def _job_view(job, db):
         'period': {'from': job.get('period_from') or '00:00', 'to': job.get('period_to') or '24:00'},
         'interval': {'min': job.get('interval_min'), 'max': job.get('interval_max')},
         'start_at': job.get('start_at') or '',
+        'query_mode': job.get('query_mode') or '',
+        # 站点匹配方式：exact=仅指定站名（新建任务的默认）/ expand=同城站扩展（「广州」= 10 个站）。
+        # 12306 的余票结果本来就会混入同城其它站（AGENTS.md §5.25），这里决定过滤的宽严。
+        # ⚠️ 兜底值仍是 'expand'：列刚加时 ALTER TABLE 给历史行填的就是 'expand'，
+        #    只会在行为真的读不到该列时才会走到（保持老任务原行为，不要静默改语义）。
+        'station_mode': job.get('station_mode') or 'expand',
         'is_active': active,
         'created_at': job.get('created_at'),
         'updated_at': job.get('updated_at'),
@@ -337,6 +343,9 @@ EVENT_LABELS = {
     'confirm': '排队确认',
     'success': '下单成功',
     'fail': '失败',
+    # 站点过滤：12306 的同城站扩展会让「深圳北→广州南」的查询结果里混入
+    # 「深圳北→广州东」等车次，引擎按用户输入过滤掉它们时记这条（见 engine_hooks._hook_station_filter）
+    'skip': '站点过滤',
 }
 
 
@@ -430,39 +439,74 @@ def _job_logs(job_name, limit=100):
 
 @bp.route('/api/stations')
 def stations():
+    """
+    站名联想。站名来源统一走 `webx.stations`（本地表 ∪ 12306 官方表）——
+    本地 `data/stations.txt` 不含新开站（实测「湛江北」「茂名南」「番禺」都查不到），
+    只用本地表时这些站在下拉里永远找不到、也没法在区间里填。
+    """
     q = (request.args.get('q') or '').strip()
-    try:
-        from py12306.helpers.station import Station
-        s = Station()
-    except Exception as e:
-        return {'code': 1, 'msg': 'station unavailable: %s' % e, 'data': None}
     if not q:
         return {'code': 0, 'msg': '', 'data': {'list': []}}
+    from py12306.webx import stations as st
+    # 拼音/电报码只有本地表有，先建一份索引（官方表只给 站名 + 电报码）
+    pinyin_of, code_of = {}, {}
+    try:
+        from py12306.helpers.station import Station
+        for info in Station().stations:
+            nm = info.get('name') or ''
+            if nm:
+                pinyin_of[nm] = info.get('pinyin') or ''
+                code_of[nm] = info.get('key') or ''
+    except Exception:
+        pass
     ql = q.lower()
-    # 注意子串方向：应判断「输入」是否包含在「站名/拼音」里。
-    # 原实现写成 `st['name'] in q`，输入「北」永远匹配不到「北京」→ 下拉恒为空。
     ranked = []
-    for st in s.stations:
-        name = st.get('name') or ''
-        pinyin = (st.get('pinyin') or '').lower()
-        key = (st.get('key') or '').upper()
+    for name in st.names():
+        py = (pinyin_of.get(name) or '').lower()
         if name == q:
             score = 0
         elif name.startswith(q):
             score = 1
-        elif pinyin.startswith(ql):
+        elif py and py.startswith(ql):
             score = 2
         elif q in name:
             score = 3
-        elif ql and ql in pinyin:
+        elif py and ql in py:
             score = 4
-        elif q.upper() == key:
+        elif q.upper() == (code_of.get(name) or '').upper():
             score = 5
         else:
             continue
-        ranked.append((score, len(name), {'name': name, 'pinyin': st.get('pinyin', ''), 'key': st.get('key')}))
+        ranked.append((score, len(name), {'name': name, 'pinyin': pinyin_of.get(name, '')}))
     ranked.sort(key=lambda x: (x[0], x[1]))
     return {'code': 0, 'msg': '', 'data': {'list': [x[2] for x in ranked[:20]]}}
+
+
+@bp.route('/api/stations/expand')
+def stations_expand():
+    """
+    某个输入实际会匹配到哪些**车站**（规则与引擎侧 `webx/stations.py` 完全同源）。
+
+    为什么需要它：12306 查询会做「同城站扩展」—— 查「深圳北 → 广州南」实际返回
+    深圳北/福田/深圳 → 广州东/广州/新塘… 共 567 条结果，而引擎原先只按时段 + 车次白名单
+    过滤、不校验行的实际到发站，于是真的把「深圳北 → 广州东」的票下了单。
+    现在引擎侧按同一套规则过滤，这里把规则**展示给用户**，避免「我填了广州南，
+    怎么广州东也算」这类意外（也顺手校验站名是否存在）。
+
+    `mode=expand|exact`（默认 exact，与新建任务的默认一致）与任务的 `station_mode` 对应。
+    """
+    from py12306.webx import stations as st
+    raw = request.args.get('q') or ''
+    mode = (request.args.get('mode') or 'exact').strip().lower()
+    if mode not in ('expand', 'exact'):
+        mode = 'exact'
+    items = [x for x in raw.split('|') if x.strip()]
+    if not items:
+        return {'code': 1, 'msg': '缺少 q 参数', 'data': None}
+    return {'code': 0, 'msg': '', 'data': {
+        'mode': mode,
+        'list': [st.describe(x.strip(), mode) for x in items[:40]],
+    }}
 
 
 @bp.route('/api/dates')

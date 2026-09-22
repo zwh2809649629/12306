@@ -7,11 +7,12 @@ PUT/POST /api/settings
   特例：web.password 非空时改管理台口令（db.login_user_set_password），成功后配置值清空。
 """
 import re
+import copy
 
 from flask import Blueprint, request
 
 from py12306.log.common_log import CommonLog
-from py12306.webx.config_store import ConfigStore
+from py12306.webx.config_store import ConfigStore, _deep_merge
 from py12306.webx.db import DataStore
 from py12306.webx.sync import ConfigSync, _pbkdf2
 
@@ -57,9 +58,31 @@ def settings_save():
         except Exception:
             try: return int(float(dflt))
             except Exception: return 0
+    def _interval(value, fallback):
+        if isinstance(value, dict):
+            old_min = fallback.get('min') if isinstance(fallback, dict) else float(fallback) / 2
+            old_max = fallback.get('max') if isinstance(fallback, dict) else float(fallback)
+            try: low = float(value.get('min', old_min))
+            except Exception: low = float(old_min)
+            try: high = float(value.get('max', old_max))
+            except Exception: high = float(old_max)
+        else:
+            try:
+                high = float(value)
+                low = high / 2
+            except Exception:
+                if isinstance(fallback, dict):
+                    low, high = float(fallback.get('min', 0.5)), float(fallback.get('max', 1))
+                else:
+                    high = float(fallback)
+                    low = high / 2
+        low = max(0.1, low)
+        high = max(low, high)
+        return {'min': low, 'max': high}
     cfg_q = data.get('query') or {}
-    cfg_q['interval'] = _f(patch.get('query', {}), 'interval', cfg_q.get('interval', 1))
+    cfg_q['interval'] = _interval((patch.get('query') or {}).get('interval'), cfg_q.get('interval', 1))
     cfg_q['request_max_retry'] = _i(patch.get('query', {}), 'request_max_retry', cfg_q.get('request_max_retry', 5))
+    cfg_q['thread_enabled'] = _i(patch.get('query', {}), 'thread_enabled', cfg_q.get('thread_enabled', 0))
     cfg_q['job_timeout'] = _f(patch.get('query', {}), 'job_timeout', cfg_q.get('job_timeout', 3))
     patch['query'] = cfg_q
     cfg_u = data.get('user') or {}
@@ -71,6 +94,39 @@ def settings_save():
     cfg_c = data.get('cluster') or {}
     cfg_c['redis_port'] = str(_i(patch.get('cluster', {}), 'redis_port', cfg_c.get('redis_port', 6379)))
     patch['cluster'] = cfg_c
+
+    effective = copy.deepcopy(data)
+    _deep_merge(effective, patch)
+
+    def _on(value):
+        return value is True or value == 1 or value == '1'
+
+    notification = effective.get('notification') or {}
+    required_notifications = {
+        'voice_code': ('app_code', 'phone'),
+        'dingtalk': ('webhook',),
+        'telegram': ('bot_api_url',),
+        'serverchan': ('key',),
+        'pushbear': ('key',),
+        'bark': ('push_url',),
+        'email': ('sender', 'receiver', 'host', 'user', 'password'),
+    }
+    for name, fields in required_notifications.items():
+        item = notification.get(name) or {}
+        if _on(item.get('enabled')) and any(not str(item.get(field) or '').strip() for field in fields):
+            return {'code': 1, 'msg': '通知渠道“%s”尚未填写完整配置，不能启用' % name, 'data': None}
+
+    cdn = effective.get('cdn') or {}
+    if _on(cdn.get('enabled')):
+        try:
+            if float(cdn.get('check_time_out')) <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return {'code': 1, 'msg': '启用 CDN 前请设置大于 0 的检测超时', 'data': None}
+
+    rail = effective.get('rail') or {}
+    if _on(rail.get('cache_enabled')) and (not str(rail.get('device_id') or '').strip() or not str(rail.get('expiration') or '').strip()):
+        return {'code': 1, 'msg': '启用 RAIL 设备缓存前请填写设备 ID 和过期值', 'data': None}
 
     # 4) 落盘 + 生效
     try:

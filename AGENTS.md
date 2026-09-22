@@ -3,7 +3,7 @@
 > 面向**任何 AI agent 或新加入的开发者**的项目交接文档。
 > 读这一份就能上手：改了哪些东西、为什么这么改、哪些坑踩过、怎么验证。
 >
-> 最后更新：2026-09-16 · Python 3.12.14 · Flask 3.1.3
+> 最后更新：2026-09-17 · Python 3.12.14 · Flask 3.1.3
 
 ---
 
@@ -90,8 +90,7 @@ py12306/                   原版引擎（不要改）
   └ webx/                  ★ 所有二次开发代码都在这
       ├ config_store.py        webx.json 读写（原子写 + 密钥脱敏）
       ├ db.py                  SQLite 封装（唯一数据源）
-      ├ sync.py                webx(db/json) → 原版 Config 的桥接
-      ├ webx12306.py           独立 12306 登录助手（扫码/密码/乘客）
+      ├ sync.py                webx(db/json) → 原版 Config 的桥接      ├─ stations.py            ★ 站名解析（本地表 ∪ 12306 官方表；同城站前缀展开）      ├ webx12306.py           独立 12306 登录助手（扫码/密码/乘客）
       ├ engine_hooks.py        ★ 包装原引擎方法（不改原文件的扩展方式）
       ├ presale.py             预售期唯一事实来源
       ├ server/                Flask 蓝图（REST API）
@@ -192,7 +191,7 @@ def _hook_something():
 ```
 约定：标记 `_webx_wrapped` / `_webx_original`；`install()` 幂等；回调内 `try/except` 兜底。
 
-### 当前已装的 11 个钩子（`engine_hooks.install()`）
+### 当前已装的 16 个钩子（`engine_hooks.install()`）
 
 | 钩子 | 目的 |
 |---|---|
@@ -206,6 +205,13 @@ def _hook_something():
 | `UserJob.get_user_passengers` | 顾客原始字段 + 防递归 |
 | `UserJob.can_access_passengers` | 就绪探针走 webx 策略 |
 | `Query.start/update_query_jobs` | 零任务启动后，启用任务自动重启查询循环 |
+| `Job.query_by_date` | 按任务统计「已查询」次数 |
+| `Job.destroy` | 结束状态 + 原因落库 |
+| `Job.init_data` | 把 webx 自有任务字段（`webx_station_mode`）挂到实例上（§5.25） |
+| `Job.is_trains_number_valid` | ★ **只抢指定车站**：修 12306 同城站扩展导致的错站下单（§5.25） |
+| `is_main_thread`（多模块同名全局） | ★ 查询循环线程的日志落盘（§5.26） |
+| `UserJob.wait_for_ready` | ★ 账号等待限频 + 自愈（§5.27） |
+| `User.get_passenger_for_members` | ★ 跳过僵尸账号对象（§5.27） |
 | `Request/UserJob/Order` 下单状态机 | 诚实阶段日志、initDc 保护、防重和失败落库（§5.18） |
 
 ---
@@ -370,8 +376,8 @@ class BaseLog:
 | 原始值 | 含义 | 我们显示 |
 |---|---|---|
 | `''` / `'N'` | **该车不设此席别** | `/`（灰、不可点、无票价） |
-| `'无'` | 有该席别但当前无票 | `无` + 票价估算（**可选中**） |
-| `'有'` / 数字 | 有票 | 有 / 数字 + 票价 |
+| `'无'` | 有该席别但当前无票 | `无` + 真实票价（**可选中**） |
+| `'有'` / 数字 | 有票 | 有 / 数字 + 真实票价 |
 
 后端 `routes_tickets` 写 `seat_map[key] = '/' if raw in ('', 'N') else raw`。
 前端两个判据（`main.js`）：
@@ -536,6 +542,372 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
   引擎有对象且 `is_ready=False` 说明会话真的失效，不能谎报在线（否则掉线被静默掩盖）。
 - 前端 `checkQr()` 在 `state=success` 时已经立即调 `loadAccounts()`，无需改动。
 
+### 5.22 经停站与票价
+
+车次列表点**车次号**会打开「经停站」弹窗（`GET /api/tickets/stops`）。接口实测结论（2026-09）：
+
+| 接口 | 结果 |
+|---|---|
+| `GET /otn/queryTrainInfo/query?leftTicketDTO.train_no=..&leftTicketDTO.train_date=..&rand_code=` | ✅ 200 JSON，`data.data[]` 含 station_name / station_no / arrive_time / start_time / arrive_day_str / arrive_day_diff / running_time |
+| `GET /otn/cndata/queryByTrainNo?...` | ❌ 返回 **HTML 错误页**（`Content-Type: text/html`） |
+| `GET /lcquery/queryTrainStopTime?...` | ❌ 返回 `{"status":true,"data":"","errorMsg":"url error"}` |
+| `GET /otn/leftTicket/queryTicketPrice?...&to_station_no=..` | ❌ **只返回 `train_no`，没有任何价格**（补 Referer / X-Requested-With / 各种 seat_types 都试过） |
+| `GET /otn/leftTicketPrice/query?leftTicketDTO.train_no=..&from_station=..&to_station=..&train_date=..&rand_code=` | ✅ **真实票价**（本条即 `PRICE_URL`） |
+| `GET /otn/leftTicketPrice/queryAllPublicPrice` | ❌ 405，**没有批量接口**，只能逐车次查 |
+
+- ⚠️ **`train_no` 不是车次号**：车次号是 `t[3]`（`Z8006`），`train_no` 是 `t[2]`（`65000Z80060Y`）。
+  停靠站与票价接口都只认后者。`/api/tickets` 的每行因此新增 `no` / `from_no` / `to_no` /
+  `seat_types` / `f_code` / `to_code`（`t[2]` / `t[16]` / `t[17]` / `t[15]` / `t[6]` / `t[7]`）。
+
+#### ★ 真实票价：已彻底取代「历时 × 单价」估算
+
+**为什么必须换**：估算按**历时**，而真实票价按**里程** —— 同样 1 分钟，跑 200km/h 的
+深茂铁路比跑 350km/h 的京沪高铁走得短得多，于是估算在两个方向上都会错很多：
+
+| 车次 | 区间 | 历时 | 旧估算 | 12306 真实 | 误差 |
+|---|---|---|---|---|---|
+| G531 | 北京南→上海虹桥 | 5:56 | ¥292 | **¥661** | 低 56% |
+| G5148 | 深圳→马踏 | 2:35 | ¥127 | **¥278** | 低 54% |
+| G5148 | 深圳→茂名南 | 2:50 | ¥139 | **¥308** | 低 55% |
+| Z8006 | 深圳东→三亚 | 19:08 | ¥241 | **¥267.5** | 低 10% |
+
+（正是用户报的「G5148 票价和 12306 不一致、低了一半」的根因。）
+
+- 前端 `priceOf(leg, k)` 返回 `数字 | null`，**永不估算**；拿不到就显示 `—`。
+  旧函数 `seatPrice` / `isHighSpeed` / `HIGH_SPEED_TYPES` 已删除，不要再加回来。
+- 接口 `GET /api/tickets/prices?date=&items=train_no:from:to|...`（最多 150 项）→
+  `{ "train_no:from:to": {seat_key: 元} }`。前端 `MON.prices` + `loadPrices()`（差量拉取，
+  已缓存的 key 不重复请求）+ `paintPrices()`（**原地**改 `td.seat` 里的 `small.seat-price`，
+  不重建整表，避免打断勾选状态）。
+- 服务端 `_PRICE_CACHE`（TTL 6h，4 线程并发）；**只缓存非空结果** —— 空结果可能是临时失败。
+- 价格字段是**「角」的字符串**，需 `/10`：`'02780'` → `278.0`；`'--'` → 该席别不适用（不展示）。
+- 请求必须带 `Referer: <init 页>?linktypeid=dc&date=<日期>&flag=N,N,Y` + `X-Requested-With`，
+  否则 302 / 空数据。单次约 **125ms**。
+
+⚠️ **必须用「行自己的」电报码**（`t[6]`/`t[7]`），**不能用查询时输入站的电报码**。
+踩过：用查询站（深圳北=IOQ）去查 G5148 拿到 `{"status":true,"data":[]}`，一度误判
+「接口已下线」。实际是 12306 做了**同城站扩展** —— 行的实际站是 深圳=SZQ，接口只认行自己的站码。
+（站码写错**不报错**，只返回空数组 —— 这就是它容易被误判成「接口挂了」的原因。）
+
+#### ★ 站名 → 电报码：三级兜底（`routes_tickets._to_code()`）
+
+「在经停站里改成中间站」之后，行里原有的电报码已不再描述这对站，我们**只剩站名**。
+而本地 `data/stations.txt` **不含新开站**（实测「湛江北」「茂名南」都查不到）→ 必须兜底：
+
+1. 本地站点表 `Station.get_station_key_by_name()`（快，但缺新站）；
+2. 余票响应的 `data.map`（电报码→站名）—— 每次查询累积进 `_STATION_CODES`，**免费**，
+   但只含**本次查询涉及的站**（实测 深圳北→茂名 的 map 里「茂名南」有、「湛江北」没有）；
+3. **12306 官方站名表** `https://kyfw.12306.cn/otn/resources/js/framework/station_name.js`
+   —— 3385 站、**含全部新站**，用 `station_names\s*=\s*'(.*?)'` 抠出 `@` 分隔的
+   `拼音|站名|电报码|...`。懒加载（只在前面都解析不出来时才请求）+ 落盘缓存
+   `runtime/station_codes.json`（TTL 7 天，失败 300s 后重试）。
+
+实测：接入后「深圳→湛江北」从 `—` 变为 商务座 ¥1240 / 一等座 ¥561 / 二等座 ¥366 / 无座 ¥366，
+与直接打接口一致。
+
+- **经停站弹窗不展示价格**（`/api/tickets/stops` 不返回 `price`/`seat`/`high_speed`）：
+  票价的正确性依赖「行自己的站码 + 可售区间」，弹窗里的中间站组合未必可售，
+  展示容易误导。弹窗只展示 12306 真实返回的字段（到站 / 出发 / 停留 / 累计历时）。
+  ⚠️ 后续不要再把价格加回经停站面板。
+- ⚠️ **弹窗必须放在所有 `.view` 之外**（`index.html` 里 `#stopsModal` / `#taskModal` 放在 `#app`
+  之后、与 `.toast` 同级）。`.view{display:none}`，弹窗原本嵌在 `#view-monitor` 里 →
+  切到新建任务页时 `#view-monitor` 是 `display:none`，**`position:fixed` 也逃不出
+  `display:none` 的祖先** → 弹窗被整个隐藏（`class` 上有 `open`、DOM 内容也对，但用户看不到）。
+  症状就是「在新建任务页点车次号没有任何窗口」。🔎 排查手法：沿 `parentElement` 链数
+  `getComputedStyle(el).display`，找出第一个 `none`；**别只看弹窗自己的 display**。
+  推论：正因为弹窗现在在 `.view` 之外，CSS 只需**单 id** 前缀
+  （曾经的冲突源 `.view#view-monitor .table{min-width:1100px}` 已命中不到它）。
+  **若日后又把弹窗移回某个 `.view` 内，必须改回两级 id 才能压过它。**
+- 弹窗内时长文案去掉空格（`5小时56分`）以免窄列溢出；「站名」列用 `auto` 吃剩余宽度，
+  否则「上海虹桥」这类 4 字站名会被 `text-overflow:ellipsis` 截断。
+- **可在列表里改「上车站 / 下车站」**（车票查询页与新建任务页两处入口都可）：
+  典型场景是全程区间没票、但中间某段有票（如 深圳东→三亚 无票，东莞→海口 有票）。
+  - 每行两个按钮（上 / 下）；`i >= STOPS.to` 的行「上」禁用、`i <= STOPS.from` 的行「下」禁用，
+    从 UI 上保证「上车必须早于下车」（比事后报错体验好）。
+  - 选择是**暂存**的，点「应用区间」才写回；「恢复原区间」= 回到**该车次当前区间**
+    （不是重置成 12306 的始发→终点 —— 用户改完想反悔，期望回到改之前的样子）。
+  - 写回时**站名 / 到发时刻 / 历时一起重算**（上车用该站「出发」、下车用「到达」，
+    历时 = 两站 `elapsed` 之差）。只改站名不改时间会让卡片自相矛盾。
+  - 同时把 `leg.bookable = false` 清掉可订标记：`leg.s`（席别余票）是**原区间**的数据，
+    改区间后已不再适用（弹窗里有文案说明）。
+  - `leg` 是 `MON.rows` 与 `APP.taskPicked[].leg` **共享的引用**，所以改一处两边同时生效；
+    `pickedPairs()` 推导的任务区间、`updateNtSummary()` 的预估金额也跟着变。
+  - 刷新统一走 `refreshAfterLegChange()`（车票列表 / 任务卡片 / 推导行 / 摘要）。
+- 新建任务页的**车次卡片里车次号同样是按钮**（`.task-train-stops`），样式与原纯文本一致，
+  只是多了虚线底边与 hover 底色提示可点。
+
+### 5.23 表头固定：`overflow-x:auto` 会让元素变成滚动容器
+
+**症状**：给 `thead th` 加了 `position:sticky; top:0`，页面滚动时表头**照样被卷走**。
+
+**根因**：CSS 规范规定「一轴非 `visible` 时另一轴不能是 `visible`」——
+`.scroll{overflow-x:auto}` 会让 `overflow-y` **计算成 `auto`**，于是 `.scroll` 自己就是滚动容器。
+它没有高度约束时不会竖向滚动，sticky 便相对它的 scrollport 定位 → 页面滚动时毫无效果。
+
+**修法（★ 2026-09 最终版：自然流 + 大高度上限，「单屏锁定/flex 填充」方案已废弃）**。
+用户最终要求：① 不压缩查询/筛选头部 ② 不强制一页 ③ 拖列表时表头固定 ④ 列表多显示行、
+不挤占原空间。因此放弃了两版「铺满单屏」：
+- ~~v1 写死 `calc(100vh - 485px)`（后改 438px）~~ ——「列表以外占多少」的常数，头部一变就失准；
+- ~~v2 flex 自适应填充单屏~~（`.main{height:100vh}` + `#view-monitor.is-active{display:flex}`
+  整条链 + `.scroll{flex:1 1 auto}`）——满足「几乎铺满」但把页面**锁死一屏**，且 768 下
+  `min-height:320px` 会把最后一行裁到视口外（`scrollBottom 781 > 768` 而 `pageScroll=0`，
+  裁切不产生页面滚动，很隐蔽）。
+最终方案只有一条核心规则（`app.css`）：
+```css
+.view#view-monitor .results-panel .scroll{max-height:calc(90vh - 40px)}
+.view#view-monitor .results-panel thead th{position:sticky;top:0;z-index:3;background:#fff}
+```
+- 页面保持**自然流**（不锁一屏）：查询/日期/筛选面板按内容高度正常排布，列表在其下方。
+- 列表行数少 → 高度就是行高本身（不撑不压）；行多 → 封顶 **`90vh - 40px`** 后列表**内部滚**，
+  `thead`（sticky）钉在列表面板顶，滚列表时表头不动（对列方便）。
+- 滚轮：列表内先消耗列表自身滚动量，滚到边界后按浏览器默认 **scroll chaining** 放行给页面，
+  不会把滚轮「困」在列表里。**不要加 `overscroll-behavior:contain`**（会吞掉边界处滚轮）。
+- **一级滚动到底时表头被顶栏盖住**不是 sticky 失效，也不应靠降低列表高度修：默认
+  `.content` 底部 `padding:40px` + 最后一个 `.panel` 的 `margin-bottom:16px` 会让页面额外
+  下滚 56px。只在车票页设
+  `.content:has(#view-monitor.is-active){padding-bottom:0}` 和
+  `#view-monitor > .panel:last-child{margin-bottom:0}`，即可让列表顶停在顶栏下方，同时保留
+  `90vh - 40px` 列表高度。实测 1680×768：修前页面到底 `listTop=20`（表头被 60px 顶栏盖住），
+  修后 `listTop=76`、`theadTop=77`；二级列表滚到 `scrollTop=900` 后仍 pinned。
+- 列表高度只为结果条预留固定的 40px，头部内容仍保持自然流；查询/筛选头部变化不会被压缩。
+  可见行数（≈18 行 @1080、≈12 行 @768，行高 53px）实测（2026-09-21）：1080 屏 54 行结果
+  `clientH=931=90vh-40px`、`scrollTop=800` 时 `theadTop=listTop+0`（sticky 成立）；其他视图
+  （dashboard/jobs/new/accounts/logs/settings）display 全部恢复原始（grid/block）。
+- batch 模式的「悬浮栏遮最后一行」padding 补丁仍生效（`:not(.batch-mode)` 隐藏，
+  `.batch-mode .scroll{padding-bottom:86px}`，实测滚到底后最后一行与悬浮栏 `overlapPx = 0`）。
+- ⚠️ 历史教训（仍有效）：表头背景**必须不透明**（`#fff`），否则行会从固定表头下透出；
+  `#view-monitor` 若在 ID 选择器上单独写 `display:flex` 会永久压过 `.view{display:none}`
+  （ID 优先级更高）→ 视图切换报废。
+
+### 5.24 车票查询页头部压缩（一屏布局 + 双点滑动条）
+
+**背景**：用户先报「出发时间的最右端太宽了，要两点滑动条」+「压缩页面头部（出发地 / 预售日期）空间，
+上方占比太大」；随后明确要求**保留设计稿排布**（标签在输入框上方、筛选项纵向排开）——
+所以最终方案是：**不动排布，只压行高 / 内边距 / 日期片宽度 / 结果条**。
+改前实测 1440×800：`.panel` 464px（占满屏 **58%**），
+其中 `.query` 116 / `.dates` 103 / `.filter` 245；列表 `.scroll` **592** 但页面另滚 336px。
+
+**改动（按收益排序）**：
+
+| 项 | 改前 | 改后 | 手段 |
+|---|---|---|---|
+| `.query` | 116 | **70** | 去掉自占一行的预售期提示（-29）；标签 `margin-bottom` 6→3、输入框 36→32、上下内边距 30→19 |
+| `.dates` | 103 | **45** | 日期片 3 行 → 2 行（「未开售」不再单独占一行，改成中划线 + 灰化 + tooltip）；**片宽 76→37px** 使 20 天在 ≥1280px 下**无需横向滚动**；滚动条 16→6px |
+| `.filter` | 245 | **203** | 行高 34→27、分段控件 36→26、底栏 34→28（**纵向排布不变**） |
+| `.bar` | 56 | **38** | 路线 + 车次数由两行合成一行（基线对齐）；按钮 30→26、padding 15→6 |
+| 上下空白 | — | **-54** | `> .panel:last-child{margin-bottom:0}`；`:has(#view-monitor.is-active){padding-bottom:16px}` |
+| **`.panel` 合计** | **464** | **317** | -32% |
+| 车次行高 | 70 | **53** | 见下「顺带修的既有问题」 |
+| 可见车次行数 | 8（但要滚整页、表头被卷走） | 列表 `max-height:calc(90vh - 40px)`：行少=自然高度，行多=封顶内部滚、表头 sticky（768→约 12 行、1080→约 17 行） | |
+
+**⚠️ 踩坑与要点**：
+
+- **CSS 改在哪**：这批规则写在 `index.html` 的**内联 `<style>` 块**里（不是末尾也行，只要在 `<link>` 之后），
+  因为 `.view#view-monitor .query .field.route-pair` 等规则在 `app.css` 里**同特异性**，
+  只能靠「更靠后」取胜（内联 `<style>` 在 `<link>` 之后解析）。
+  列表**高度**在 `app.css` 一条：`.scroll{max-height:calc(90vh - 40px)}`（为结果条预留 40px，见 §5.23）。
+- **`scrollbar-width:thin` 会让 `::-webkit-scrollbar` 失效**。Chromium 121+ 下一旦设置了标准属性，
+  同一元素上的 webkit 伪元素被忽略，`thin` 实测 11px（日期条 61px）→ 去掉后
+  `::-webkit-scrollbar{height:6px}` 生效（日期条 45px）。
+  （⚠️ `app.css` 里 `.date-strip` 也写了 `scrollbar-width:thin`，那是原型残留、本页不用。）
+- **日期片宽度决定「要不要横向滚动」**：`.date{min-width:0;flex:0 0 auto;padding:3px 5px}` +
+  字号 12/10 → 单片 37px，20 片 + 19 个 6px 间隔 ≈ 854px，1440/1366/1280 下
+  `scrollWidth - clientWidth = 0`（实测）。**改间距/字号后要重新量这个差**。
+- **查询行是 12 列网格 + `align-items:end`**：写完新字段后仍要保持
+  `.field{span 2}` / `.field.route-pair{span 4}` / `.btn{span 2}` 之和 = 12，
+  否则会折行。`.btn` 用 `align-self:end` 与输入框**底对齐**（标签在上，网格底边才是输入框底）。
+- **「交换」按钮用嵌套网格 `1fr auto 1fr`**，按钮占一个真实列 → 与输入框**零重叠**
+  （实测两侧各留 6px）。`.swap-btn{margin-bottom:3px}` 是让 26px 按钮在 32px 输入框里垂直居中。
+- **双点滑动条是自己画的**（`#mHourRange` + 两个 `<button role="slider">`，pointer 拖拽），
+  不是两个叠起来的 `input[type=range]` —— 后者依赖 `::-webkit-slider-thumb` 的
+  `pointer-events` 才能两个都拖得到，跨浏览器不稳。
+  不变量是 `0 <= from < to <= 24`（**至少 1 小时窗口**），所以两端永不交叉/互换。
+  `readHourRange()` 仍输出 `matchHour()` 认的 `['HH:00-HH:00']`（全量输出 `[]`），下游无需改动。
+  **拖动中只更新视觉，`pointerup` 才重新筛选** —— 否则每个像素都要重建整张表。
+  「**不限**」按钮在轨道**左侧**（与其他筛选行的「全部」芯片同位，默认点亮）；
+  右侧 `#mHourVal` 只显示当前区间，不限时留空但保留 `min-width`（避免切换时轨道宽度跳动）。
+- ⚠️ **Playwright 的 `page.mouse` 在 hidden 页面上不投递**（和 `page.click()` 超时同源）。
+  验证滑动条要用 `dispatchEvent(new PointerEvent('pointerdown'|'pointermove'|'pointerup'))`
+  + 先 `document.elementFromPoint(x,y)` 确认命中的是哪个元素。
+- 🔎 **`page.screenshot()` 也不可靠**：本会话里它只截到窗口物理尺寸的那一块，
+  且**不跟随 `setViewportSize` 的模拟滚动**。结论一律以
+  `getBoundingClientRect` / `getComputedStyle` **度量**为准。
+- 🔎 **量列表高度**：行少时 `.scroll` 高度 = 行高本身（不撑）；行多时 = `90vh - 40px` 封顶
+  （`clientHeight ≈ 0.9 × innerHeight`，列表内部滚）。**历史教训**：`.main{height:100vh}`
+  那版单屏方案会把超出视口的部分**裁切**而非产生页面滚动（`pageScroll` 恒 0 也可能裁掉了
+  最后一行，768 实测 `scrollBottom 781 > 768`）——已废，但排查「最后一行看不到」时仍要先
+  确认 `scrollBottom ≤ 所在滚动容器底`。
+
+**顺带修的既有问题**：`td.train` 的内边距被后来的表格规则压掉了 ——
+`app.css` 里 `.results-panel td.train{padding-top:0;padding-bottom:0}`（本意是让
+`.train-stops` 按钮自己给内边距）特异性 131，但 `index.html` 里后写的
+`.results-panel .table td{padding:9px 8px}` 也是 131 且更靠后 → 两者相加 18px，
+**行高从 52px 虚涨到 70px**（800px 高的窗口里少显示 2 行车次）。
+修法是显式压过：`.results-panel .table td.train{padding-top:0;padding-bottom:0}`（特异性 141）。
+这是 §5.16「原型/后写规则静默覆盖」的又一例 —— **改表格样式前先确认没有更靠后的同族规则**。
+
+### 5.25 ★★★ 区间设了「深圳北 → 广州南」，却下单了「深圳北 → 广州东」
+
+**症状**：用户在新建任务页的**区间查询**里填「深圳北 → 广州南」，
+结果买到了**深圳北 → 广州东**（实测订单号 `E920286710` / `E970909022`，且连续三笔）。
+这不是「偶发」，是**必然**：只要那个区间里有票，引擎就会买错站。
+
+**根因**：12306 的余票查询会做**同城站扩展**，而引擎只按「时段 + 车次白名单」过滤、**不校验行的实际到发站**。
+
+实测：查「深圳北 → 广州南」返回 **567 条**结果，其中
+
+| 到达站 | 条数 | | 出发站 | 条数 |
+|---|---|---|---|---|
+| 广州南 | 208 | | 深圳北 | 277 |
+| 广州东 | 132 | | 深圳 | 205 |
+| 新塘 | 87 | | 福田 | 64 |
+| 广州 | 55 | | 深圳东 | 16 |
+| 广州白云 / 广州北 / 番禺 / 花都 | 42 / 38 / 3 / 2 | | 深圳机场 | 5 |
+
+而 `Job.is_trains_number_valid()` 只看「出发时间在不在时段内 + 车次在不在白名单」，
+`is_has_ticket()` 只看 `canWebBuy == 'Y'` 且 `order_text == '预订'` ——
+于是「深圳北 → 广州东」的 C8012 完全符合条件。任务表里 `train_numbers = []`（不限车次）时必然中招。
+
+**修法（两个层面）**：
+
+1. **引擎侧（核心）**：`engine_hooks._hook_station_filter()` 包装 `Job.is_trains_number_valid`，
+   在原有判断之上再加一道**站点校验** —— 行的实际到发站必须落在用户输入的「前缀展开集合」里。
+   判断逻辑在 `py12306/webx/stations.py`：
+
+   | 输入 | 实际允许的站 | 说明 |
+   |---|---|---|
+   | `深圳北` | `[深圳北]` | 具体站只匹配自己 ★ 这是修复的关键 |
+   | `广州南` | `[广州南]` | 同上 |
+   | `广州` | `广州 / 广州东 / 广州北 / 广州南 / 广州西 / 广州新塘 / 广州白云 / 广州长隆 / 广州大学城 / 广州莲花山` | 城市名保留「全站」语义 |
+   | `北京` | 9 个北京站 | 同上 |
+   | `番寓`（打错） | `None` → **不过滤** | 宁可少管，也不能把「打错字」变成「一条也抢不到」的静默失败 |
+
+   - 站名解析走 `webx/stations.py`：本地 `data/stations.txt` → 余票响应 `data.map` → 12306 官方站名表
+     （`station_name.js`，3385 站，含新站；懒加载 + `runtime/station_codes.json` 缓存 7 天）。
+     ⚠️ 本地表**缺新站**：实测余票响应里出现过本地表没有的电报码 `PYA`（=番禺），
+     此时引擎的 `get_info_of_left_station()` 会直接抛 `AttributeError` ——
+     所以过滤**先拿行的原始电报码自己解析**，不要依赖那个方法。
+   - 被拦下的行会限频写一条 `job_event`（kind `skip`，标签「站点过滤」）
+     + 一行日志，形如：
+     `已按站点过滤 1 个非目标车站的车次（最近：C8012 深圳→广州东）`。
+     不写出来用户根本不知道过滤在起作用（也可能误以为「怎么少了这么多车」）。
+
+2. **界面侧**：区间输入框从「纯文本盲打」升级为
+   - 带**车站联想下拉**（与车票查询页起终点输入框同一套：`bindStationSuggest` 已泛化，
+     用同级的 `.stn-suggest` 定位，不再只认 `mFrom`/`mTo`）；
+   - **每个站名输入框正下方跟一句「实际匹配规则」**（`GET /api/stations/expand?mode=&q=A|B`
+     返回 `stations.describe()`）：
+     `深圳北 只匹配这一站`（挂在出发站下面）、`广州 会匹配 10 个站：广州、广州东…`（挂在到达站下面）。
+     ⚠️ **必须分成两条、各自挂在自己那个输入下方**（`[data-note="left"]` → 网格第 1 列、
+     `[data-note="arrive"]` → 第 3 列），不要合成一条横跨整行 —— 那样用户得自己猜
+     「哪半句说的是哪个站」。城市名/前缀用警示色，未收录/不完整站名用红色。
+     半行宽写不下 10 个站名 → 列表只列前 5 + `等 N 个`，完整列表放 `title` 里；
+   - 建任务时 `create_job` **校验站名存在**（不存在直接 400，并回 `station_notes`），
+     避免站名写错变成「任务在跑但永远没结果」。
+
+3. **可按任务选「站点匹配方式」**（`job.station_mode`，UI 在「区间地点」卡里）：
+
+   | 取值 | 含义 | 例（输入 `广州`） |
+   |---|---|---|
+   | `exact`（**默认**，UI 在**左**侧） | 仅指定站名：只认完全同名的站 | 只 1 个（广州站） |
+   | `expand`（UI 右侧） | 同城站扩展：城市名匹配该城市全部车站，具体站只匹配自己 | 10 个广州站 |
+
+   - 默认取 `exact`：最不容易买错站（就是 §5.25 这个 bug 的根因所在）。
+   - `exact` 下输入不是**完整站名**（如 `番`）时 `create_job` 直接 400 ——
+     否则任务会一条也抢不到（静默失败）；
+   - 链路：`db.job.station_mode` → `sync.job_info_dict()['webx_station_mode']` →
+     `_hook_job_init_data`（挂到 Job 实例）→ `_hook_station_filter` 读取。
+     ⚠️ 该键参与 `md5(info)` → **改 mode 会重建 Job 实例**（无害）；
+   - **默认值分两层，别改乱**：
+     「新建任务时的默认」= `exact`（前端 `ntStnMode()` 兜底 + `create_job` 缺字段时）；
+    「读不到存值时引擎侧兜底」= `expand`（`sync._station_mode` / `engine_hooks._job_station_mode` /
+     `routes_jobs._job_view`）—— 因为该列是后加的，历史任务本来就是按 expand 语义跑的，
+     **不要在旧对象上把语义骤变成 exact**；
+   - 实测（查“深圳北→广州”的 567 行真实结果，打桩 `do_order`）：
+     `expand` 放行 **247 行**（广州南/广州东/广州/广州白云…），
+     `exact` 只放行 **5 行**，**全部是 `深圳北→广州`**。
+
+**验证证据（用真实 12306 响应 + 引擎自己的 `handle_response`，`do_order` 打桩记录）**：
+
+| 场景 | 修前（进入 do_order 的行） | 修后 |
+|---|---|---|
+| 深圳北→广州南 | **42 次**，覆盖 28 种 OD，**全是** 深圳/福田/深圳东 → 广州东/广州白云/新塘/广州北（含 C8012） | **0 次** |
+| 深圳→广州（城市名） | 42 次 | 28 次（保留广州/广州东/广州南/广州北/广州白云，排除新塘） |
+| C8012（深圳→广州东）单独判定 | `True`（会被下单） | `False` |
+
+线上实证：一个运行中的「深圳北→广州南」任务详情里出现了
+`skip | 站点过滤 | 已按站点过滤 1 个非目标车站的车次（最近：C8012 深圳→广州东）`。
+
+**⚠️ 后续注意**：
+- 前缀规则是**近似**（12306 的同城扩展是按城市码，不是按名字前缀）——
+  例如「广州」匹配不到 `番禺 / 花都 / 新塘`（它们不以「广州」开头，虽然同城）。
+  所以界面**必须把那行匹配说明露出来**；用户真想要这些站时，
+  显式加多组区间（`深圳北→番禺`）即可，不要偷偷放宽规则。
+- 本地站点表与官方表的合并入口是 `webx/stations.py`；`routes_tickets` 的
+  站名→电报码解析也走它（不要再在别处各写一份站名表）。
+
+### 5.26 ★★ 抢票任务在累计查询，日志里却什么都没有
+
+**症状**：任务卡上「已查询」一直在涨、`runtime/query/status.json` 的 `query_count`
+也在涨，但任务详情/运行日志里看不到 `>> 第 N 次查询 …` / `出发日期 …` / `耗时 …`
+任何一轮查询日志。
+
+**根因（我们自己的钩子引入的）**：引擎把日志分「主线程 / 子线程」两套缓冲，
+**只有主线程才会落盘**：
+
+```python
+# py12306/log/base.py
+add_log():    self.logs.append(...) if is_main_thread() else self.thread_logs[tid].append(...)
+# py12306/log/query_log.py
+print_job_start(): ...; if is_main_thread(): self.flush(publish=False)
+# py12306/query/job.py
+Job.start() 每轮结束: if is_main_thread(): QueryLog.flush(sep='\t\t', publish=False)
+```
+而 `_hook_query_loop()` 为了「0 任务启动后新建任务也能查询」，把**单线程的查询循环
+搬进了 daemon 线程**（`Query.start()` 原本跑在主线程）→ `is_main_thread()` 为假 →
+每轮日志只堆在 `thread_logs[tid]` 里**永不落盘**（还顺带无界增长占内存）。
+
+实测证据：`runtime/webx.log` 里最后一条 `>> 第 N 次查询` 停在 `13:56:58`，
+而 `status.json` 的 `query_count` 在同一时刻之后仍从 **6145 涨到 6676+**。
+
+**修法**：`_hook_log_thread()` 把 webx 查询循环线程**视为主线程**。
+⚠️ 不能只改 `py12306.helpers.func.is_main_thread` —— 各模块是
+`from ... import is_main_thread` 绑定到自己的命名空间的，必须**逐个模块替换同名全局**：
+`helpers.func` / `log.base` / `log.query_log` / `query.job` / `web.web`。
+识别方式是线程名/属性（`WEBX_LOG_THREAD_NAME = 'webx-query-loop'`）。
+副作用评估：`sleep_forever()` 也用这个判定，但全项目无人调用（已 grep 确认）。
+
+修后实测：重启后新日志里 `>> 第 N 次查询` 正常增长，任务详情 `logs` 返回 100 条。
+
+### 5.27 ★★ 界面显示账号已登录，日志却每 3 秒刷「账号正在登录中」
+
+**症状**：`/api/accounts` 显示该账号在线，但日志持续刷
+`账号正在登录中，3 秒后自动重试`（实测累计 1700+ 行），且停止不了。
+
+**根因（两个独立成因叠在一起）**：
+
+| # | 根因 | 说明 |
+|---|---|---|
+| A | `UserJob.wait_for_ready()` 是**无界递归** | `if is_ready: return self` → 否则打日志 + `stay_second(3)` + `return self.wait_for_ready()`。对象永远不就绪时，调用它的线程**永久卡死**并每 3 秒打一行（不是「日志重复」，是「真的在无限重试」）。 |
+| B | `UserJob.destroy()` 只把 `is_alive` 置 False，**不从 `User.users` 摘除** | 改账号/重新扫码后列表里会留**僵尸对象**；而 `User.get_passenger_for_members()` 取的是 `users` 里**第一个 key 匹配项**、**不看 is_alive / is_ready** → 永远卡在僵尸上。`ConfigSync._prune_dead_users()` 只在账号列表变化时才跑，救不了这个场景。 |
+
+于是「界面（读到的活对象）显示在线」+「日志（卡在僵尸对象上）显示正在登录中」同时成立。
+
+**修法**（见 `engine_hooks`）：
+- `_hook_wait_for_ready()`：改成**有界循环**——
+  先**自愈**（`is_first_time()` 为假就 `load_user()`，即读网页扫码写下的 cookie →
+  `did_loaded_user()` → `is_ready=True`）；日志**限频 60s**且带上账号名与可行动提示；
+  遇到**已死对象**立即 `return None`（`get_passenger_for_members` 的 `and` 会跳过它）。
+- `_hook_get_passenger_for_members()`：按「**活着且就绪** → 活着 → 都没有则摘掉僵尸」
+  的顺序挑对象。
+- `main_web` 的 30s 守护里定期 `ConfigSync.prune_dead_users()` 兜底。
+
+验证（单元级，构造僵尸对象）：死对象 `wait_for_ready()` **0.000s 返回 None**；
+「僵尸在前 + 活对象在后」立刻返回活对象结果；「只有僵尸」时返回 None 且
+`User.users` 被摘成 0 个。
+线上验证：重启后新日志 `账号正在登录中` **0 次**，且 `用户恢复成功 / 乘客验证成功`
+正常出现（同一账号不再自相矛盾）。
+
 ---
 
 ## 6. 前端（`static/`）协作要点
@@ -585,6 +957,24 @@ var SEAT_ORDER = ['商务座','一等座','二等座','硬卧','软卧','硬座'
 **一个颜色 = 一个优先级**（同色即同级）。调色板 8 色（`--red/--info/--warn/--ok/--pri5..--pri8`），
 取 `ti % 8 + 1`。摘要、推导行、详情页三处都按此渲染，**不带序号**（顺序由芯片排列表达）。
 
+### 出发时间筛选（双点滑动条）
+状态在 `MON.hourFrom` / `MON.hourTo`（整点，初值 0 / 24），**不在 `MON.filters` 里** ——
+`MON.filters.hour` 是每次 `syncMonitorFilters()` 从它算出来的派生值：
+
+```js
+hourText(h)            // 8 → '08:00'（24 → '24:00'）
+hourIsAll()            // from<=0 && to>=24
+readHourRange()        // 全量 → []；否则 ['08:00-22:00']（matchHour 只认这个格式）
+setHourFrom/setHourTo  // 夹取，保证 0 <= from < to <= 24（至少 1 小时窗口）
+renderHourRange()      // 只改视觉：fill 的 left/width、两个 thumb 的 left、aria-*
+resetHourRange(opts)   // 回 0/24；opts.apply===false 时不重新筛选（供「清除筛选」用）
+bindHourRange()        // 由 bindMonitorFilters() 调用一次
+```
+「不限」按钮（`#mHourReset`）在**轨道左侧**，用 `.on` 表示当前就是「不限」（不隐藏）；
+右侧 `#mHourVal` 只显示当前区间，不限时为空。
+⚠️ `#mTime`（原来那 4 个区间复选框）**已不存在**，`readFilterGroup('mTime')` 会返回 `[]`；
+任何新代码请走 `readHourRange()`。
+
 ---
 
 ## 7. 数据与运行时状态
@@ -603,7 +993,8 @@ var SEAT_ORDER = ['商务座','一等座','二等座','硬卧','软卧','硬座'
 
 ### 数据库表
 ```
-job           抢票任务（含 seat_tiers 二维优先级、start_at、interval_min/max、is_active）
+job           抢票任务（含 seat_tiers 二维优先级、start_at、interval_min/max、is_active、
+              station_mode 站点匹配方式 expand/exact）
 account       12306 账号（key / user_name / password / type / login_ok / active）
 user_login    管理台账号（pbkdf2(salt, hash)，无明文）
 order_log     下单记录（queued → submitted → success / failed / cancelled）
@@ -699,12 +1090,18 @@ c = create_app().test_client()          # 然后 c.get('/api/xxx')
 | **任务级「开始时间」「查询间隔」** | 已落库（`job.start_at` / `interval_min/max`）+ UI 已标注「待引擎支持」，但**引擎侧尚未消费**。需要：`sync.job_info_dict()` 加 `interval`/`start_at` 键 → 会改变 `Job.id`（md5 of info dict）→ **一次性任务重建**；`Job.update_interval()` 优先用任务级间隔；调度层支持 `start_at`。 |
 | **候补购票** | 引擎不支持（`Job.is_has_ticket` 要求 `order_text == '预订'`），接口不提供 waiting 模式。 |
 | **中转方案** | `routes_tickets` 只返回直达。 |
-| **票价估算** | 按「历时 × 单价」估算，**长距离明显偏低**（如 G1025 二等座约 ¥554 vs 实际约 ¥1050）。仅参考。 |
+| **票价** | 已是 12306 **真实票价**（`/api/tickets/prices` 逐车次查，见 §5.22）。
+  拿不到就显示 `—`（**从不估算**）。注意：每日 1:00–5:00 维护窗口期间接口不可用。 |
 | **监控表格只 6 个席别列** | 后端已返回 `softSleeper`/`special`，表格未展示（这也是 §6 里 `MON.selBy` 那套语义存在的原因）。 |
 | **`requirements.txt`** | 已失效，未重写。 |
 | **`webx.log` 无轮转** | 账号离线时引擎每 3s 刷一行，会持续增长（目前 100KB 量级，暂时无害）。 |
+| **各站起售时间（精确到分钟）** | 拿不到。官方页 `www.12306.cn/index/view/infos/sale_time.html` 背后是
+  `POST /index/otn/queryAllCacheSaleTime`（返回每站 `sale_time`），但**被 passport 登录门挡住**：
+  匿名 403、带已登录 kyfw cookie 也 302 到 `/otn/passport`（2026-09 实测）；`station_sale.js`
+  静态表已 404。服务侧无法稳定获取，用户 2026-09 决定「处理不了就跳过、未开售日期不处理」。
+  能精确推导的只有**开售日期** = 日期 − (presale_days−1)。别再重复探测这个数据源。 |
 | **12306 每日维护窗口 1:00–5:00** | `app_available_check()` 会 `sleep` 到 5:00（**日志文案写"6 点"，代码实际是 5 点**）。凌晨调试时任务"看起来没跑"，**不是 bug**。 |
-| **账号掉线时日志刷屏** | `UserJob.wait_for_ready()` 无限递归每 3s 刷「账号正在登录中，3 秒后自动重试」。属引擎既有行为，重新扫码即停。 |
+| **账号掉线时日志刷屏** | 已修（§5.27）：`wait_for_ready` 改为有界循环 + 限频日志 + 自愈，并跳过僵尸账号对象。实测重启后「账号正在登录中」0 次。 |
 
 ---
 

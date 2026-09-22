@@ -64,18 +64,18 @@
 
 /* 表头行高固定：避免批量模式下因出现全选复选框（inline-block）而撑高行盒、造成列表下移 */
 .view#view-monitor .results-panel thead th{line-height:16px}
-/* 「重置选择」：放在「批量」左侧隔壁（不占「清除排序」的位置）。
-   有可重置内容时向左滑出。注意 .batch-actions 是 margin-left:auto 右对齐，
-   内容变宽只会把整个组的左缘推左，所以「批量」按钮位置不变；高度也不变 → 表头不跳 */
-.view#view-monitor .batch-actions .reset-slot{
-  display:inline-flex;max-width:0;opacity:0;overflow:hidden;visibility:hidden;pointer-events:none;
-  transition:max-width .22s ease,opacity .16s ease,margin-right .22s ease,visibility 0s linear .22s;
+/* 「批量」列表头：单个按钮切换批量选择模式；表头行高固定，避免显示复选框时列表下移。 */
+.view#view-monitor th .batch-toggle{padding:0;border:0;background:none;color:var(--sub);font:inherit;font-size:11px;font-weight:600;line-height:16px;cursor:pointer;white-space:nowrap}
+.view#view-monitor th .batch-toggle:hover{color:#101828}
+.view#view-monitor th .batch-toggle.on{color:var(--red)}
+.view#view-monitor th .batch-toggle.on:hover{color:var(--red)}
+/* 悬浮栏里的「重置选择」：贴「已选 N 条」计数（它是选择状态的附属动作，不是主操作），
+   链接样式与右侧 新建任务/关联任务 按钮组拉开距离，避免误点（2026-09 重设计） */
+.view#view-monitor .selection-bar .sel-reset{
+  height:24px;padding:0 8px;border:0;border-radius:5px;background:none;cursor:pointer;font-family:inherit;
+  font-size:11px;font-weight:500;color:#9aa4b8;text-decoration:underline dotted;text-underline-offset:3px;flex-shrink:0;
 }
-.view#view-monitor .batch-actions .reset-slot.on{
-  max-width:120px;opacity:1;margin-right:8px;visibility:visible;pointer-events:auto;
-  transition:max-width .22s ease,opacity .16s ease .06s,margin-right .22s ease,visibility 0s linear 0s;
-}
-.view#view-monitor .batch-actions .batch-reset{white-space:nowrap}
+.view#view-monitor .selection-bar .sel-reset:hover{color:#fff;text-decoration:underline}
 /* 不设座：该车次无此席别 → 显示 '/'，弱化且不可点（与「无票」的「无」明确区分开） */
 .view#view-monitor td.seat.seat-absent{cursor:default;background:transparent}
 .view#view-monitor td.seat.seat-absent strong.absent{color:#D0D5DD;font-weight:500;font-size:13px}
@@ -205,9 +205,6 @@
 .view#view-monitor .date.dis small.dis-tag{color:#C7CCD6;font-size:10px;margin-top:1px}
 .view#view-monitor .date.dis:hover{background:#F3F4F7}
 .view#view-monitor .date.dis::after{content:"";position:absolute;left:12px;right:12px;top:50%;height:1px;background:#DFE2E8;transform:rotate(-12deg)}
-/* 日期条「预售期」提示：独立成行，避免塞进 label 里把该列撑成两行导致输入框错位 */
-.view#view-monitor .query-hint{grid-column:1 / -1;font-size:11.5px;color:var(--faint);line-height:1.5;margin-top:-2px}
-.view#view-monitor .query-hint:empty{display:none}
 /* 查询条件标签统一单行，防止任何标签换行破坏字段对齐 */
 .view#view-monitor .query .field label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* 出发地 / 目的地 + 「交换」按钮
@@ -238,6 +235,139 @@
   .view#view-monitor .swap-btn{justify-self:center;margin-bottom:0;transform:rotate(90deg)}
   .view#view-monitor .swap-btn:active{transform:rotate(90deg) scale(.9)}
 }
+
+/* ==========================================================================
+   车票查询：紧凑头部
+   --------------------------------------------------------------------------
+   排布**遵循设计稿**：字段标签在输入框上方、筛选项纵向排开、日期片两行。
+   压缩只落在「行高 / 内边距 / 日期片宽度 / 结果条」上，不动字段排布。
+   改前实测（1440×800）：.panel 464px（占满屏 58%），列表还要另滚 336px。
+   ⚠️ 这些规则必须写在**内联样式块**里 —— `.query .field.route-pair` 等规则在 app.css 里
+   同特异性，只能靠「更靠后」取胜（内联 <style> 在 <link> 之后解析）。
+   ========================================================================== */
+/* ---- 查询行：标签在输入框上方，字段仍走 12 列网格 ---- */
+.view#view-monitor .query{
+  display:grid; grid-template-columns:repeat(12,1fr); gap:8px 10px;
+  padding:9px 16px 10px; align-items:end;
+}
+.view#view-monitor .query .field{grid-column:span 2}
+.view#view-monitor .query .field label{
+  display:block; margin:0 0 3px; font-size:11.5px; font-weight:600;
+  color:var(--sub); line-height:1.3;
+}
+.view#view-monitor .query input,
+.view#view-monitor .query select{height:32px; padding:5px 10px; font-size:13px}
+.view#view-monitor .query .btn{
+  grid-column:span 2; align-self:end; height:32px; font-size:13px;
+}
+/* 出发地 / 目的地 + 「交换」按钮：嵌套网格 `1fr auto 1fr`，按钮占一个真实列
+   （所以**完全不重叠**，也不影响其余字段的列对齐）。
+   按钮与输入框底对齐：标签在输入框上方，输入框高 32px、按钮 26px → 差 6px/2 = 3px */
+.view#view-monitor .query .field.route-pair{
+  grid-column:span 4; display:grid; grid-template-columns:1fr auto 1fr;
+  column-gap:6px; align-items:end;
+}
+.view#view-monitor .query .field.route-pair .rp-item{min-width:0}
+.view#view-monitor .query .field.route-pair .swap-btn{align-self:end; margin-bottom:3px}
+
+/* ---- 日期条 ----
+   日期片：3 行 → 2 行（「未开售」不再单独占一行，改为中划线 + 灰化 + tooltip）。
+   **未开售只保留 1 片**（`renderMonitorDates` 里过滤）→ 片数从 20 降到 16，
+   腾出的宽度全部给日期片：`flex:1 1 auto` 让它们自动铺满可用宽度（最宽 78px），
+   窄屏也不会溢出（min-width 52px + 16 片在 1280px 下仅需 ~922px，容器约 956px）。 */
+.view#view-monitor .dates{padding:6px 16px; gap:7px}
+.view#view-monitor .date{
+  flex:1 1 auto; min-width:52px; max-width:78px; padding:6px 8px; border-radius:9px; line-height:1.25;
+}
+.view#view-monitor .date b{font-size:14px; line-height:1.25}
+.view#view-monitor .date small{font-size:11.5px; margin-top:2px; line-height:1.25}
+.view#view-monitor .date.dis::after{left:8px; right:8px}
+/* 横向滚动条收窄（默认 ~16px，在 40px 高的日期条里几乎占掉三成）。
+   ‼️ 不能同时写 `scrollbar-width:thin` —— Chromium 121+ 下一旦设置了标准属性，
+   同一元素上的 `::-webkit-scrollbar` 就会被忽略，thin 反而有 11px（实测 61px → 6px 后 50px）。 */
+.view#view-monitor .dates::-webkit-scrollbar{height:6px}
+.view#view-monitor .dates::-webkit-scrollbar-track{background:transparent}
+.view#view-monitor .dates::-webkit-scrollbar-thumb{background:#D6DAE2; border-radius:99px}
+.view#view-monitor .dates::-webkit-scrollbar-thumb:hover{background:#BFC5D0}
+
+/* ===== 出发时间：双点滑动条 =====
+   用自绘轨道 + 两个 pointer 拖拽的圆点，而不是两个叠起来的 input[type=range]
+   （后者依赖 ::-webkit-slider-thumb 的 pointer-events 才会两个都能拖，跨浏览器不稳）。
+   严格不变量：0 <= from < to <= 24（至少 1 小时窗口）→ 两端永不交叉/互换。 */
+/* 「不限」放在轨道左侧，样式与其他筛选行的「全部」芯片一致 */
+.view#view-monitor .hour-reset{
+  display:inline-flex; align-items:center; flex:0 0 auto; min-height:22px; margin-right:4px;
+  padding:1px 7px; border:1px solid transparent; border-radius:5px; background:none;
+  color:#667085; font-size:11.5px; line-height:18px; white-space:nowrap; cursor:pointer;
+}
+.view#view-monitor .hour-reset:hover{background:#f5f7fa; color:#344054}
+.view#view-monitor .hour-reset.on{border-color:#f3c7ce; background:#fff2f4; color:var(--red); font-weight:700}
+.view#view-monitor .hour-range{
+  position:relative; flex:1 1 220px; max-width:440px; height:24px; margin:0 4px; touch-action:none;
+}
+.view#view-monitor .hr-rail{position:absolute; inset:0; cursor:pointer}
+.view#view-monitor .hr-rail::before{
+  content:""; position:absolute; left:0; right:0; top:50%; margin-top:-2px; height:4px;
+  border-radius:99px; background:#E7EAEF;
+}
+.view#view-monitor .hr-fill{
+  position:absolute; top:50%; margin-top:-2px; height:4px; border-radius:99px;
+  background:var(--red); left:0; width:100%; pointer-events:none;
+}
+.view#view-monitor .hr-thumb{
+  position:absolute; top:50%; width:14px; height:14px; margin:-7px 0 0 -7px; padding:0;
+  border-radius:50%; background:#fff; border:2px solid var(--red);
+  box-shadow:0 1px 3px rgba(16,24,40,.18); cursor:grab; transition:transform .1s;
+}
+.view#view-monitor .hr-thumb:hover{transform:scale(1.15)}
+.view#view-monitor .hr-thumb:focus-visible{outline:2px solid var(--red); outline-offset:2px}
+.view#view-monitor .hr-thumb:active{cursor:grabbing}
+body.hr-dragging{cursor:grabbing; user-select:none}
+/* 右侧只显示当前区间；不限时留空但保留槽位（避免切换时轨道宽度跳动） */
+.view#view-monitor .hour-val{
+  font-size:11.5px; color:var(--sub); font-variant-numeric:tabular-nums;
+  white-space:nowrap; min-width:92px;
+}
+.view#view-monitor .hour-val.on{color:var(--red); font-weight:700}
+
+/* ===== 筛选面板：行高收紧（**仍是纵向排开**） =====
+   行高 34 → 27、分段控件 36 → 26、底栏 34 → 28；不动「一行一个筛选维度」的排布。 */
+.view#view-monitor .filter{padding:5px 16px 6px}
+.view#view-monitor .filter-row{min-height:27px; padding:0}
+.view#view-monitor .filter-label{flex-basis:56px; line-height:22px; font-size:11.5px}
+.view#view-monitor .filter label.filter-option{min-height:22px; padding:1px 7px}
+.view#view-monitor .filter-mode-row{padding-top:0; padding-bottom:2px}
+.view#view-monitor .filter-mode-row .seg{height:26px; padding:2px}
+.view#view-monitor .filter-mode-param select{height:24px}
+.view#view-monitor .filter-footer{min-height:28px; padding-top:3px}
+.view#view-monitor .filter-footer .check,
+.view#view-monitor .filter .clear,
+.view#view-monitor .filter-apply{height:24px}
+
+/* ===== 结果条：压成一行 =====
+   「北京 → 深圳 · 日期」「共 N 个车次 · 可订 M 个」「即时结果 · 点击表头排序」
+   原来自占三行（路线 + 车次数各一行 ≈ 38px 内容高）。现在前两项同一行基线对齐，
+   状态文案本就 inline → 文字只占 18px，结果条高度由右侧按钮决定（按钮 30 → 26）。 */
+.view#view-monitor .bar{padding:6px 16px; gap:8px}
+.view#view-monitor .bar>div:not(.batch-actions){display:flex; align-items:baseline; gap:8px; min-width:0}
+.view#view-monitor .bar h2{font-size:14px; white-space:nowrap}
+.view#view-monitor .bar small{font-size:11.5px; white-space:nowrap}
+.view#view-monitor .bar .btn{height:26px; padding:0 10px; font-size:12px}
+.view#view-monitor .bar .sort-status{margin-left:auto;color:var(--faint);font-size:12px;line-height:28px;white-space:nowrap}
+.view#view-monitor .bar .sort-action{padding:0;border:0;background:none;color:inherit;font:inherit;cursor:default}
+.view#view-monitor .bar .sort-action.is-sorted{color:var(--sub);cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}
+.view#view-monitor .bar .sort-action.is-sorted:hover{color:var(--red)}
+
+/* 一级滚动到底时让列表表头停在顶栏下方：默认 content 底部 40px + 最后一个
+  panel 的 16px margin 会让页面多滚 56px，表头虽 sticky 但会被 70px 顶栏盖住。
+  只收掉车票查询页的无效尾部空白，不降低 90vh 列表高度、不压缩查询/筛选区。 */
+.content:has(#view-monitor.is-active){padding-bottom:0}
+.view#view-monitor > .panel:last-child{margin-bottom:0}
+
+/* 车次列单元格不带内边距：内边距由 .train-stops 按钮自己给（app.css 里那条
+   `td.train{padding-top:0;padding-bottom:0}` 的本意），否则两者相加 18px，
+   行高从 52px 涨到 70px（800px 高的窗口里少显示 2 行车次）。 */
+.view#view-monitor .results-panel .table td.train{padding-top:0; padding-bottom:0}
 </style>
 </head>
 <body>
@@ -361,7 +491,7 @@
           <div class="detail-stack">
             <!-- 下单阶段与命中轨迹都是「按时间的列表」，合成一个卡片用分段切换，
                  省下一整张卡的高度（详情页要一屏装满） -->
-            <div class="card"><div class="card-h"><h3>执行轨迹</h3>
+            <div class="card detail-track-card"><div class="card-h"><h3>执行轨迹</h3>
               <div class="seg seg-mini" id="dTrackSeg">
                 <button type="button" class="seg-btn on" data-track="stage">下单阶段</button>
                 <button type="button" class="seg-btn" data-track="hit">命中轨迹</button>
@@ -431,11 +561,35 @@
                 <div class="stg-grid cols-1">
                   <div class="stg-card">
                     <div class="stg-head">区间地点<span class="opt-x">可添加多组，依次轮询</span></div>
+                    <!-- 站点匹配方式：12306 的余票结果本来就会混入同城其它站
+                         （查「深圳北→广州南」实测会返回 深圳/福田 → 广州东/新塘/广州…）。
+                         这一项决定引擎按哪种规则过滤行的实际到发站。 -->
+                    <div class="stn-mode-row">
+                      <span class="stn-mode-lab">站点匹配</span>
+                      <!-- 默认是「仅指定站名」：填什么站就只抢那个站（最不容易买错站）。
+                           想要「广州 → 该城市全部车站」时再手动切到右侧的「同城站扩展」。 -->
+                      <div class="seg" id="ntStnMode">
+                        <button type="button" class="seg-btn on" data-stn-mode="exact">仅指定站名</button>
+                        <button type="button" class="seg-btn" data-stn-mode="expand">同城站扩展</button>
+                      </div>
+                      <span class="stn-mode-hint" id="ntStnModeHint">只认完全同名的站：填「广州」只抢广州站</span>
+                    </div>
                     <div id="ntPairs">
-                      <div class="pair"><input class="stn" type="text" data-role="left" value="北京"><span class="arr">→</span><input class="stn" type="text" data-role="arrive" value="深圳"><span class="del">✕</span></div>
+                      <div class="pair">
+                        <div class="stn-wrap"><input class="stn" type="text" data-role="left" value="北京" placeholder="出发站"><div class="stn-suggest hidden"></div></div>
+                        <span class="arr">→</span>
+                        <div class="stn-wrap"><input class="stn" type="text" data-role="arrive" value="深圳" placeholder="到达站"><div class="stn-suggest hidden"></div></div>
+                        <span class="del">✕</span>
+                        <div class="pair-note" data-note="left" hidden></div>
+                        <div class="pair-note" data-note="arrive" hidden></div>
+                      </div>
                     </div>
                     <div class="pair-add" id="ntAddPair">+ 添加一组区间</div>
-                    <div class="stg-hint">支持输入车站全称或简称，如「北京」「深圳北」。多组区间会<b>依次轮询</b>，区间越多每轮请求越多。</div>
+                    <div class="stg-hint">
+                      支持输入车站全称或简称，如「北京」「深圳北」，从下拉里选更稳。<b>多组区间会依次轮询</b>，区间越多每轮请求越多。<br>
+                      ⚠️ 12306 的查询会做<b>同城站扩展</b>（查「深圳北→广州南」也会返回「深圳北→广州东」）。
+                      引擎会<b>按每个站名下方那行说明过滤</b>行的实际到发站，说明随上面的「站点匹配」切换。
+                    </div>
                   </div>
                   <div class="stg-card">
                     <div class="stg-head">乘车日期<span class="opt-x" id="ntDateCnt">请选择，可多选</span></div>
@@ -543,10 +697,9 @@
               <div class="rp-item"><label>目的地</label><div class="route-input"><input id="mTo" type="text" value="深圳"><div class="stn-suggest hidden" id="mToSug"></div></div></div>
             </div>
             <div class="field"><label>出发日期</label><input id="mDate" type="date"></div>
-            <div class="field"><label>返程日期（可选）</label><input id="mBackDate" type="date" placeholder="不填则单程"></div>
-            <div class="field"><label>乘客类型</label><select class="ctl" id="mPassType"><option>成人</option><option>学生</option><option>儿童</option></select></div>
+            <div class="field"><label title="不填则只看单程">返程</label><input id="mBackDate" type="date" title="不填则单程"></div>
+            <div class="field"><label>乘客</label><select class="ctl" id="mPassType"><option>成人</option><option>学生</option><option>儿童</option></select></div>
             <button class="btn btn-primary" id="mSearch" style="background:var(--red);color:#fff;border-color:var(--red)">查询车票</button>
-            <div class="query-hint" id="mPresaleNote"></div>
           </div>
           <div class="dates" id="mDates"></div>
           <div class="filter" id="mFilter">
@@ -573,11 +726,11 @@
               <span class="filter-label">车次类型</span>
               <div class="filter-options" id="mType" data-filter-group="type">
                 <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>全部</span></label>
-                <label class="filter-option"><input type="checkbox" value="g"><span>G/C-高铁 / 城际</span></label>
-                <label class="filter-option"><input type="checkbox" value="d"><span>D-动车</span></label>
-                <label class="filter-option"><input type="checkbox" value="z"><span>Z-直达</span></label>
-                <label class="filter-option"><input type="checkbox" value="t"><span>T-特快</span></label>
-                <label class="filter-option"><input type="checkbox" value="k"><span>K-快速</span></label>
+                <label class="filter-option"><input type="checkbox" value="g"><span>G/C 高铁·城际</span></label>
+                <label class="filter-option"><input type="checkbox" value="d"><span>D 动车</span></label>
+                <label class="filter-option"><input type="checkbox" value="z"><span>Z 直达</span></label>
+                <label class="filter-option"><input type="checkbox" value="t"><span>T 特快</span></label>
+                <label class="filter-option"><input type="checkbox" value="k"><span>K 快速</span></label>
                 <label class="filter-option"><input type="checkbox" value="other"><span>其他</span></label>
               </div>
             </div>
@@ -607,12 +760,18 @@
             </div>
             <div class="filter-row">
               <span class="filter-label">出发时间</span>
-              <div class="filter-options" id="mTime" data-filter-group="hour">
-                <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>不限</span></label>
-                <label class="filter-option"><input type="checkbox" value="00:00-06:00"><span>00:00 - 06:00</span></label>
-                <label class="filter-option"><input type="checkbox" value="06:00-12:00"><span>06:00 - 12:00</span></label>
-                <label class="filter-option"><input type="checkbox" value="12:00-18:00"><span>12:00 - 18:00</span></label>
-                <label class="filter-option"><input type="checkbox" value="18:00-24:00"><span>18:00 - 24:00</span></label>
+              <div class="filter-options">
+                <!-- 「不限」放在轨道左侧（与其他筛选行的「全部」芯片同位），当前区间显示在右侧。
+                     双点滑动条（0~24 点，整点）：原来 4 个互斥区间复选框只有 6 小时粒度，
+                     且「不限」与 4 个区间的取舍关系不直观。现在直接拖两端定区间。 -->
+                <button class="hour-reset on" id="mHourReset" type="button" title="恢复不限">不限</button>
+                <div class="hour-range" id="mHourRange" title="拖动两端圆点设置出发时段；也可点击轨道移动最近的一端（键盘 ←/→ 微调）">
+                  <div class="hr-rail"></div>
+                  <div class="hr-fill" id="mHourFill"></div>
+                  <button class="hr-thumb" id="mHourFrom" type="button" role="slider" aria-label="最早出发时间" aria-valuemin="0" aria-valuemax="24" aria-valuenow="0"></button>
+                  <button class="hr-thumb" id="mHourTo" type="button" role="slider" aria-label="最晚出发时间" aria-valuemin="0" aria-valuemax="24" aria-valuenow="24"></button>
+                </div>
+                <span class="hour-val" id="mHourVal"></span>
               </div>
             </div>
             <div class="filter-footer">
@@ -624,14 +783,10 @@
         <div class="panel results-panel" id="mPanel">
           <div class="bar">
             <div><h2 id="mRoute">— → —</h2><small id="mSummary"></small></div>
-            <span class="status">即时结果 · 点击表头排序</span><button class="clear-sort" id="mClearSort" type="button">清除排序</button>
-            <div class="batch-actions">
-              <span class="reset-slot"><button class="btn btn-outline batch-reset" id="mSelReset" type="button">重置选择</button></span>
-              <button class="btn batch-toggle" id="mBatchToggle" type="button" aria-pressed="false">批量</button>
-            </div>
+            <span class="sort-status" id="mSortStatus" aria-live="polite"><span>即时结果</span><span aria-hidden="true"> · </span><span>点击</span><button class="sort-action" id="mSortAction" type="button" disabled title="请点击表头排序">表头排序</button></span>
           </div>
-          <div class="selection-bar" id="mSelBar"><strong id="mSelCount">已选 0 条</strong><small id="mSelRule">勾选车次后，该行有票席别会自动带上</small>
-            <div class="floating-actions">
+          <div class="selection-bar" id="mSelBar"><strong id="mSelCount">已选 0 条</strong><button class="sel-reset" id="mSelReset" type="button" title="清空全部勾选">重置选择</button><small id="mSelRule">勾选车次后，该行有票席别会自动带上</small>
+            <div class="floating-actions" id="mSelBarActions">
               <button class="btn btn-outline normal-batch-only" id="mFloatPrefill" type="button">新建任务</button>
               <button class="btn btn-outline normal-batch-only" id="mFloatBind" type="button">关联任务</button>
               <!-- 任务上下文（从新建任务页「继续添加」进来）：需要明确提交或放弃，
@@ -649,25 +804,9 @@
               <th><button class="sort-head" data-sort="duration" type="button">历时<span class="sort-arrows" aria-hidden="true"><i class="up"></i><i class="down"></i></span></button></th>
               <th>商务座</th><th>一等座</th>
               <th>二等座</th>
-              <th>硬卧</th><th>硬座</th><th>无座</th><th class="th-actions">操作</th>
+              <th>硬卧</th><th>硬座</th><th>无座</th><th class="th-actions"><button type="button" class="batch-toggle" id="mBatchToggle" aria-pressed="false" title="切换批量选择模式">批量</button></th>
             </tr></thead><tbody id="mResults"></tbody></table>
             <div class="empty hidden" id="mEmpty"><b>没有符合条件的车次</b>请调整筛选条件后重新查看。</div>
-          </div>
-        </div>
-        <div class="task-modal" id="taskModal">
-          <div class="task-dialog">
-            <div class="dh">
-              <h3>绑定到抢票任务</h3>
-              <button class="icon-btn" id="closeTaskModal" type="button" aria-label="关闭">×</button>
-            </div>
-            <div class="db">
-              <div class="preview" id="taskPreview"></div>
-              <div id="bindChoices" style="display:grid;gap:8px"></div>
-            </div>
-            <div class="df">
-              <button class="btn btn-ghost" id="cancelTaskModal" type="button">取消</button>
-              <button class="btn btn-primary" id="confirmTaskBind" type="button">确认关联</button>
-            </div>
           </div>
         </div>
       </section>
@@ -753,6 +892,55 @@
         <div class="set-grid" id="setGrid"></div>
       </section>
 
+    </div>
+  </div>
+</div>
+
+<!-- ⚠️ 弹窗必须放在所有 `.view` **之外**（这里放在 #app 之后、与 .toast 同级）：
+     `.view{display:none}`，而弹窗原本嵌在 `#view-monitor` 里 →
+     切到新建任务页时 `#view-monitor` 是 display:none，
+     **`position:fixed` 也逃不出 display:none 的祖先** → 弹窗被整个隐藏
+     （class 上有 open、DOM 内容也对，但用户看不到）。 -->
+<!-- 经停站（点车次号打开）：展示每站到发时刻、停留与累计历时。
+     从新建任务页 / 车票查询页打开时，可以在这里改「上车 / 下车」站，
+     改完点「应用」写回车次区间（站名、时刻、历时、票价一起更新）。 -->
+<div class="task-modal stops-modal" id="stopsModal">
+  <div class="task-dialog stops-dialog">
+    <div class="dh">
+      <h3 id="stopsTitle">经停站</h3>
+      <button class="icon-btn" id="closeStops" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="db">
+      <div class="stops-sum" id="stopsSum"></div>
+      <div class="stops-wrap">
+        <table class="table stops-table">
+          <thead><tr><th>站序</th><th>站名</th><th>到站</th><th>出发</th><th>停留</th><th>累计</th><th class="th-pick">上车 / 下车</th></tr></thead>
+          <tbody id="stopsBody"></tbody>
+        </table>
+      </div>
+      <div class="stops-note" id="stopsNote"></div>
+    </div>
+    <div class="stops-foot" id="stopsFoot">
+      <span class="stops-pick" id="stopsPick"></span>
+      <button class="btn btn-ghost" id="stopsReset" type="button">恢复原区间</button>
+      <button class="btn btn-primary" id="stopsApply" type="button">应用区间</button>
+    </div>
+  </div>
+</div>
+<!-- 关联到抢票任务 -->
+<div class="task-modal" id="taskModal">
+  <div class="task-dialog">
+    <div class="dh">
+      <h3>绑定到抢票任务</h3>
+      <button class="icon-btn" id="closeTaskModal" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="db">
+      <div class="preview" id="taskPreview"></div>
+      <div id="bindChoices" style="display:grid;gap:8px"></div>
+    </div>
+    <div class="df">
+      <button class="btn btn-ghost" id="cancelTaskModal" type="button">取消</button>
+      <button class="btn btn-primary" id="confirmTaskBind" type="button">确认关联</button>
     </div>
   </div>
 </div>

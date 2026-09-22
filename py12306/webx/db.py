@@ -66,6 +66,7 @@ class DataStore:
                     interval_min REAL,
                     interval_max REAL,
                     start_at TEXT,              -- 定时开始时间 'YYYY-MM-DD HH:MM'（引擎待支持）
+                    query_mode TEXT DEFAULT 'range', -- train / range，仅用于管理台编辑回显
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT,
                     updated_at TEXT,
@@ -151,6 +152,22 @@ class DataStore:
             # 按任务统计的查询次数（卡片要分别展示「已查询」与「命中」）
             if 'query_count' not in cols:
                 cur.execute('ALTER TABLE job ADD COLUMN query_count INTEGER DEFAULT 0')
+            # 站点匹配方式：expand=同城站扩展（城市名匹配该城市全部车站）/ exact=仅指定站名。
+            # 12306 的查询结果里本来就会混入同城其它站（见 AGENTS.md §5.25），
+            # 这一列决定「广州」到底算 1 个站还是 10 个站。
+            if 'station_mode' not in cols:
+                cur.execute("ALTER TABLE job ADD COLUMN station_mode TEXT DEFAULT 'expand'")
+            if 'query_mode' not in cols:
+                cur.execute("ALTER TABLE job ADD COLUMN query_mode TEXT DEFAULT 'range'")
+            # 迁移前没有模式字段：有车次白名单的历史任务按车次查询回显，
+            # 无白名单的历史任务保持区间查询。用 kv 标记只执行一次，
+            # 避免以后「区间查询 + 车次筛选」的任务被再次改成车次模式。
+            migrated = cur.execute("SELECT value FROM kv WHERE key='job_query_mode_migrated'").fetchone()
+            if not migrated:
+                cur.execute("UPDATE job SET query_mode='train' "
+                            "WHERE query_mode='range' AND train_numbers IS NOT NULL "
+                            "AND train_numbers NOT IN ('', '[]')")
+                cur.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('job_query_mode_migrated', '1')")
             self.conn.commit()
 
     # ---------------- 通用 ----------------
@@ -190,8 +207,8 @@ class DataStore:
         data['updated_at'] = _now()
         cols = ['job_id', 'job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                 'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-                'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'is_active',
-                'created_at', 'updated_at']
+            'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'station_mode',
+                'is_active', 'created_at', 'updated_at']
         vals = []
         for c in cols:
             v = data.get(c)
@@ -203,7 +220,7 @@ class DataStore:
     def job_update(self, job_id, data):
         allowed = ['job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                    'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'is_active',
+                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'is_active',
                    'finished_at', 'finish_reason',
                    'updated_at']
         sets, vals = [], []

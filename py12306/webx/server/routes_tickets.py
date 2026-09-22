@@ -27,8 +27,91 @@ DEFAULT_API_TYPE = 'leftTicket/queryG'
 SESSION_TTL = 600      # 兜底会话重建周期
 API_TYPE_TTL = 3600    # 接口名缓存周期
 
+# 经停站接口（2026-09 实测可用；参数名就叫 leftTicketDTO.*，很容易猜错）
+BASE_TRAIN_INFO = ('https://kyfw.12306.cn/otn/queryTrainInfo/query'
+                   '?leftTicketDTO.train_no={train_no}'
+                   '&leftTicketDTO.train_date={date}&rand_code=')
+
+# ---- 真实票价接口（2026-09 实测可用，单次约 125ms）----
+# ⚠️ 三个参数**都必须精确**：train_no + 该行的**实际上/下车站电报码** + 日期。
+#    站码写错**不会报错**，只会返回 `{"status":true,"data":[]}` ——
+#    我最初用查询站的电报码（深圳北=IOQ）去查，拿到空数组就误判成「接口已下线」；
+#    实际上 12306 会做**同城站扩展**，行的实际站可能是同城其它站（深圳=SZQ），
+#    接口只认**行自己的 t[6]/t[7]**。
+# ⚠️ `/otn/leftTicket/queryTicketPrice`（旧接口）确实只返回 train_no，不要再试；
+#    `/otn/leftTicketPrice/queryAllPublicPrice` 返回 405，**没有批量接口**，
+#    只能按车次逐个查（所以做了缓存）。
+PRICE_URL = ('https://kyfw.12306.cn/otn/leftTicketPrice/query'
+             '?leftTicketDTO.train_no={train_no}'
+             '&leftTicketDTO.from_station={from_station}'
+             '&leftTicketDTO.to_station={to_station}'
+             '&leftTicketDTO.train_date={date}&rand_code=')
+
+# 12306 价格字段（字符串，单位「角」，需 /10）→ 我们的席别 key
+PRICE_FIELDS = [
+    ('swz_price', 'business'),      # 商务座
+    ('tz_price', 'special'),        # 特等座
+    ('zy_price', 'first'),          # 一等座
+    ('ze_price', 'second'),         # 二等座
+    ('rw_price', 'softSleeper'),    # 软卧
+    ('yw_price', 'hardSleeper'),    # 硬卧
+    ('yz_price', 'hardSeat'),       # 硬座
+    ('wz_price', 'noSeat'),         # 无座（与二等座/硬座同价）
+]
+
+# 票价缓存：票价在当天内不变，所以长 TTL。
+# key = (train_no, from_code, to_code, date) → {seat_key: 元}
+_PRICE_CACHE = {}
+_PRICE_TTL = 6 * 3600
+_PRICE_WORKERS = 4          # 并发查价（单次 ~125ms；55 个车次约 2s）
+
+# 站名 → 电报码：统一走 `py12306.webx.stations`（本地表不全、需官方表兜底，见那里的文档）。
+# 这里只保留「余票响应 data.map 积累」的入口，因为只有本模块拿得到那个 map。
+
 _cache = {'session': None, 'session_at': 0.0, 'api_type': None, 'api_type_at': 0.0}
 _lock = threading.Lock()
+
+
+def _remember_stations(station_names):
+    """余票响应的 `data.map`（电报码→站名）积累进共享站名表。"""
+    from py12306.webx import stations as st
+    st.remember(station_names)
+
+
+def _price_of(raw):
+    """12306 价格字段是「角」的字符串（'02780' → 278.0）；'--' 表示该席别不适用"""
+    if not raw or raw == '--':
+        return None
+    try:
+        return round(int(str(raw).strip()) / 10.0, 1)
+    except Exception:
+        return None
+
+
+def _fetch_price_one(session, train_no, from_code, to_code, date):
+    """查一个车次的真实票价；失败/无数据返回 {}（不抛异常）"""
+    url = PRICE_URL.format(train_no=train_no, from_station=from_code,
+                           to_station=to_code, date=date)
+    headers = {
+        'Referer': '%s?linktypeid=dc&date=%s&flag=N,N,Y' % (API_QUERY_INIT_PAGE, date),
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+    }
+    try:
+        with _sem:
+            resp = session.get(url, timeout=Config().TIME_OUT_OF_REQUEST,
+                               allow_redirects=True, headers=headers)
+        payload = resp.json()
+    except Exception:
+        return {}
+    rows = payload.get('data') or []
+    dto = ((rows[0] or {}).get('queryLeftNewDTO') if rows else None) or {}
+    out = {}
+    for field, seat_key in PRICE_FIELDS:
+        value = _price_of(dto.get(field))
+        if value:
+            out[seat_key] = value
+    return out
 
 
 def _new_session():
@@ -189,6 +272,7 @@ def tickets():
         if not result:
             return {'code': 1, 'msg': '未查询到车次（该日期可能未放票或已售完）', 'data': None}
         station_names = payload.get('data', {}).get('map') or {}
+        _remember_stations(station_names)
         rows = []
         for raw in result:
             t = raw.split('|')
@@ -226,6 +310,18 @@ def tickets():
                 'm': minutes,
                 'bookable': ticket_num == 'Y',
                 's': seat_map,
+                # 12306 内部车次号（如 65000Z80060Y）与起/终点站序号，
+                # 停靠站（queryTrainInfo）与分站票价都要用它们定位。
+                # 注意：train_no **不是**车次号（t[3] 才是「Z8006」），两者不同。
+                'no': t[2],
+                'from_no': t[16] if len(t) > 16 else '',
+                'to_no': t[17] if len(t) > 17 else '',
+                'seat_types': t[15] if len(t) > 15 else '',
+                # 该行的**实际上/下车站**电报码（t[6]/t[7]）。
+                # ⚠️ 12306 会做同城站扩展：查「深圳北→茂名」时返回的行可能是
+                # 「深圳→马踏」（同城另站），票价接口只认行自己的这对站码。
+                'f_code': left_st,
+                'to_code': arrive_st,
             })
         return {'code': 0, 'msg': '', 'data': {'rows': rows, 'left': left, 'arrive': arrive,
                                               'date': date, 'api_type': api_type}}
@@ -273,6 +369,162 @@ def _duration_minutes(dep, arr):
         return m
     except Exception:
         return None
+
+
+# 站序（01）→ 序号（1）；12306 的 station_no 是两位字符串
+def _stopover_minutes(arrive, start):
+    """停留时长 = 出发时间 - 到站时间（分钟）。跨零点则 +1440。处理不出来的返回 None"""
+    try:
+        a = int(arrive[:2]) * 60 + int(arrive[3:5])
+        s = int(start[:2]) * 60 + int(start[3:5])
+        m = s - a
+        if m < 0:
+            m += 1440
+        return m
+    except Exception:
+        return None
+
+
+@bp.route('/api/tickets/stops')
+def tickets_stops():
+    """
+    列车经停站（对应 12306 车次详情里的「经停站信息」弹窗）。
+
+    数据源（2026-09 实测可用）：
+      GET /otn/queryTrainInfo/query?leftTicketDTO.train_no=<train_no>&leftTicketDTO.train_date=<date>
+        → data.data[] = {station_name, station_no, arrive_time, start_time,
+                         arrive_day_str, arrive_day_diff, running_time, is_start}
+    ⚠️ 注意参数里是 **train_no**（如 65000Z80060Y），不是车次号（Z8006）。
+       `/otn/cndata/queryByTrainNo` 与 `/lcquery/queryTrainStopTime` 实测**已不可用**
+       （前者返回 HTML 错误页，后者返回 `errorMsg: url error`），不要再尝试。
+
+    **不提供票价**：12306 的分站票价接口（queryTicketPrice 带 to_station_no）
+    实测**已不再返回数据**（响应里只有 train_no 字段，补 Referer / X-Requested-With /
+    各种 seat_types 组合都试过）。估价值与实际差距过大（高铁长距离可差 2 倍），
+    展示出来反而误导，所以干脆不给 —— 只返回 12306 真实返回的字段。
+    """
+    train_no = (request.args.get('train_no') or request.args.get('no') or '').strip()
+    date = (request.args.get('date') or '').strip()
+    if not train_no or not date:
+        return {'code': 1, 'msg': '缺少 train_no/date 参数', 'data': None}
+    if not re.match(r'^[0-9A-Za-z]{4,}$', train_no):
+        return {'code': 1, 'msg': 'train_no 格式不正确（应为 12306 内部车次号）', 'data': None}
+    try:
+        session = _query_session()
+        url = BASE_TRAIN_INFO.format(train_no=train_no, date=date)
+        with _sem:
+            resp = session.get(url, timeout=Config().TIME_OUT_OF_REQUEST, allow_redirects=True)
+        ctype = (resp.headers.get('Content-Type') or '') if hasattr(resp, 'headers') else ''
+        if 'json' not in ctype.lower():
+            return {'code': 1, 'msg': '12306 未返回经停站数据（会话可能失效，请重试）', 'data': None}
+        payload = resp.json()
+        raw_stops = (payload.get('data') or {}).get('data') or []
+        if not raw_stops:
+            return {'code': 1, 'msg': '未获取到经停站信息', 'data': None}
+
+        stops = []
+        for raw in raw_stops:
+            arrive = str(raw.get('arrive_time') or '')
+            start = str(raw.get('start_time') or '')
+            stops.append({
+                'no': str(raw.get('station_no') or ''),
+                'name': str(raw.get('station_name') or ''),
+                'arrive': arrive if arrive != '----' else '',
+                'start': start if start != '----' else '',
+                # 跨天标记：arrive_day_diff 是「第几天到」（0 当天、1 次日）
+                'day_diff': int(raw.get('arrive_day_diff') or 0),
+                'elapsed': _parse_lishi(raw.get('running_time')),  # 从始发站起累计历时（分钟）
+                'stay': _stopover_minutes(arrive, start),          # 停留时长（分钟）
+            })
+        return {'code': 0, 'msg': '', 'data': {
+            'train_no': train_no,
+            'train_number': str(raw_stops[0].get('station_train_code') or ''),
+            'total_minutes': stops[-1]['elapsed'] if stops else None,
+            'stops': stops,
+        }}
+    except Exception as e:
+        return {'code': 1, 'msg': '获取经停站异常: %s' % e, 'data': None}
+
+
+@bp.route('/api/tickets/prices')
+def tickets_prices():
+    """
+    真实票价（逐车次查 12306）。
+
+    `items=train_no:from_code:to_code|...`（`from_code`/`to_code` 是该行的实际
+    上下站电报码，即 `/api/tickets` 行里的 `f_code`/`to_code`）。
+    返回 `{ "train_no:from:to": {seat_key: 元} }`。
+
+    为什么不用估算：实测「历时 × 单价」在两个方向上都会错很多 ——
+      G531 北京南→上海虹桥 二等座估 ¥292，实际 **¥661**（低 56%）；
+      G5148 深圳→马踏 二等座估 ¥127，实际 **¥278**（低 54%）。
+    根因是**真实票价按里程、而估算按历时**：同样 1 分钟，跑 200km/h 的深茂铁路
+    比跑 350km/h 的京沪高铁走得短得多。所以必须用 12306 的真实价格。
+    """
+    date = (request.args.get('date') or '').strip()
+    items_raw = (request.args.get('items') or '').strip()
+    if not date or not items_raw:
+        return {'code': 1, 'msg': '缺少 date/items 参数', 'data': None}
+    keys = []
+    for chunk in items_raw.split('|'):
+        parts = chunk.split(':')
+        if len(parts) != 3 or not all(parts):
+            continue
+        key = (parts[0], parts[1], parts[2])
+        if key not in keys:
+            keys.append(key)
+    if not keys:
+        return {'code': 1, 'msg': 'items 格式应为 train_no:from_code:to_code', 'data': None}
+    keys = keys[:150]        # 保险：单次最多 150 个车次
+
+    def _to_code(value):
+        """
+        上/下站写成 3 位大写字母（如 SZQ）就是电报码，直接用；
+        否则当站名解析（本地表 → 余票 map → 12306 官方站名表，见 `webx.stations`）。
+        后两级兜底是为了「在经停站里改成中间站」后仍能查价 —— 那时行里的电报码已失效，
+        只剩站名，而中间站很可能是本地表没有的新站（湛江北 / 茂名南 / 番禺…）。
+        """
+        s = str(value or '').strip()
+        if len(s) == 3 and s.isalpha() and s.isupper():
+            return s
+        from py12306.webx import stations as st
+        return st.code_of(s) or s
+
+    result = {}
+    missing = []
+    now = time.time()
+    for train_no, from_ref, to_ref in keys:
+        from_code = _to_code(from_ref)
+        to_code = _to_code(to_ref)
+        cache_key = (train_no, from_code, to_code, date)
+        hit = _PRICE_CACHE.get(cache_key)
+        slot = '%s:%s:%s' % (train_no, from_ref, to_ref)
+        if hit and (now - hit[0]) < _PRICE_TTL:
+            result[slot] = hit[1]
+        else:
+            missing.append((cache_key, slot))
+
+    if missing:
+        try:
+            import concurrent.futures
+            session = _query_session()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=_PRICE_WORKERS) as pool:
+                futures = {pool.submit(_fetch_price_one, session, ck[0], ck[1], ck[2], date): (ck, slot)
+                           for (ck, slot) in missing}
+                for fut in concurrent.futures.as_completed(futures):
+                    cache_key, slot = futures[fut]
+                    try:
+                        prices = fut.result() or {}
+                    except Exception:
+                        prices = {}
+                    # 只缓存「拿到了价格」的结果：空结果可能是临时失败，下次重试
+                    if prices:
+                        _PRICE_CACHE[cache_key] = (time.time(), prices)
+                    result[slot] = prices
+        except Exception as e:
+            return {'code': 1, 'msg': '查询票价异常: %s' % e, 'data': None}
+
+    return {'code': 0, 'msg': '', 'data': {'prices': result, 'date': date}}
 
 
 @bp.route('/api/tickets/hits')

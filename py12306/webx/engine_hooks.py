@@ -167,6 +167,11 @@ def install():
         _hook_query_loop()
         _hook_query_count()
         _hook_job_destroy()
+        _hook_job_init_data()
+        _hook_station_filter()
+        _hook_log_thread()
+        _hook_wait_for_ready()
+        _hook_get_passenger_for_members()
         _hook_order_flow_guard()
         try:
             from py12306.log.common_log import CommonLog
@@ -175,7 +180,9 @@ def install():
                 'save_user(空会话守卫) / request_device_id(防递归) / qr_login(让位网页扫码) / '
                 'get_user_passengers / get_user_info(登录态确认) / can_access_passengers(就绪探针) / '
                 'query_loop(启用任务后自动查询) / query_count(按任务计数) / '
-                'job_destroy(结束状态落库) / '
+                'job_destroy(结束状态落库) / station_filter(只抢指定车站，修同城站扩展误下单) / '
+                'log_thread(查询循环日志落盘) / wait_ready(账号等待限频+自愈) / '
+                'get_passenger_for_members(跳过僵尸账号对象) / '
                 'order_flow(订单状态机+阶段事件+防重复提交)').flush()
         except Exception:
             pass
@@ -189,9 +196,205 @@ def install():
         return False
 
 
+# ---------------- 日志落盘：查询循环所在的线程必须被当成「主线程」 ----------------
+#
+# ★ 症状：抢票任务在累计查询（`query_count` 一直涨），但**日志里什么都没有**。
+#
+# 根因：引擎把日志分成「主线程」与「子线程」两套缓冲，只有主线程才会落盘：
+#   py12306/log/base.py:      add_log()  → is_main_thread() ? self.logs : self.thread_logs[tid]
+#   py12306/log/query_log.py: print_job_start() → if is_main_thread(): self.flush()
+#   py12306/query/job.py:     Job.start() 每轮结束 → if is_main_thread(): QueryLog.flush()
+# 而 `_hook_query_loop()` 为了「0 任务启动后新建任务也能查询」，把单线程的查询循环
+# 放到 **daemon 线程** 里跑（`Query.start()` 原本跑在主线程）。
+# 于是 `is_main_thread()` 为假 → `>> 第 N 次查询 …` / `出发日期 …` / `耗时 …` 全部
+# 只堆在 `thread_logs[tid]` 里**永不落盘**（还顺带无界增长占内存）。
+#
+# 实测证据：`runtime/webx.log` 里最后一条 `>> 第 N 次查询` 停在 13:56:58，
+# 而 `runtime/query/status.json` 的 `query_count` 在同一时刻之后仍从 6145 涨到 6676+。
+#
+# 修法：把 webx 查询循环线程「视为主线程」。不能只改 `func.is_main_thread` ——
+# 各模块是 `from ... import is_main_thread` 绑定的，必须逐个模块替换同名全局。
+# **不修改 py12306 原文件。**
+#
+# ⚠️ 副作用评估：`sleep_forever()` 也用 `is_main_thread()`，但全项目无人调用
+# （只有 `sleep_forever_when_in_test()` 引用它，而后者也没人调用），故安全。
+# 代价是 `self.logs` 会被查询线程与主线程共用（引擎单线程模式本来就是这种用法）。
+
+WEBX_LOG_THREAD_NAME = 'webx-query-loop'
+
+
+def _hook_log_thread():
+    import threading
+
+    import py12306.helpers.func as func_mod
+
+    if getattr(func_mod.is_main_thread, '_webx_wrapped', False):
+        return
+    original = func_mod.is_main_thread
+
+    def is_main_thread():
+        try:
+            t = threading.current_thread()
+            if getattr(t, '_webx_log_thread', False) or t.name == WEBX_LOG_THREAD_NAME:
+                return True
+        except Exception:
+            pass
+        return original()
+
+    is_main_thread._webx_wrapped = True
+    is_main_thread._webx_original = original
+
+    # 逐模块替换（它们都是 from ... import 绑定的名字）
+    mods = [func_mod]
+    for name in ('py12306.log.base', 'py12306.log.query_log', 'py12306.query.job',
+                 'py12306.web.web'):
+        try:
+            mod = __import__(name, fromlist=['*'])
+            mods.append(mod)
+        except Exception:
+            pass
+    for mod in mods:
+        try:
+            if hasattr(mod, 'is_main_thread'):
+                mod.is_main_thread = is_main_thread
+        except Exception:
+            pass
+
+
+# ---------------- 账号就绪等待：限频 + 自愈 ----------------
+#
+# ★ 症状：界面显示账号**已登录**，但日志每 3 秒刷一行「账号正在登录中，3 秒后自动重试」。
+#
+# 根因（实测确认，两个独立成因叠在一起）：
+#  A. `UserJob.wait_for_ready()` 是**无界递归**：
+#         if self.is_ready: return self
+#         UserLog.add_quick_log(MESSAGE_WAIT_USER_INIT_COMPLETE).flush(); stay_second(3)
+#         return self.wait_for_ready()
+#     对象永远不 ready 时，调用它的线程就永久卡在这里，每 3 秒打一行。
+#  B. `User.get_passenger_for_members()` 取的是 `self.users` 里**第一个** key 匹配项，
+#     **不检查 is_alive / is_ready**；而 `UserJob.destroy()` 只把 is_alive 置 False、
+#     不从 `User.users` 摘除 → 重新扫码/改账号后列表里会留着**僵尸对象**（is_ready 永远 False）。
+#     于是「界面（读到的活对象）显示在线」+「日志（卡在僵尸对象上）显示正在登录中」同时成立。
+#     （`ConfigSync._prune_dead_users()` 只在账号列表变化时才跑，救不了这个场景。）
+#
+# 修法：
+#  1. 这里把 wait_for_ready 改成有界循环：先**尝试自愈**（读盘上的 cookie →
+#     `load_user()` → `is_ready=True`），日志限频且带上账号名与原因；
+#     遇到**已死对象**立即返回 None（调用方 `get_passenger_for_members` 的 `and` 会跳过它）。
+#  2. `_hook_get_passenger_for_members()` 优先挑「活着且就绪」的对象，并顺手摘掉僵尸。
+# **不修改 py12306 原文件。**
+
+_WAIT_LOG_INTERVAL = 60          # 同一个账号的等待日志最短间隔（秒）
+_WAIT_LAST_LOG = {}
+
+
+def _hook_wait_for_ready():
+    from py12306.user.job import UserJob
+
+    if getattr(UserJob.wait_for_ready, '_webx_wrapped', False):
+        return
+    original = UserJob.wait_for_ready
+
+    def wait_for_ready(self, *args, **kwargs):
+        import time
+        from py12306.log.user_log import UserLog
+        if getattr(self, 'is_ready', False):
+            return self
+
+        key = str(getattr(self, 'key', '') or '')
+        name = str(getattr(self, 'user_name', '') or key)
+        healed = 0.0
+        while not getattr(self, 'is_ready', False):
+            # 僵尸对象（已 destroy）：绝不能再等，否则调用方永久卡死
+            if not getattr(self, 'is_alive', True):
+                now = time.time()
+                if now - _WAIT_LAST_LOG.get('dead:' + key, 0) > _WAIT_LOG_INTERVAL:
+                    _WAIT_LAST_LOG['dead:' + key] = now
+                    UserLog.add_quick_log(
+                        'webx 跳过已失效的账号对象: %s（引擎里还有可用对象，已改用它）' % name).flush()
+                return None
+            # 自愈：盘上有 cookie（网页扫码写过）就试着自己恢复，成功则立刻就绪
+            now = time.time()
+            if now - healed > _WAIT_LOG_INTERVAL:
+                healed = now
+                try:
+                    if not getattr(self, 'is_first_time', lambda: True)() and self.load_user():
+                        if getattr(self, 'is_ready', False):
+                            return self
+                except Exception:
+                    pass
+            if now - _WAIT_LAST_LOG.get(key, 0) > _WAIT_LOG_INTERVAL:
+                _WAIT_LAST_LOG[key] = now
+                UserLog.add_quick_log(
+                    'webx 账号尚未就绪，正在等待: %s（每 %s 秒重试；若一直如此请到「账号管理」重新扫码）'
+                    % (name, getattr(self, 'retry_time', 3))).flush()
+            try:
+                stay = float(getattr(self, 'retry_time', 3) or 3)
+            except Exception:
+                stay = 3
+            time.sleep(stay)
+        return self
+
+    wait_for_ready._webx_wrapped = True
+    wait_for_ready._webx_original = original
+    UserJob.wait_for_ready = wait_for_ready
+
+
+def _hook_get_passenger_for_members():
+    """
+    `User.get_passenger_for_members(members, account_key)` 的原实现：
+
+        for user in self.users:
+            if user.key == key and user.wait_for_ready():
+                return user.get_passengers_by_members(members)
+
+    它按**列表顺序**取第一个 key 匹配项，完全不看 is_alive / is_ready。
+    `UserJob.destroy()` 只置 is_alive=False、不从 `User.users` 摘除 →
+    旧账号对象（僵尸）会一直排在前面，于是这里永远卡在僵尸上（配合上面的无限递归，
+    表现为每 3 秒刷「账号正在登录中」而界面依旧显示在线）。
+
+    包装后：优先「活着且就绪」的对象 → 其次「活着的」→ 都没有就把僵尸摘掉再回落原实现。
+    """
+    from py12306.user.user import User
+
+    if getattr(User.get_passenger_for_members, '_webx_wrapped', False):
+        return
+    original = User.get_passenger_for_members
+
+    def get_passenger_for_members(cls, members, key):
+        try:
+            users = list(getattr(cls(), 'users', None) or [])
+            mine = [u for u in users if str(getattr(u, 'key', '')) == str(key)]
+            if mine:
+                live = [u for u in mine if getattr(u, 'is_alive', True)]
+                ready = [u for u in live if getattr(u, 'is_ready', False)]
+                target = (ready or live or [None])[0]
+                if target is not None:
+                    got = target.wait_for_ready()
+                    if got is not None:
+                        return got.get_passengers_by_members(members)
+                # 同名对象全是僵尸 → 摘掉，避免每次调用都重走一遍
+                if not live:
+                    keep = [u for u in users if u not in mine]
+                    if len(keep) != len(users):
+                        try:
+                            cls().users[:] = keep
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return original(members, key)
+
+    wrapped = classmethod(get_passenger_for_members)
+    wrapped._webx_wrapped = True
+    wrapped._webx_original = original
+    User.get_passenger_for_members = wrapped
+
+
 # ---------------- 查询循环：从 0 任务恢复时自动拉起 ----------------
 #
 # 原版 Query.start() 在单线程模式下遇到 self.jobs 为空会直接 break 并返回。
+
 # 服务以 0 个任务启动后，网页新建/启用任务只会调 update_query_jobs()，
 # 新 Job 虽然已加入内存，但已退出的 start() 不会自动重启，因而永远不发查询。
 #
@@ -240,8 +443,14 @@ def _hook_query_loop():
                 runnable = any(getattr(job, 'is_alive', True) for job in (self.jobs or []))
                 running = bool(getattr(self, '_webx_query_loop_running', False))
                 if runnable and not running:
-                    threading.Thread(target=self.start, daemon=True,
-                                     name='webx-query-loop').start()
+                    th = threading.Thread(target=self.start, daemon=True,
+                                          name=WEBX_LOG_THREAD_NAME)
+                    # 标记为「日志主线程」：引擎只在主线程落盘（见 _hook_log_thread）
+                    try:
+                        th._webx_log_thread = True
+                    except Exception:
+                        pass
+                    th.start()
             except Exception:
                 pass
         return result
@@ -294,7 +503,6 @@ def _hook_job_destroy():
     if getattr(Job.destroy, '_webx_wrapped', False):
         return
     original = Job.destroy
-
     def destroy(self):
         try:
             _record_job_finished(self)
@@ -349,6 +557,166 @@ def _record_job_finished(job):
     except Exception:
         pass
     db.job_mark_finished(job_id, reason)
+
+
+# ---------------- 站点过滤：只抢「用户指定的那对车站」 ----------------
+#
+# ★ 根因（实测确认，用户报「区间设了 深圳北 → 广州南，却下单了 深圳北 → 广州东」）：
+#
+# 12306 的余票查询会做**同城站扩展** —— 查「深圳北 → 广州南」实际返回 567 条，其中
+#   到达站：广州南 208 / 广州东 132 / 新塘 87 / 广州 55 / 广州白云 42 / 广州北 38 / 番禺 3 / 花都 2
+#   出发站：深圳北 277 / 福田 64 / 深圳 205 / 深圳东 16 / 深圳机场 5
+# 而 `Job.is_trains_number_valid()` 只判「出发时段 + 车次白名单」，**完全没看站名**；
+# `is_has_ticket()` 也只判 `canWebBuy == 'Y'` 且 `order_text == '预订'`。
+# 于是「深圳北 → 广州东」(C8012) 完全符合条件 → 真的被下单（实测出了订单号）。
+#
+# 修法：包装 `Job.is_trains_number_valid`，在原有判断之上**再加一道站点校验** ——
+# 行的**实际**到发站（`ticket_info[6]/[7]`）必须落在用户输入的前缀展开集合里
+# （规则见 `webx/stations.py`：具体站只匹配自己，城市名匹配该城市全部站）。
+# 拿不到站名 / 站名无法解析时**放行**，避免把「站名写错」变成「一条也抢不到」的静默失败。
+#
+# 与原实现一致：回调内 try/except 兜底，异常绝不影响抢票主流程。
+
+_STATION_SKIP = {}          # 引擎 Job.id → {'at': 时间戳, 'nums': [车次…], 'sample': 描述}
+_STATION_SKIP_LOG_INTERVAL = 60
+
+
+def _allowed_stations(requested, mode='expand'):
+    """
+    用户输入 → 允许的实际站名集合；无法判断时返回 None（= 不拦截）。
+
+    `mode`：
+      - `expand`（同城站扩展，默认）：`广州` → 10 个广州站（前缀规则）
+      - `exact`（仅指定站名）  ：`广州` → 只算 `广州` 一个站；
+        输入不是完整站名时返回 None（= 不拦截，避免静默变成「一条也抢不到」）
+    """
+    try:
+        from py12306.webx import stations as st
+        if mode == 'exact':
+            return {requested} if st.is_exact_name(requested) else None
+        hit = st.expand(requested)
+        return set(hit) if hit else None
+    except Exception:
+        return None
+
+
+def _job_station_mode(job):
+    """
+    任务级站点匹配方式（由 `_hook_job_init_data` 从 job_info_dict 挂到实例上）。
+    ⚠️ 拿不到时兜底 `expand`（同城站扩展）：该字段是后加的，历史任务就是按这个语义
+    跑过来的 —— 保持原行为，不要因为在旧对象上读不到就骤变成「仅指定站名」。
+    """
+    mode = str(getattr(job, 'webx_station_mode', '') or '').strip().lower()
+    return mode if mode in ('expand', 'exact') else 'expand'
+
+
+def _row_station_ok(job):
+    """行里的实际到发站是否就是用户要的那对站"""
+    try:
+        requested_left = getattr(job, 'left_station', '') or ''
+        requested_arrive = getattr(job, 'arrive_station', '') or ''
+        info = getattr(job, 'ticket_info', None)
+        from py12306.webx import stations as st
+        # 优先用行里的**原始电报码**（ticket_info[6]/[7]）自己解析站名：
+        # 本地站点表缺新站，`job.get_info_of_left_station()` 在遇到未知码时
+        # 会直接抛 AttributeError（实测余票响应里出现过本地表没有的 `PYA`）。
+        actual_left = actual_arrive = None
+        if info is not None:
+            actual_left = st.name_of(info[6])
+            actual_arrive = st.name_of(info[7])
+        if not actual_left:
+            actual_left = job.get_info_of_left_station()
+        if not actual_arrive:
+            actual_arrive = job.get_info_of_arrive_station()
+    except Exception:
+        return True, '', ''
+    if not actual_left or not actual_arrive:
+        return True, '', ''
+    if not requested_left or not requested_arrive:
+        return True, '', ''
+    mode = _job_station_mode(job)
+    ok_l = (_allowed_stations(requested_left, mode) or {actual_left})
+    ok_r = (_allowed_stations(requested_arrive, mode) or {actual_arrive})
+    return (actual_left in ok_l and actual_arrive in ok_r), actual_left, actual_arrive
+
+
+def _note_station_skip(job, train_number, actual_left, actual_arrive):
+    """把「被站点过滤掉的车次」记一条事件（限频），并打到日志。"""
+    import time
+    try:
+        key = str(getattr(job, 'id', '') or id(job))
+        now = time.time()
+        rec = _STATION_SKIP.setdefault(key, {'at': 0.0, 'n': 0, 'nums': []})
+        rec['n'] += 1
+        if train_number and train_number not in rec['nums']:
+            rec['nums'].append(train_number)
+        if now - rec['at'] < _STATION_SKIP_LOG_INTERVAL:
+            return
+        rec['at'] = now
+        nums = rec['nums'][:8]
+        rec['nums'] = []
+        msg = ('近 %d 秒已按站点过滤 %d 条非目标车站的车次（最近：%s %s→%s）'
+               % (_STATION_SKIP_LOG_INTERVAL, rec['n'], '、'.join(nums) or '-',
+                  actual_left, actual_arrive))
+        rec['n'] = 0
+        try:
+            from py12306.log.common_log import CommonLog
+            CommonLog.add_quick_log('%s%s' % (_jn(job), msg)).flush()
+        except Exception:
+            pass
+        _evjob(job, 'skip', msg)
+    except Exception:
+        pass
+
+
+def _hook_station_filter():
+    from py12306.query.job import Job
+    if getattr(Job.is_trains_number_valid, '_webx_wrapped', False):
+        return
+    original = Job.is_trains_number_valid
+
+    def is_trains_number_valid(self, *args, **kwargs):
+        if not original(self, *args, **kwargs):
+            return False
+        try:
+            ok, actual_left, actual_arrive = _row_station_ok(self)
+            if not ok:
+                _note_station_skip(self, self.get_info_of_train_number(), actual_left, actual_arrive)
+                return False
+        except Exception:
+            pass
+        return True
+
+    is_trains_number_valid._webx_wrapped = True
+    is_trains_number_valid._webx_original = original
+    Job.is_trains_number_valid = is_trains_number_valid
+
+
+def _hook_job_init_data():
+    """
+    把 webx 自有任务字段挂到引擎 Job 实例上。
+
+    引擎的 `Job.init_data` 只读它认识的键，`job_info_dict` 里多出来的
+    `webx_station_mode` 会被丢掉；而站点过滤（`_hook_station_filter`）需要它。
+    包一层把它存到实例上，避免每行都去查一次数据库。
+    """
+    from py12306.query.job import Job
+    if getattr(Job.init_data, '_webx_wrapped', False):
+        return
+    original = Job.init_data
+
+    def init_data(self, info, *args, **kwargs):
+        result = original(self, info, *args, **kwargs)
+        try:
+            if isinstance(info, dict) and 'webx_station_mode' in info:
+                self.webx_station_mode = info.get('webx_station_mode')
+        except Exception:
+            pass
+        return result
+
+    init_data._webx_wrapped = True
+    init_data._webx_original = original
+    Job.init_data = init_data
 
 
 # ---------------- 下单状态机：诚实语义 + initDc 保护 + 防重 ----------------

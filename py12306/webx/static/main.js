@@ -61,24 +61,37 @@ function fmtAgo(ts) {
   return Math.floor(sec / 86400) + ' 天前';
 }
 
-/* ---------- 席别票价（与原型一致） ---------- */
-function seatPrice(leg, k) {
-  var high = leg.tn === '高铁' || leg.tn === '动车';
-  // 注意：这是**估算**（按历时 × 单价），长距离会明显偏低，仅供参考。
-  // 按「一个席别一个基准单价」给全：之前把卧铺/硬座只放在非高铁分支，
-  // 导致动车（D 字头，带卧铺）的硬卧/软卧拿不到价格。
-  var rates = {};
-  if (high) { rates.business = 3.1; rates.first = 1.65; rates.second = .82; rates.special = 2.1; }
-  rates.noSeat = high ? .82 : .21;      // 高铁无座 = 二等座价；普速无座 = 硬座价
-  rates.hardSleeper = .43; rates.softSleeper = .63; rates.hardSeat = .21;
-  var minutes = leg.m;
-  if (minutes == null) {
-    var d = +leg.d.slice(0, 2) * 60 + +leg.d.slice(3, 5);
-    var a = +leg.a.slice(0, 2) * 60 + +leg.a.slice(3, 5);
-    minutes = a - d; if (minutes < 0) minutes += 1440;
-  }
-  var r = rates[k]; if (!r) return null;
-  return Math.max(12, Math.round(minutes * r));
+/* ---------- 席别票价：**12306 真实价格**（不再估算） ----------
+   历史：早期用「历时 × 单价」估算，但实测两个方向都错很多 ——
+     · G531 北京南→上海虹桥 二等座 估 ¥292，实际 **¥661**（低 56%）
+     · G5148 深圳→马踏      二等座 估 ¥127，实际 **¥278**（低 54%）
+   根因：真实票价**按里程**，而估算按**历时** —— 同样 1 分钟，跑 200km/h 的
+   深茂铁路比跑 350km/h 的京沪高铁走得短得多，所以估算是根本性错误。
+   现在改成查 12306 的 `/otn/leftTicketPrice/query`（详见后端 `/api/tickets/prices`）。
+   价格放在 MON.prices，key = `train_no:上站电报码:下站电报码`。 */
+function priceKey(leg) {
+  if (!leg || !leg.no) return '';
+  // 上/下站：优先用该行的实际站电报码（t[6]/t[7]）；
+  // 若在经停站里改过区间，电报码已清空 → 退化用站名（后端会用站点表解析）。
+  var f = leg.f_code || leg.f || '';
+  var t = leg.to_code || leg.to || '';
+  if (!f || !t) return '';
+  return leg.no + ':' + f + ':' + t;
+}
+// 真实票价（元）。**没有就是 null，绝不用估算值顶替** ——
+// 错的数字比没有数字更糟（用户会据此选车次）。
+function priceOf(leg, k) {
+  var key = priceKey(leg);
+  if (!key) return null;
+  var p = MON.prices[key];
+  if (!p) return null;
+  var v = p[k];
+  return (v == null || v === '') ? null : v;
+}
+function fmtPrice(v) {
+  if (v == null) return '';
+  // 12306 价格可能带 .5（如 K952 硬座 ¥72、软臷 ¥226.5）
+  return (Math.round(v * 10) % 10 === 0) ? String(Math.round(v)) : v.toFixed(1);
 }
 // 席别取值语义（与后端约定）：'/'(或不设) = 该车不设此席别；'无' = 有该席别但无票；'有'/数字 = 可购
 function seatOffered(leg, k) {          // 该车是否提供此席别（可用于任务等待）
@@ -94,21 +107,78 @@ function seatCell(leg, k) {
   if (!seatOffered(leg, k)) {
     return '<td class="seat seat-absent" data-seat="' + k + '" title="该车次不设此席别"><strong class="absent">/</strong></td>';
   }
-  var price = seatPrice(leg, k);
   var inner;
   if (v == null || v === '') inner = '<strong class="none">无</strong>';
   else if (v === '无') inner = '<strong class="none">无</strong>';
   else if (v === '有') inner = '<strong>有</strong>';
   else if (v === '候补') inner = '<strong class="wait">候补</strong>';
   else inner = '<strong>' + esc(v) + '</strong>';
-  if (price) inner += '<small class="seat-price">约 ¥' + price + '</small>';
+  // 真实的才显示；还没查到就先留空，由 paintPrices() 回填
+  var price = priceOf(leg, k);
+  if (price != null) inner += '<small class="seat-price">¥' + fmtPrice(price) + '</small>';
   return '<td class="seat" data-seat="' + k + '">' + inner + '</td>';
+}
+
+/* 售价填充：先把车次列表渲染出来（快），再异步拉真实票价并**就地回填**。
+   为什么不直接把价格写进 /api/tickets：每个车次要单独查一次 12306（无批量接口，
+   实测 55 个车次要 ~2s），放在列表接口里会把整体响应拖慢。
+   服务端有 6 小时缓存（票价当天不变），所以同一批车次第二次搜几乎瞬回。 */
+function loadPrices(rowsOverride, dateOverride) {
+  var rows = rowsOverride || (MON.rows || []);
+  if (!rows.length) return;
+  var need = [], seen = {};
+  rows.forEach(function (leg) {
+    var key = priceKey(leg);
+    if (!key || seen[key]) return;
+    seen[key] = 1;
+    if (!MON.prices[key]) need.push(key);
+  });
+  if (!need.length) { paintPrices(); return; }
+  var date = dateOverride || (($('mDate') || {}).value || '');
+  api('/api/tickets/prices?date=' + encodeURIComponent(date) +
+      '&items=' + encodeURIComponent(need.join('|')))
+    .then(function (d) {
+      var got = (d && d.prices) || {};
+      Object.keys(got).forEach(function (k) { MON.prices[k] = got[k]; });
+      if ($('mResults')) paintPrices();
+      // 任务卡片 / 摘要里的价格也用同一份数据，一并刷新
+      if (typeof renderTaskPicked === 'function') renderTaskPicked();
+    })
+    .catch(function () { /* 票价拿不到就不显示，不弹错（不影响查票主流程）*/ });
+}
+
+/** 把已拿到的真实票价写进席别单元格（就地修改，避免整体重渲染） */
+function paintPrices() {
+  var box = $('mResults');
+  if (!box) return;
+  box.querySelectorAll('tr.ticket-row').forEach(function (tr) {
+    var leg = MON.rows[+tr.dataset.i];
+    if (!leg) return;
+    tr.querySelectorAll('td.seat').forEach(function (td) {
+      var k = td.dataset.seat;
+      var price = priceOf(leg, k);
+      var sm = td.querySelector('small.seat-price');
+      if (price == null) { if (sm) sm.parentNode.removeChild(sm); return; }
+      if (!sm) {
+        sm = document.createElement('small');
+        sm.className = 'seat-price';
+        td.appendChild(sm);
+      }
+      sm.textContent = '¥' + fmtPrice(price);
+    });
+  });
 }
 function rowHtml(leg) {
   var i = MON.rows.indexOf(leg);
   var rowCls = 'ticket-row' + (leg.bookable ? ' hit' : '');
   return '<tr class="' + rowCls + '" data-i="' + i + '">' +
-    '<td class="train"><b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></td>' +
+    // 车次号本身就是一个按钮：点它看经停站（与 12306 官网的交互一致）。
+    // 放在车次格里而不是操作列：操作列只放「预定」一个动作按钮，
+    // 而车次格宽度富余，点车次看详情也更符合直觉。
+    // （行内「新建任务」按钮已移除 2026-09：加任务统一走底部批量栏「添加到任务」。）
+    '<td class="train"><button class="train-stops" type="button" data-act="stops" data-i="' + i + '"'
+      + (leg.no ? ' title="查看经停站与到站参考票价"' : ' title="该车次缺少 12306 内部编号，无法查经停站"') + '>'
+      + '<b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></button></td>' +
     legCell(leg.f, leg.d) +
     legCell(leg.to, leg.a) +
     '<td class="duration">' + fmtDur(leg.m) + '</td>' +
@@ -116,7 +186,6 @@ function rowHtml(leg) {
     '<td class="actions">' +
       '<span class="row-pick"><input class="row-check" type="checkbox" data-i="' + i + '"' + (MON.sel[i] ? ' checked' : '') + '></span>' +
       '<button class="btn btn-outline" data-act="book">预定</button>' +
-      '<button class="btn btn-ghost" data-act="prefill">新建任务</button>' +
     '</td></tr>';
 }
 // 出发/到达：站名 + 对应时间合并在一栏（去掉冗余的单独时间列）
@@ -142,10 +211,40 @@ function paintRowSeats(i, tr) {
 function inBatchUI() {
   return !!MON.batch || $('mPanel').classList.contains('task-pick-mode');
 }
+// 非批量模式只允许保留一行车次的席别选择；切换车次时同步清掉旧行的视觉状态。
+function clearOtherSeatSelections(keepIndex) {
+  Object.keys(MON.selSeats).forEach(function (key) {
+    var i = +key;
+    if (i === keepIndex) return;
+    delete MON.selSeats[i];
+    delete MON.sel[i];
+    delete MON.selBy[i];
+    forgetSelection(i);
+    var tr = document.querySelector('#mResults tr[data-i="' + i + '"]');
+    if (tr) paintRowSeats(i, tr);
+  });
+}
+// 同步列表头「批量」按钮的选中态
+function syncModeSeg() {
+  var batch = $('mBatchToggle');
+  if (!batch) return;
+  batch.classList.toggle('on', MON.batch);
+  batch.setAttribute('aria-pressed', MON.batch ? 'true' : 'false');
+}
+function rememberSelection(i) {
+  var pos = MON.selOrder.indexOf(i);
+  if (pos >= 0) MON.selOrder.splice(pos, 1);
+  MON.selOrder.push(i);
+}
+function forgetSelection(i) {
+  var pos = MON.selOrder.indexOf(i);
+  if (pos >= 0) MON.selOrder.splice(pos, 1);
+}
 // 勾选车次 → 默认复选该行【全部】有票席别；取消勾选 → 清空该行席别
 function selectRow(i, on) {
   if (on) {
     MON.sel[i] = true;
+    rememberSelection(i);
     MON.selSeats[i] = {};
     availableSeatKeys(MON.rows[i]).forEach(function (k) { MON.selSeats[i][k] = true; });
     // 记住来源：复选框 = 「默认全部」语义（提交时补上表格没列的软卧/特等座）
@@ -154,25 +253,16 @@ function selectRow(i, on) {
     delete MON.sel[i];
     delete MON.selBy[i];
     MON.selSeats[i] = {};
+    forgetSelection(i);
   }
 }
-// 同一车次号在查询结果里可能出现多行（不同到达站 / 不同出发站的余票分区，
-// 如 G1025→深圳北 与 G1025→福田）。而引擎的车次白名单只有车次号，
-// 所以勾选/取消必须整组进行，否则会出现「G1025 的 A 行勾着、B 行没勾」这种自相矛盾的状态
-function sameTrainIndexes(i) {
-  var n = MON.rows[i] && MON.rows[i].n, out = [i];
-  MON.rows.forEach(function (r, k) { if (k !== i && r.n === n) out.push(k); });
-  return out;
-}
-// 勾选/取消某行 → 同车次号的所有行一起处理（复选框与席别都跟随）
+// 勾选/取消只作用于当前结果行；同车次号的不同出发/到达区间仍是独立选择。
 function setRowChecked(i, on) {
-  sameTrainIndexes(i).forEach(function (k) {
-    selectRow(k, on);
-    var tr = document.querySelector('#mResults tr[data-i="' + k + '"]');
-    var cb = tr && tr.querySelector('input.row-check');
-    if (cb) cb.checked = on;
-    paintRowSeats(k, tr);
-  });
+  selectRow(i, on);
+  var tr = document.querySelector('#mResults tr[data-i="' + i + '"]');
+  var cb = tr && tr.querySelector('input.row-check');
+  if (cb) cb.checked = on;
+  paintRowSeats(i, tr);
 }
 // 由席别反推复选框：只要还有席别被选中就勾上，全部取消则自动取消勾选
 function syncRowCheckFromSeats(i, tr) {
@@ -180,7 +270,56 @@ function syncRowCheckFromSeats(i, tr) {
   var any = Object.keys(MON.selSeats[i] || {}).length > 0;
   var cb = tr.querySelector('input.row-check');
   if (cb) cb.checked = any;
-  if (any) MON.sel[i] = true; else delete MON.sel[i];
+  if (any) {
+    MON.sel[i] = true;
+    MON.selBy[i] = 'seat';
+    rememberSelection(i);
+  } else {
+    delete MON.sel[i];
+    delete MON.selBy[i];
+    forgetSelection(i);
+  }
+}
+
+// 从非批量席别选择切入批量模式时，把已有席别同步为对应行的复选框选择。
+function syncBatchChecksFromSeats() {
+  document.querySelectorAll('#mResults tr[data-i]').forEach(function (tr) {
+    var i = +tr.dataset.i;
+    syncRowCheckFromSeats(i, tr);
+  });
+}
+
+// 批量模式退出后只保留最后一次选择的结果，避免非批量模式提交多条车次。
+function keepOnlyOneSelection() {
+  var selected = Object.keys(MON.sel).map(Number).sort(function (a, b) { return a - b; });
+  if (!selected.length) return;
+  var keep = null;
+  for (var j = MON.selOrder.length - 1; j >= 0; j--) {
+    if (selected.indexOf(MON.selOrder[j]) >= 0) {
+      keep = MON.selOrder[j];
+      break;
+    }
+  }
+  if (keep == null) keep = selected[selected.length - 1];
+  selected.forEach(function (i) {
+    if (i === keep) return;
+    delete MON.sel[i];
+    delete MON.selSeats[i];
+    delete MON.selBy[i];
+    forgetSelection(i);
+  });
+  Object.keys(MON.selSeats).forEach(function (key) {
+    if (+key !== keep) delete MON.selSeats[key];
+  });
+  Object.keys(MON.selBy).forEach(function (key) {
+    if (+key !== keep) delete MON.selBy[key];
+  });
+  document.querySelectorAll('#mResults tr[data-i]').forEach(function (tr) {
+    var i = +tr.dataset.i;
+    var cb = tr.querySelector('input.row-check');
+    if (cb) cb.checked = i === keep;
+    paintRowSeats(i, tr);
+  });
 }
 
 /* ---------- 登录态 ---------- */
@@ -319,8 +458,8 @@ function go(view, ctx) {
   if (view === 'detail' && ctx && ctx.job_id) loadDetail(ctx.job_id);
   if (view === 'monitor') {
     MON.batch = false;
-    $('mBatchToggle').classList.remove('is-active');
-    $('mBatchToggle').setAttribute('aria-pressed', 'false');
+    keepOnlyOneSelection();
+    syncModeSeg();
     if (ctx && ctx.pick) { refreshMonitorView(); enterPickMode(); }
     else { exitPickMode(); refreshMonitorView(); }
   }
@@ -567,15 +706,25 @@ function loadDetail(job_id) {
     var excepts = j.except_train_numbers || [];
     var members = (j.members || []).filter(Boolean);
     var isTrainMode = trains.length > 0;
+    var detailTrainDate = (j.left_dates || [])[0] || '';
+    var detailTrainList = function (numbers, clickable) {
+      return '<span class="detail-train-list">' + numbers.map(function (trainNumber) {
+        if (!clickable) return '<span class="detail-train-name">' + esc(trainNumber) + '</span>';
+        return '<button type="button" class="detail-train-link" data-detail-train="' + esc(trainNumber) + '" data-detail-date="' + esc(detailTrainDate) + '">' + esc(trainNumber) + '</button>';
+      }).join('') + '</span>';
+    };
     var scope = trains.length
-      ? esc(clipList(trains, 12)) + '<small>共 ' + trains.length + ' 个（只抢这些）</small>'
+      ? detailTrainList(trains, true) + '<small>共 ' + trains.length + ' 个（只抢这些）</small>'
       : (excepts.length
-        ? '排除 ' + esc(clipList(excepts, 12)) + '<small>其余均抢</small>'
+        ? '排除 ' + detailTrainList(excepts, false) + '<small>其余均抢</small>'
         : '不限车次<small>区间内全部车次</small>');
     $('dFacts').innerHTML =
       dvGroup('行程') +
       dv('查询方式', isTrainMode ? '车次查询<small>只抢列表内车次</small>' : '区间查询<small>查询区间内全部车次</small>') +
       dv('区间', (routes.join('；') || '—') + '<small>' + (j.stations || []).length + ' 组，依次轮询</small>') +
+      dv('站点匹配', (j.station_mode === 'exact'
+        ? '仅指定站名<small>只抢与输入完全同名的站</small>'
+        : '同城站扩展<small>城市名按该城市全部车站匹配；具体站只匹配自己</small>')) +
       dv('出行日期', esc((j.left_dates || []).map(shortDate).join('、') || '—') +
         '<small>共 ' + (j.left_dates || []).length + ' 天</small>') +
       dv('车次范围', scope) +
@@ -650,11 +799,54 @@ function loadDetail(job_id) {
     $('dTimeline').innerHTML = (j.hit_timeline || []).length ? j.hit_timeline.slice(0, 15).map(function (h) {
       return '<div class="it"><time>' + esc(String(h.at).slice(5, 16)) + '</time><i class="fdot"></i><div><b>' + esc(h.train_number) + '</b> 命中 <b>' + esc(h.seat) + '</b> × ' + esc(h.num) + ' <span style="color:var(--faint)">(' + esc(shortDate(h.left_date)) + ')</span></div></div>';
     }).join('') : '<div class="dv-empty">还没有命中记录。任务启动后这里会实时展示查询与命中轨迹。</div>';
+    bindDetailTrainStops(j);
     // 日志（后端已按任务名过滤且取最新，见 routes_jobs._job_logs）
     var logs = j.logs || [];
     if ($('dLogSub')) $('dLogSub').textContent = logs.length ? '最新 ' + logs.length + ' 行 · 已按任务名过滤' : '';
     $('dLog').innerHTML = logs.length ? logs.map(function (l) { return '<div class="' + logLineClass(l) + '">' + esc(l) + '</div>'; }).join('') : '<div style="color:var(--faint)">暂无日志</div>';
   }).catch(function (e) { toast(e.message, 'err'); go('jobs'); });
+}
+
+function bindDetailTrainStops(job) {
+  document.querySelectorAll('#dFacts [data-detail-train]').forEach(function (button) {
+    button.addEventListener('click', function () {
+      openDetailTrainStops(job, button.dataset.detailTrain, button.dataset.detailDate);
+    });
+  });
+}
+
+function openDetailTrainStops(job, trainNumber, date) {
+  var pairs = (job.stations || []).filter(function (pair) {
+    return pair.left && pair.arrive;
+  });
+  if (!pairs.length || !trainNumber || !date) {
+    toast('缺少该车次的查询区间或日期，无法获取经停站', 'err');
+    return;
+  }
+  toast('正在获取 ' + trainNumber + ' 的经停站…', '', 1800);
+  Promise.all(pairs.map(function (pair) {
+    return api('/api/tickets?' + new URLSearchParams({
+      left: pair.left, arrive: pair.arrive, date: date
+    }).toString()).then(function (data) {
+      return data.rows || [];
+    }).catch(function () { return []; });
+  })).then(function (groups) {
+    var leg = null;
+    groups.some(function (rows) {
+      return rows.some(function (row) {
+        if (String(row.n || '') !== String(trainNumber)) return false;
+        leg = row;
+        return true;
+      });
+    });
+    if (!leg) {
+      toast('当前日期未查询到车次 ' + trainNumber + '，无法显示经停站', 'err');
+      return;
+    }
+    openStopsForLeg(leg, null, date);
+  }).catch(function (e) {
+    toast(e.message || '获取车次信息失败', 'err');
+  });
 }
 // 执行轨迹的租户：TRACK.mode = 'stage'（下单阶段）| 'hit'（命中轨迹）。
 // userSet 记录「用户主动切过」，避免每次轮询刷新都把选择重置回默认值。
@@ -669,8 +861,8 @@ function applyTrackMode() {
   for (var i = 0; i < seg.length; i++) seg[i].classList.toggle('on', seg[i].dataset.track === TRACK.mode);
   if ($('dTrackSub')) {
     $('dTrackSub').textContent = stage
-      ? '命中 → 排队 → 成单，含每步耗时'
-      : '最近 15 次余票命中';
+      ? '命中 → 成单 · 含耗时'
+      : '最近 15 次命中';
   }
 }
 // 每次进详情页都重新绑定（事件委托在 document 上，只需绑一次）
@@ -750,13 +942,25 @@ function renderMonitorDates() {
   var box = $('mDates');
   if (!box) return;
   var cur = $('mDate').value;
-  box.innerHTML = DATES.all.map(function (x) {
+  // 只保留**一个**未开售日期：后面每天都是同样的「未开售」，全列出来只是白占横向空间
+  // （实测 20 天里 5 天未开售）。留一个当「还有更多、但还没开售」的提示，
+  // 点它会 toast 说明，且 tooltip 会带出剩余天数。
+  var openL = DATES.all.filter(function (x) { return x.open !== false; });
+  var blockedL = DATES.all.filter(function (x) { return x.open === false; });
+  var list = openL.concat(blockedL.slice(0, 1));
+  var extraClosed = Math.max(0, blockedL.length - 1);
+  box.innerHTML = list.map(function (x) {
     var blocked = x.open === false;
+    // 「未开售」不再单独占一行：第三行会让日期片高度明显变高、整条日期栏变厚。
+    // 改为中划线（app.css 的 .date.dis::after）+ 灰化 + tooltip，信息不丢。
+    var tip = blocked
+      ? ('尚未开售' + (extraClosed ? '（其余 ' + extraClosed + ' 天同样未开售）' : ''))
+      : x.date;
     return '<div class="date' + (blocked ? ' dis' : '') + (x.date === cur ? ' on' : '') +
       '" data-date="' + x.date + '" data-open="' + (blocked ? '0' : '1') +
-      '" title="' + esc(blocked ? '尚未开售' : x.date) + '">' +
+      '" title="' + esc(tip) + '">' +
       '<b>' + esc(x.weekday) + '</b><small>' + esc(x.date.slice(5)) + '</small>' +
-      (blocked ? '<small class="dis-tag">未开售</small>' : '') + '</div>';
+      '</div>';
   }).join('');
   if ($('mPresaleNote')) $('mPresaleNote').textContent = DATES.note;
   box.querySelectorAll('.date').forEach(function (el) {
@@ -935,10 +1139,14 @@ function loadPassengersFor(key) {
     clearNtPassengers('账号未登录');
     return;
   }
+  var requestSeq = (APP.passengerLoadSeq || 0) + 1;
+  APP.passengerLoadSeq = requestSeq;
   APP.paxAll = []; APP.paxSel = [];
   $('ntPassengers').innerHTML = '<span style="color:var(--faint);font-size:12.5px">加载中…</span>';
   $('ntPaxHint').textContent = '';
   api('/api/accounts/' + encodeURIComponent(key) + '/passengers').then(function (d) {
+    // 编辑初始化和账号轮询可能同时触发多次请求，旧响应不能覆盖最新选择。
+    if (APP.passengerLoadSeq !== requestSeq) return;
     // 异步返回时账号可能已经掉线 → 结果作废，避免又把乘车人填回来
     if (APP.accReady && APP.accReady[key] === false) {
       clearNtPassengers('账号未登录');
@@ -987,7 +1195,8 @@ function seedSeatTiers(all) {
   // 优先沿用现有的 selSeats（比如从车次查询带过来 / 之前选过），否则给个默认
   var seed = (APP.selSeats || []).filter(function (s) { return all.indexOf(s) >= 0; });
   if (!seed.length) {
-    var prefer = ['二等座', '一等座', '商务座', '硬卧', '硬座'];
+    // 默认座次（用户指定 2026-09）：二等座 + 无座；都取不到才回落到第一个席别
+    var prefer = ['二等座', '无座'];
     seed = prefer.filter(function (s) { return all.indexOf(s) >= 0; }).slice(0, 2);
   }
   APP.seatTiers = [seed.length ? seed : [all[0]]];
@@ -1114,11 +1323,23 @@ function buildNtSeats() { renderNtSeats(); }
 function addNtPair(left, arrive) {
   var row = document.createElement('div');
   row.className = 'pair';
-  row.innerHTML = '<input class="stn" type="text" data-role="left" value="" placeholder="出发站"><span class="arr">→</span><input class="stn" type="text" data-role="arrive" value="" placeholder="到达站"><span class="del">✕</span>';
+  // 每个站名输入都带自己的联想框（与车票查询页的起终点输入框一致），
+  // 以及一行「这个输入会匹配哪些站」的说明 —— 12306 查询会做同城站扩展，
+  // 不写出来用户根本不知道「广州」= 10 个站、「广州南」= 只 1 个站。
+  row.innerHTML =
+    '<div class="stn-wrap"><input class="stn" type="text" data-role="left" value="" placeholder="出发站">' +
+      '<div class="stn-suggest hidden"></div></div>' +
+    '<span class="arr">→</span>' +
+    '<div class="stn-wrap"><input class="stn" type="text" data-role="arrive" value="" placeholder="到达站">' +
+      '<div class="stn-suggest hidden"></div></div>' +
+    '<span class="del">✕</span>' +
+    '<div class="pair-note" data-note="left" hidden></div>' +
+    '<div class="pair-note" data-note="arrive" hidden></div>';
   $('ntPairs').appendChild(row);
   if (left) row.querySelector('[data-role=left]').value = left;
   if (arrive) row.querySelector('[data-role=arrive]').value = arrive;
   wireNtPair(row);
+  refreshPairNotes();
 }
 function wireNtPair(row) {
   row.querySelector('.del').addEventListener('click', function () {
@@ -1126,15 +1347,113 @@ function wireNtPair(row) {
     if (!$('ntPairs').querySelector('.pair')) addNtPair('北京', '深圳');
     refreshNtQueryLoad();
     updateNtSummary();
+    refreshPairNotes();
   });
   // 输入站点后需要刷新「每轮请求」预估（空区间会被 ntPairs() 过滤，所以必须监听输入）
   row.querySelectorAll('.stn').forEach(function (inp) {
-    inp.addEventListener('input', function () { refreshNtQueryLoad(); updateNtSummary(); });
+    if (inp.dataset.ntWired) return;
+    inp.dataset.ntWired = '1';
+    inp.addEventListener('input', function () {
+      refreshNtQueryLoad();
+      updateNtSummary();
+      scheduleePairNotes();
+    });
+    inp.addEventListener('change', function () { refreshPairNotes(); });
   });
-  bindStationSuggest(row.querySelectorAll('.stn'));
+  bindStationSuggest(row.querySelectorAll('.stn'), {
+    onPick: function () { refreshNtQueryLoad(); updateNtSummary(); refreshPairNotes(); }
+  });
 }
 function loadStationsForPairs() {
   $('ntPairs').querySelectorAll('.pair').forEach(wireNtPair);
+  refreshPairNotes();
+}
+var pairNoteTimer = 0;
+// 站点匹配方式：exact=仅指定站名（默认，只认完全同名的站）/ expand=同城站扩展（城市名=该城市全部车站）。
+// 与引擎侧 `webx/stations.expand()`、任务表的 `station_mode` 同一套语义。
+function ntStnMode() {
+  var box = $('ntStnMode');
+  var on = box && box.querySelector('.seg-btn.on');
+  return on ? on.dataset.stnMode : 'exact';
+}
+function setNtStnMode(mode) {
+  var seg = $('ntStnMode'); if (!seg) return;
+  seg.querySelectorAll('.seg-btn').forEach(function (b) {
+    b.classList.toggle('on', b.dataset.stnMode === (mode || 'exact'));
+  });
+  if ($('ntStnModeHint')) {
+    $('ntStnModeHint').textContent = ntStnMode() === 'exact'
+      ? '只认完全同名的站：填「广州」只抢广州站'
+      : '城市名（广州）= 该城市全部车站';
+  }
+  refreshPairNotes();
+  updateNtSummary();
+}
+function bindStnMode() {
+  var seg = $('ntStnMode'); if (!seg || seg.dataset.bound) return;
+  seg.dataset.bound = '1';
+  seg.querySelectorAll('.seg-btn').forEach(function (b) {
+    b.addEventListener('click', function () { setNtStnMode(b.dataset.stnMode); });
+  });
+}
+function scheduleePairNotes() {
+  clearTimeout(pairNoteTimer);
+  pairNoteTimer = setTimeout(refreshPairNotes, 350);
+}
+// 区间输入 → 实际匹配车站。规则与引擎侧 `webx/stations.expand()` **完全同源**
+// （同一个接口 + mode 参数），所以界面写什么，引擎就按什么过滤。
+function refreshPairNotes() {
+  var box = $('ntPairs'); if (!box) return;
+  var rows = Array.prototype.slice.call(box.querySelectorAll('.pair'));
+  if (!rows.length) return;
+  var inputs = [], seen = {};
+  rows.forEach(function (r) {
+    ['left', 'arrive'].forEach(function (role) {
+      var inp = r.querySelector('[data-role=' + role + ']');
+      var v = (inp.value || '').trim();
+      if (v && !seen[v]) { seen[v] = 1; inputs.push(v); }
+    });
+  });
+  function hideAll() {
+    rows.forEach(function (r) {
+      r.querySelectorAll('.pair-note').forEach(function (n) { n.hidden = true; n.innerHTML = ''; });
+    });
+  }
+  if (!inputs.length) { hideAll(); return; }
+  var mode = ntStnMode();
+  api('/api/stations/expand?mode=' + encodeURIComponent(mode) + '&q=' + encodeURIComponent(inputs.join('|'))).then(function (d) {
+    var byInput = {};
+    (d.list || []).forEach(function (x) { byInput[x.input] = x; });
+    rows.forEach(function (r) {
+      // 说明**分别**挂在出发站 / 到达站自己的输入框下方（见 app.css 的 [data-note] 列定位）
+      ['left', 'arrive'].forEach(function (role) {
+        var note = r.querySelector('.pair-note[data-note="' + role + '"]');
+        if (!note) return;
+        var v = (r.querySelector('[data-role=' + role + ']').value || '').trim();
+        var info = v ? byInput[v] : null;
+        if (!info) { note.hidden = true; note.innerHTML = ''; return; }
+        var html, cls = 'pair-note';
+        if (!info.known) {
+          html = '<b>' + esc(v) + '</b> 未收录，请检查拼写'; cls += ' bad';
+        } else if (mode === 'exact' && !info.exact) {
+          html = '<b>' + esc(v) + '</b> 不是完整站名，请从下拉里选'; cls += ' bad';
+        } else if (mode === 'exact') {
+          // 「仅指定站名」：完整站名当然只匹配自己 → 不再显示注释，只保留上面的错误提示
+          note.hidden = true; note.innerHTML = ''; note.title = '';
+          return;
+        } else {
+          // 「同城站扩展」：展示全部会匹配到的站名（匹配：站名），不截断
+          var ms = info.matches || [];
+          html = '<b>' + esc(v) + '</b> 匹配：' + esc(ms.join('、'));
+          if (ms.length > 1) cls += ' wide';
+        }
+        note.hidden = false;
+        note.className = cls;
+        note.innerHTML = html;
+        note.title = info.known ? ((info.matches || []).join('、') || '') : '';
+      });
+    });
+  }).catch(function () { hideAll(); });
 }
 // 车次范围三选一（与后端「train_numbers / except_train_numbers 不可同时给出」的校验一致）
 function ntTrainMode() {
@@ -1164,9 +1483,8 @@ function ntQueryLoad() {
   var st = ntPairs().length, dt = (APP.selDates || []).length;
   return { stations: st, dates: dt, perRound: st * dt };
 }
-// 预估金额（单个乘车人）：取「优先级最高的席别」在已选车次里的估算票价。
-// 只有车次查询模式算得了（区间模式还没确定车次，拿不到席别与历时）。
-// ⚠️ 单价是 seatPrice 的粗略估算（历时 × 单价），长距离会偏低 → 文案写「预估」。
+// 金额（单个乘车人）：取「优先级最高的席别」在已选车次里的**真实票价**。
+// 价格来自 12306（loadPrices 已缓存到 MON.prices）；还没查到就返回 null。
 function ntEstimateUnitPrice() {
   var seats = APP.selSeats || [];
   var picked = APP.taskPicked || [];
@@ -1177,8 +1495,8 @@ function ntEstimateUnitPrice() {
     for (var j = 0; j < picked.length; j++) {
       var leg = picked[j] && picked[j].leg;
       if (leg && seatOffered(leg, k)) {
-        var p = seatPrice(leg, k);
-        if (p) return { price: p, seat: seats[i], train: leg.n || leg.tn || '' };
+        var p = priceOf(leg, k);
+        if (p != null) return { price: p, seat: seats[i], train: leg.n || leg.tn || '' };
       }
     }
   }
@@ -1189,12 +1507,12 @@ function ntEstimateLabel() {
   var pax = (APP.paxSel || []).length;
   if (!unit) {
     return '<span style="color:var(--faint)">—</span><small>' +
-      (ntMode() === 'train' ? '选定车次与座次后可预估' : '区间模式未定车次，无法预估') + '</small>';
+      (ntMode() === 'train' ? '票价加载中或该席别无报价' : '区间模式未定车次，无法给出金额') + '</small>';
   }
   var total = unit.price * (pax || 1);
-  return '<b style="color:var(--red)">¥' + fmtNum(total) + '</b>' +
-    '<small>' + esc(unit.seat) + ' 约 ¥' + fmtNum(unit.price) + ' × ' + (pax || 1) +
-    ' 人（按历时估算，仅供参考）</small>';
+  return '<b style="color:var(--red)">¥' + fmtNum(Math.round(total * 10) / 10) + '</b>' +
+    '<small>' + esc(unit.seat) + ' ¥' + fmtPrice(unit.price) + ' × ' + (pax || 1) +
+    ' 人（12306 实际票价，按首选席别）</small>';
 }
 function refreshNtQueryLoad() {
   var L = ntQueryLoad();
@@ -1214,6 +1532,7 @@ function refreshNtQueryLoad() {
 function refreshNewView() {
   bindNtModeSeg();
   bindNtStartMode();
+  bindStnMode();
   applyNtMode();
   syncSeatsFromPicked();
   // 日期 chip 必须重绘：车票查询导入车次时会向 APP.selDates 写入查询日期，
@@ -1434,6 +1753,11 @@ function updateNtSummary() {
       ? esc(APP.paxSel.join('、')) + '<small>' + APP.paxSel.length + ' 人' + ($('ntLessMember').checked ? ' · 允许部分先行' : '') + '</small>'
       : '未选') +
     row('区间', pairs.length ? esc(pairs.map(function (p) { return p.left + '→' + p.arrive; }).join(' · ')) + '<small>' + pairs.length + ' 组，依次轮询</small>' : '未填') +
+    row('站点匹配', ntMode() === 'range'
+      ? (ntStnMode() === 'exact'
+        ? '仅指定站名<small>只抢与输入完全同名的站（「广州」= 广州站）</small>'
+        : '同城站扩展<small>城市名按该城市全部车站匹配（「广州」= 10 个广州站）；具体站只匹配自己</small>')
+      : '—') +
     row('日期', APP.selDates.length ? esc(APP.selDates.map(shortDate).join('、')) + '<small>共 ' + APP.selDates.length + ' 天</small>' : '未选') +
     // 标签跟模式走：车次模式没有可编辑的「席别优先级」列表，那里叫「座次顺序」
     row(train ? '座次顺序' : '席别优先级', seatPri || '未选', 'seat-priority') +
@@ -1444,7 +1768,7 @@ function updateNtSummary() {
     row('开始时间', esc(ntStartLabel()) + '<small>需引擎支持后生效</small>') +
     row('查询间隔', iv.min + '–' + iv.max + ' 秒<small>本任务专用；需引擎支持后生效</small>') +
     row('每轮请求', load.perRound ? '<b>' + load.perRound + '</b> 次<small>' + load.stations + ' 区间 × ' + load.dates + ' 日期</small>' : '—') +
-    row('预估金额', ntEstimateLabel());
+    row('参考金额', ntEstimateLabel());
   // 允许部分乘客：说明引擎在该开关下的实际行为
   if ($('ntLessNote')) $('ntLessNote').textContent = $('ntLessMember').checked
     ? '开启时：按实际余票数减人提交'
@@ -1544,20 +1868,34 @@ function refreshMonitorView() {
 
 /* ---------- 车站联想 ---------- */
 var sugTimers = {};
-function bindStationSuggest(inputs) {
+var SUG_SEQ = 0;
+// 联想框的位置：车票查询页用固定 id，其余（新建任务页的区间输入框）用同级的 .stn-suggest。
+// 早先这里对非 mFrom/mTo 直接 `return`（注释写「直接输入即可」），
+// 结果是区间输入框没有任何提示，用户只能盲打站名 —— 而站名打错在引擎侧是**静默失败**。
+function suggestBoxOf(inp) {
+  var id = inp.id === 'mFrom' ? 'mFromSug' : inp.id === 'mTo' ? 'mToSug' : null;
+  if (id) return $(id);
+  var wrap = inp.parentElement;
+  return wrap ? wrap.querySelector('.stn-suggest') : null;
+}
+function bindStationSuggest(inputs, opts) {
+  opts = opts || {};
   (inputs.length ? inputs : [inputs]).forEach(function (inp) {
-    // boxId 必须在外层作用域求值：blur 处理器与 input 处理器是两个函数，
-    // 之前 boxId 只声明在 input 处理器内，blur 引用它必然抛 ReferenceError
-    var boxId = inp.id === 'mFrom' ? 'mFromSug' : inp.id === 'mTo' ? 'mToSug' : null;
-    if (!boxId) return; // 新建任务页站名直接输入即可，不做远程联想
-    var box = function () { return $(boxId); };
+    if (inp.dataset.sugBound) return;
+    inp.dataset.sugBound = '1';
+    if (!inp.dataset.sugKey) inp.dataset.sugKey = 'sg' + (++SUG_SEQ);
+    var boxKey = inp.dataset.sugKey;
+    var box = function () { return suggestBoxOf(inp); };
     inp.addEventListener('input', function () {
-      clearTimeout(sugTimers[boxId]);
-      if (!inp.value.trim()) { box().classList.add('hidden'); return; }
-      sugTimers[boxId] = setTimeout(function () {
+      clearTimeout(sugTimers[boxKey]);
+      var el0 = box();
+      if (!el0) return;
+      if (!inp.value.trim()) { el0.classList.add('hidden'); return; }
+      sugTimers[boxKey] = setTimeout(function () {
         api('/api/stations?q=' + encodeURIComponent(inp.value.trim())).then(function (d) {
           var list = d.list || [];
           var el = box();
+          if (!el) return;
           if (!list.length) { el.classList.add('hidden'); return; }
           el.innerHTML = list.map(function (s) {
             return '<div class="stn-item" data-n="' + esc(s.name) + '"><span>' + esc(s.name) + '</span><small>' + esc(s.pinyin || '') + '</small></div>';
@@ -1568,19 +1906,25 @@ function bindStationSuggest(inputs) {
               e.preventDefault();
               inp.value = it.dataset.n;
               el.classList.add('hidden');
+              if (opts.onPick) opts.onPick(inp.value);
             });
           });
         }).catch(function () { });
       }, 300);
     });
     inp.addEventListener('blur', function () {
-      setTimeout(function () { box().classList.add('hidden'); }, 150);
+      setTimeout(function () { var el = box(); if (el) el.classList.add('hidden'); }, 150);
     });
   });
 }
 
 /* ---------- 5. 车票查询 ---------- */
-var MON = { rows: [], batch: false, sel: {}, selSeats: {}, selBy: {}, sort: null, stationOpts: { from: {}, to: {} },
+var MON = { rows: [], batch: false, sel: {}, selSeats: {}, selBy: {}, selOrder: [], sort: null, stationOpts: { from: {}, to: {} },
+            // 真实票价缓存：key = `train_no:上站电报码:下站电报码` → {seat_key: 元}
+            // 由 loadPrices() 从 /api/tickets/prices 拉取后填充
+            prices: {},
+            // 出发时间区间（整点，0~24）：from=0 且 to=24 表示不限。与 MON.filters.hour 联动
+            hourFrom: 0, hourTo: 24,
             searched: false,
             filters: { types: [], fromSt: [], toSt: [], seats: [], hour: '', bookable: false } };
 APP.taskPicked = []; // 新建任务：从车票查询勾选的车次（含席别）
@@ -1589,6 +1933,7 @@ function renderTaskPicked() {
   var list = $('taskSelectionList');
   if (!list) return;
   var sels = APP.taskPicked || [];
+  var taskDate = (APP.selDates || [])[0] || (($('mDate') || {}).value || '');
   // 入口按钮的文案随状态变化（样式与「+ 添加一组区间」一致）；
   // 没有车次时它兼任空态提示，所以不再需要单独的空白占位块
   if ($('taskAddTrain')) $('taskAddTrain').textContent = sels.length ? '+ 继续添加车次' : '+ 添加车次';
@@ -1600,17 +1945,21 @@ function renderTaskPicked() {
     var chip = PICK_SEAT_KEYS.filter(function (k) { return seatOffered(leg, k); }).map(function (k) {
       var v = leg.s ? leg.s[k] : '';
       var on = s.seats.indexOf(SEAT_NAME[k]) >= 0;
-      var price = seatPrice(leg, k);
       // 展示格式：座次（票数） 价格。票数就是接口原值（有 / 无 / 数字 / 候补），
       // 不再用「等待放票」这种额外文案 —— 无票就是「无」，含义已经足够清楚。
       var vTxt = (v == null || v === '') ? '—' : esc(String(v));
+      // 价格用 12306 真实票价（loadPrices 已填充）；没查到就不显示
+      var price = priceOf(leg, k);
       return '<label class="task-seat-option"><input type="checkbox" data-tn="' + esc(leg.n) + '" data-k="' + k + '" ' + (on ? 'checked' : '') + '>' +
         SEAT_NAME[k] + '（' + vTxt + '）' +
-        (price ? '<em class="tk-price">¥' + price + '</em>' : '') + '</label>';
+        (price != null ? '<em class="tk-price">¥' + fmtPrice(price) + '</em>' : '') + '</label>';
     }).join('');
     return '<div class="task-selection-item" data-tn="' + esc(leg.n) + '">' +
-      '<div class="train"><b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></div>' +
-      '<div class="route"><b>' + esc(leg.f) + ' ' + esc(leg.d) + ' → ' + esc(leg.to) + ' ' + esc(leg.a) + '</b><small>' + $('mDate').value + ' · ' + fmtDur(leg.m) + '</small></div>' +
+      // 车次号可点：与车票查询列表一致，打开经停站；在这里还能改「上车 / 下车」站
+      '<button class="train task-train-stops" type="button" data-tn="' + esc(leg.n) + '"'
+        + (leg.no ? ' title="查看经停站，可改上车站 / 下车站"' : ' title="该车次缺少 12306 内部编号"') + '>'
+        + '<b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></button>' +
+      '<div class="route"><b>' + esc(leg.f) + ' ' + esc(leg.d) + ' → ' + esc(leg.to) + ' ' + esc(leg.a) + '</b><small>' + esc(taskDate) + ' · ' + fmtDur(leg.m) + '</small></div>' +
       '<div class="task-seat-options">' + chip + '</div>' +
       '<button class="remove-selection" data-tn="' + esc(leg.n) + '" title="移除">×</button></div>';
   }).join('');
@@ -1646,6 +1995,14 @@ function renderTaskPicked() {
       applyNtMode(); syncSeatsFromPicked(); renderTaskPicked(); renderNtSeats();
     });
   });
+  // 车次号 → 经停站（可改上/下车；改完重绘卡片与推导区间）
+  list.querySelectorAll('.task-train-stops').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var ix = findByTn(b.dataset.tn);
+      if (ix < 0) return;
+      openStopsForLeg(APP.taskPicked[ix].leg, function () { renderTaskPicked(); });
+    });
+  });
   renderNtDerived();
   updateNtSummary();
 }
@@ -1654,8 +2011,7 @@ function enterPickMode() {
   // 从新建任务页「继续添加」进入：直接开启批量模式，右侧复选框才可用
   MON.batch = true;
   $('mPanel').classList.add('task-pick-mode', 'batch-mode');
-  $('mBatchToggle').classList.add('is-active');
-  $('mBatchToggle').setAttribute('aria-pressed', 'true');
+  syncModeSeg();
   // 进入时快照草稿：「添加到任务」提交本次修改，「取消」回滚到此快照
   snapshotPick();
   restorePickFromTask();
@@ -1716,11 +2072,12 @@ function restorePickFromTask() {
   doMonitorSearch().then(function () { applyPickToRows(); });
 }
 function applyPickToRows() {
-  MON.sel = {}; MON.selSeats = {}; MON.selBy = {};
+  MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
   (APP.taskPicked || []).forEach(function (s) {
     MON.rows.forEach(function (r, i) {
       if (r.n !== s.leg.n) return;
       MON.sel[i] = true;
+      rememberSelection(i);
       // 恢复出来的选择视为「已明确指定」：后续提交不再自动补默认席别
       // （草稿里已有的软卧/特等座会通过 prevSeats 保留）
       MON.selBy[i] = 'seat';
@@ -1845,7 +2202,7 @@ function pickAddToTask() {
   APP.ntMode = 'train';
   renderNtDates();
   exitPickMode();
-  MON.sel = {}; MON.selSeats = {}; MON.selBy = {};
+  MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
   go('new');
   toast(added + ' 个车次已加入任务' + (added < sel.length ? '（' + (sel.length - added) + ' 个已合并）' : ''), 'ok');
 }
@@ -1917,8 +2274,95 @@ function syncMonitorFilters() {
   MON.filters.fromSt = readFilterGroup('mFromStation');
   MON.filters.toSt = readFilterGroup('mToStation');
   MON.filters.seats = readFilterGroup('mSeatFilter');
-  MON.filters.hour = readFilterGroup('mTime');
+  MON.filters.hour = readHourRange();
   MON.filters.bookable = $('mAvailable').checked;
+}
+/* ---------- 出发时间：双点滑动条 ----------
+   输出仍然是 matchHour() 认的 `'HH:00-HH:00'` 单区间（数组只有一个元素），
+   全量 [0,24] 输出 []（= 不限），因此下游无需改动。 */
+function hourText(h) { return pad2(h) + ':00'; }
+function hourIsAll() { return MON.hourFrom <= 0 && MON.hourTo >= 24; }
+function readHourRange() {
+  if (hourIsAll()) return [];
+  return [hourText(MON.hourFrom) + '-' + hourText(MON.hourTo)];
+}
+function renderHourRange() {
+  var box = $('mHourRange'); if (!box) return;
+  var pct = function (h) { return (h / 24) * 100; };
+  var fill = $('mHourFill');
+  if (fill) { fill.style.left = pct(MON.hourFrom) + '%'; fill.style.width = (pct(MON.hourTo) - pct(MON.hourFrom)) + '%'; }
+  [['mHourFrom', MON.hourFrom], ['mHourTo', MON.hourTo]].forEach(function (p) {
+    var el = $(p[0]); if (!el) return;
+    el.style.left = pct(p[1]) + '%';
+    el.setAttribute('aria-valuenow', String(p[1]));
+    el.setAttribute('aria-valuetext', hourText(p[1]));
+  });
+  var all = hourIsAll();
+  if ($('mHourVal')) {
+    // 「不限」在轨道左侧（与其他筛选行的「全部」同位）；这里只显示当前区间。
+    // 不限时留空但保留槽位（CSS min-width），避免切换时轨道宽度跳动
+    $('mHourVal').textContent = all ? '' : (hourText(MON.hourFrom) + ' - ' + hourText(MON.hourTo));
+    $('mHourVal').classList.toggle('on', !all);
+  }
+  if ($('mHourReset')) $('mHourReset').classList.toggle('on', all);
+}
+// 不变量：0 <= from < to <= 24（至少 1 小时的窗口），所以两端拖动永远不会交叉 / 互换
+function setHourFrom(h) { MON.hourFrom = Math.max(0, Math.min(MON.hourTo - 1, Math.round(h))); }
+function setHourTo(h) { MON.hourTo = Math.max(MON.hourFrom + 1, Math.min(24, Math.round(h))); }
+function applyHourRange() { syncMonitorFilters(); applyMonitor(); }
+function resetHourRange(opts) {
+  MON.hourFrom = 0; MON.hourTo = 24;
+  renderHourRange();
+  if (!opts || opts.apply !== false) applyHourRange();
+}
+function bindHourRange() {
+  var box = $('mHourRange'); if (!box) return;
+  var rail = box.querySelector('.hr-rail');
+  if (!rail) return;
+  renderHourRange();
+  function hourAt(clientX) {
+    var r = rail.getBoundingClientRect();
+    if (!r.width) return 0;
+    var x = Math.max(0, Math.min(r.width, clientX - r.left));
+    return (x / r.width) * 24;
+  }
+  // 拖动过程中只更新视觉（便宜），松手才重新筛选 —— 否则每一像素都要重建整张表
+  function drag(which, startEvent) {
+    var move = function (ev) {
+      if (which === 'from') setHourFrom(hourAt(ev.clientX)); else setHourTo(hourAt(ev.clientX));
+      renderHourRange();
+    };
+    var up = function () {
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      document.removeEventListener('pointercancel', up);
+      document.body.classList.remove('hr-dragging');
+      applyHourRange();
+    };
+    move(startEvent);
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+    document.addEventListener('pointercancel', up);
+    document.body.classList.add('hr-dragging');
+  }
+  [['mHourFrom', 'from'], ['mHourTo', 'to']].forEach(function (p) {
+    var el = $(p[0]); if (!el) return;
+    el.addEventListener('pointerdown', function (e) { e.preventDefault(); drag(p[1], e); });
+    el.addEventListener('keydown', function (e) {
+      var d = e.key === 'ArrowLeft' ? -1 : (e.key === 'ArrowRight' ? 1 : 0);
+      if (!d) return;
+      e.preventDefault();
+      if (p[1] === 'from') setHourFrom(MON.hourFrom + d); else setHourTo(MON.hourTo + d);
+      renderHourRange(); applyHourRange();
+    });
+  });
+  // 点轨道：把最近的一端移过来（否则轨道几乎只能用来拖）
+  rail.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    var h = hourAt(e.clientX);
+    drag(Math.abs(h - MON.hourFrom) <= Math.abs(h - MON.hourTo) ? 'from' : 'to', e);
+  });
+  if ($('mHourReset')) $('mHourReset').addEventListener('click', function () { resetHourRange(); });
 }
 function bindMonitorFilters() {
   ['mType', 'mFromStation', 'mToStation', 'mSeatFilter'].forEach(function (id) {
@@ -1936,28 +2380,14 @@ function bindMonitorFilters() {
       applyMonitor();
     });
   });
-  var hourBox = $('mTime');
-  // 注意：不能用「others 非空则取消 isAll」的无目标写法——
-  // 那样点「不限」时因 others 仍被勾选而立即把 isAll 又取消掉，永远切不回去
-  if (hourBox) hourBox.addEventListener('change', function (e) {
-    var t = e.target, isAll = hourBox.querySelector('input[value="all"]');
-    if (t === isAll) {
-      if (t.checked) hourBox.querySelectorAll('input:not([value="all"])').forEach(function (i) { i.checked = false; });
-    } else if (t.checked && isAll) {
-      isAll.checked = false;
-    }
-    if (isAll && !nonAllChecked(hourBox).length) isAll.checked = true;
-    syncMonitorFilters();
-    applyMonitor();
-  });
+  bindHourRange();
   if ($('mAvailable')) $('mAvailable').addEventListener('change', function () { syncMonitorFilters(); applyMonitor(); });
   if ($('mFilterClear')) $('mFilterClear').addEventListener('click', function () {
     ['mType', 'mFromStation', 'mToStation', 'mSeatFilter'].forEach(function (id) {
       var box = $(id); if (!box) return;
       box.querySelectorAll('input').forEach(function (i) { i.checked = (i.value === 'all'); });
     });
-    var hourBox = $('mTime');
-    if (hourBox) hourBox.querySelectorAll('input').forEach(function (i) { i.checked = (i.value === 'all'); });
+    resetHourRange({ apply: false });
     if ($('mAvailable')) $('mAvailable').checked = false;
     var seg = $('mMode');
     if (seg) seg.querySelectorAll('.seg-btn').forEach(function (b) { b.classList.toggle('on', b.dataset.mode === 'all'); });
@@ -1970,7 +2400,9 @@ function bindMonitorFilters() {
     var n = applyMonitor();
     toast('筛选完成 · ' + n + ' 个车次', 'ok');
   });
-  if ($('mClearSort')) $('mClearSort').addEventListener('click', function () { setMonSort(null); });
+  if ($('mSortAction')) $('mSortAction').addEventListener('click', function () {
+    if (MON.sort) setMonSort(null);
+  });
   var seg = $('mMode');
   if (seg) seg.querySelectorAll('.seg-btn').forEach(function (b) {
     b.addEventListener('click', function () {
@@ -2016,7 +2448,7 @@ function doMonitorSearch() {
     .then(function (d) {
       MON.rows = d.rows || [];
       MON.searched = true;
-      MON.sel = {}; MON.selSeats = {}; MON.selBy = {};
+      MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
       MON.sort = null;
       $('mRoute').textContent = left + ' → ' + arrive + ' · ' + date;
       // 收集出发/到达车站选项
@@ -2060,7 +2492,17 @@ function markSortHeads() {
     if (MON.sort && b.dataset.sort === MON.sort.k) b.classList.add('active', MON.sort.dir === 'asc' ? 'sort-up' : 'sort-down');
     else b.classList.remove('active');
   });
-  if ($('mClearSort')) $('mClearSort').style.display = MON.sort ? '' : 'none';
+  var sortStatus = $('mSortStatus');
+  var sortAction = $('mSortAction');
+  var sorted = !!MON.sort;
+  if (sortStatus) sortStatus.setAttribute('aria-label', sorted ? '即时结果，点击清除排序' : '即时结果，点击表头排序');
+  if (sortAction) {
+    sortAction.classList.toggle('is-sorted', sorted);
+    sortAction.disabled = !sorted;
+    sortAction.title = sorted ? '清除当前排序' : '请点击表头排序';
+    sortAction.setAttribute('aria-label', sorted ? '清除排序' : '表头排序提示');
+    sortAction.textContent = sorted ? '清除排序' : '表头排序';
+  }
 }
 function applyMonitor() {
   var F = MON.filters;
@@ -2091,6 +2533,8 @@ function applyMonitor() {
   $('mEmpty').classList.toggle('hidden', n > 0);
   $('mResults').innerHTML = rows.map(rowHtml).join('');
   markSortHeads();
+  // 真实票价是异步拉的：先出列表，拿到价格再就地回填（有 6h 缓存，重复搜索几乎瞬时）
+  loadPrices();
   // 事件
   $('mResults').querySelectorAll('input.row-check').forEach(function (cb) {
     cb.addEventListener('change', function () {
@@ -2102,19 +2546,12 @@ function applyMonitor() {
   $('mResults').querySelectorAll('button[data-act]').forEach(function (b) {
     b.addEventListener('click', function () {
       var i = +b.parentElement.parentElement.dataset.i;
-      if (b.dataset.act === 'book') {
-        if (Object.keys(MON.selSeats[i] || {}).length === 0) { toast('先点击该车的席别单元格选择席别（如「二等座」）', 'err'); return; }
+      if (b.dataset.act === 'stops') {
+        openStops(i);
+      } else if (b.dataset.act === 'book') {
+        // 席别可以在下单页面里选（renderOrderView 的席别 chip 可点）→ 这里不再强制
         orderPush(MON.rows[i]);
         go('order');
-      } else {
-        // 行内「新建任务」：同样进入车次模式，带入该车次与已选（未选则默认）席别
-        var legR = MON.rows[i];
-        var seatsR = Object.keys(MON.selSeats[i] || {}).map(function (k) { return SEAT_NAME[k]; }).filter(Boolean);
-        addLegToTask(legR, seatsR.length ? seatsR : defaultSeatsFor(legR));
-        var dR = $('mDate').value;
-        if (dR && APP.selDates.indexOf(dR) < 0) APP.selDates.push(dR);
-        renderNtDates();
-        go('new');
       }
     });
   });
@@ -2125,6 +2562,7 @@ function applyMonitor() {
     td.classList.add('seat-selectable');
     if ((MON.selSeats[i] || {})[k]) td.classList.add('seat-selected');
     td.addEventListener('click', function () {
+      if (!inBatchUI()) clearOtherSeatSelections(i);
       MON.selSeats[i] = MON.selSeats[i] || {};
       if (MON.selSeats[i][k]) delete MON.selSeats[i][k]; else MON.selSeats[i][k] = true;
       td.classList.toggle('seat-selected', !!MON.selSeats[i][k]);
@@ -2132,19 +2570,7 @@ function applyMonitor() {
       // 批量界面下：点席别即自动勾选该行；取消全部席别后自动取消勾选
       if (inBatchUI()) {
         syncRowCheckFromSeats(i, tr);
-        // 同车次号的其它行跟随复选框与选中态（它们不参与本次席别编辑，
-        // 但 MON.sel 必须同步，否则草稿会因首行的 sel 为空而被误删）
-        var on = !!MON.sel[i];
-        sameTrainIndexes(i).forEach(function (k) {
-          if (k === i) return;
-          MON.sel[k] = on;
-          if (on) MON.selSeats[k] = MON.selSeats[k] || {};
-          var t = document.querySelector('#mResults tr[data-i="' + k + '"]');
-          var c = t && t.querySelector('input.row-check');
-          if (c) c.checked = on;
-        });
         // 逐个点席别 = 「已明确指定」语义：提交时不做默认补全
-        sameTrainIndexes(i).forEach(function (k) { MON.selBy[k] = 'seat'; });
       }
       syncSelCount();
       // 不实时写草稿：由底部「添加到任务」显式提交
@@ -2152,6 +2578,178 @@ function applyMonitor() {
   });
   syncSelCount();
 }
+
+/* ---------- 经停站（点击车次号打开） ----------
+   数据源：GET /api/tickets/stops?train_no=<12306 内部车次号>&date=
+   只展示 12306 真实返回的字段（到站/出发/停留/累计历时）。
+   **不展示票价**：分站票价接口已不可用，估算值对用户弊大于利（会误以为可据此决策）。
+
+   编辑能力：可以在列表里把「上车站 / 下车站」改成任一中间站。
+   典型场景 —— 全程区间没票，但中间某段有票（例如 深圳东→三亚 无票，
+   但 东莞→海口 有票）。改完点「应用」把区间写回该车次：
+   站名、到发时刻、历时都按新上下车点重算，票价估算与推导区间随之更新。
+
+   `leg` 对象是 `MON.rows` / `APP.taskPicked` 共享的引用，所以改一处两边都变。 */
+var STOPS = { leg: null, data: null, from: -1, to: -1, onApply: null };
+
+function openStops(i) { openStopsForLeg(MON.rows[i], null); }
+
+function openStopsForLeg(leg, onApply, dateOverride) {
+  if (!leg) return;
+  if (!leg.no) { toast('该车次缺少 12306 内部编号，无法查询经停站', 'err'); return; }
+  STOPS.leg = leg;
+  STOPS.data = null;
+  STOPS.from = -1;
+  STOPS.to = -1;
+  STOPS.onApply = onApply || null;
+  $('stopsTitle').textContent = (leg.n || '') + ' 经停站';
+  $('stopsSum').innerHTML =
+    '<span class="tag info">' + esc(leg.f) + ' → ' + esc(leg.to) + '</span>' +
+    '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>';
+  $('stopsBody').innerHTML = '<tr><td colspan="7" class="stops-msg">正在获取经停站…</td></tr>';
+  $('stopsNote').innerHTML = '';
+  $('stopsPick').innerHTML = '';
+  $('stopsModal').classList.add('open');
+  var date = dateOverride || (($('mDate') || {}).value || '');
+  api('/api/tickets/stops?train_no=' + encodeURIComponent(leg.no) +
+      '&date=' + encodeURIComponent(date))
+    .then(function (d) {
+      STOPS.data = d;
+      syncStopsSelection();
+      renderStops();
+    })
+    .catch(function (e) {
+      $('stopsBody').innerHTML = '';
+      $('stopsNote').innerHTML = '<b>获取失败：</b>' + esc(e.message);
+    });
+}
+
+function closeStops() { $('stopsModal').classList.remove('open'); }
+
+/**
+ * 把上/下车选中态同步到 `STOPS.leg` 当前的区间。
+ * 两处用它：① 弹窗刚打开（高亮车次现有区间）；② 点「恢复原区间」。
+ * ⚠️ 「恢复原区间」指的是**恢复成该车次当前的上/下车站**，不是重置成 12306 的
+ * 始发→终点 —— 用户改了区间后想反悔，期望回到改之前的样子，而不是被丢到全程。
+ */
+function syncStopsSelection() {
+  var d = STOPS.data, leg = STOPS.leg;
+  var stops = (d && d.stops) || [];
+  if (!stops.length || !leg) return;
+  STOPS.from = -1;
+  STOPS.to = -1;
+  for (var k = 0; k < stops.length; k++) {
+    if (STOPS.from < 0 && stops[k].name === leg.f) STOPS.from = k;
+    if (stops[k].name === leg.to) STOPS.to = k;
+  }
+  // 匹配不上（站名不一致）时退回「第 2 站 → 最后 1 站」这种可见的范围，
+  // 而不是全程：全程区间通常是用户想避开的那一段
+  if (STOPS.to < 0) STOPS.to = STOPS.from >= 0 ? stops.length - 1 : stops.length - 1;
+  if (STOPS.from < 0) STOPS.from = 0;
+  // 上车站必须在下车站之前
+  if (STOPS.from >= STOPS.to) {
+    STOPS.to = Math.min(stops.length - 1, STOPS.from + 1);
+    if (STOPS.from >= STOPS.to) STOPS.from = Math.max(0, STOPS.to - 1);
+  }
+}
+
+function renderStops() {
+  var d = STOPS.data;
+  if (!d) return;
+  var stops = d.stops || [];
+  // 表格窄，时长去空格更紧凑（`5小时56分`），否则「累计」列会溢出版面
+  var compact = function (min) {
+    if (min == null) return '—';
+    return fmtDur(min).replace(/\s+/g, '');
+  };
+  $('stopsBody').innerHTML = stops.map(function (s, i) {
+    var isFrom = i === STOPS.from, isTo = i === STOPS.to;
+    var offL = i >= STOPS.to, offR = i <= STOPS.from;   // 不允许越界：上车必须早于下车
+    return '<tr class="' + (isFrom || isTo ? 'stop-sel' : '') + '">' +
+      '<td class="sn">' + esc(s.no || '') + '</td>' +
+      '<td class="sname">' + esc(s.name || '') + '</td>' +
+      '<td>' + esc(s.arrive || '—') + (s.day_diff ? '<i class="day-diff">+' + s.day_diff + '</i>' : '') + '</td>' +
+      '<td>' + esc(s.start || '—') + '</td>' +
+      '<td>' + (s.stay == null ? '—' : s.stay + '分') + '</td>' +
+      '<td>' + compact(s.elapsed) + '</td>' +
+      '<td class="spick">' +
+        '<button type="button" class="pick-btn' + (isFrom ? ' on' : '') + '"' +
+          (offL ? ' disabled' : '') + ' data-pick="from" data-i="' + i + '"' +
+          ' title="' + (offL ? '上车站必须早于下车站' : '设为上车站') + '">上</button>' +
+        '<button type="button" class="pick-btn' + (isTo ? ' on to' : '') + '"' +
+          (offR ? ' disabled' : '') + ' data-pick="to" data-i="' + i + '"' +
+          ' title="' + (offR ? '下车站必须晚于上车站' : '设为下车站') + '">下</button>' +
+      '</td>' +
+      '</tr>';
+  }).join('');
+  $('stopsBody').querySelectorAll('.pick-btn').forEach(function (b) {
+    if (b.disabled) return;
+    b.addEventListener('click', function () {
+      var i = +b.dataset.i;
+      if (b.dataset.pick === 'from') { STOPS.from = i; if (STOPS.to <= i) STOPS.to = i + 1; }
+      else { STOPS.to = i; if (STOPS.from >= i) STOPS.from = i - 1; }
+      renderStops();
+    });
+  });
+  var picked = stopsPickSummary();
+  $('stopsPick').innerHTML = picked
+    ? '已选区间：<b>' + esc(picked.f) + ' → ' + esc(picked.to) + '</b>' +
+      '<small>' + picked.d + ' 开 · 历时 ' + fmtDur(picked.m) + '</small>'
+    : '';
+  $('stopsNote').innerHTML = '共 <b>' + stops.length + '</b> 站 · 全程 <b>' +
+    (d.total_minutes == null ? '—' : fmtDur(d.total_minutes)) + '</b>（12306 经停站数据）' +
+    '<br>席别余票是<b>原查询区间</b>的数据；改成中间站区间后，实际余票请以 12306 为准。';
+}
+
+/** 由当前上/下车选择推导出区间（站名 + 到发时刻 + 历时）。分钟数都是相对始发站。 */
+function stopsPickSummary() {
+  var d = STOPS.data;
+  if (!d) return null;
+  var stops = d.stops || [];
+  var a = stops[STOPS.from], b = stops[STOPS.to];
+  if (!a || !b || STOPS.from >= STOPS.to) return null;
+  // 上车站用「出发」时刻，下车站用「到达」时刻（与 12306 列表口径一致）
+  var dep = a.start || a.arrive || '';
+  var arr = b.arrive || b.start || '';
+  var m = (b.elapsed != null && a.elapsed != null) ? (b.elapsed - a.elapsed) : null;
+  return { f: a.name, to: b.name, d: dep, a: arr, m: m };
+}
+
+/** 把弹窗里选的区间写回 leg（站名 / 时刻 / 历时），并刷新所有依赖它的界面 */
+function applyStopsPick() {
+  var leg = STOPS.leg, p = stopsPickSummary();
+  if (!leg || !p) { toast('请先选择上车站与下车站', 'err'); return; }
+  if (p.f === leg.f && p.to === leg.to) { closeStops(); return; }
+  leg.f = p.f;
+  leg.to = p.to;
+  if (p.d) leg.d = p.d;
+  if (p.a) leg.a = p.a;
+  if (p.m != null) leg.m = p.m;
+  // 上/下站变了 → 原电报码已不再描述这对站，清掉；
+  // priceKey() 会退化成用站名，后端解析后重新查真实票价。
+  leg.f_code = '';
+  leg.to_code = '';
+  $('stopsSum').innerHTML =
+    '<span class="tag info">' + esc(leg.f) + ' → ' + esc(leg.to) + '</span>' +
+    '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>';
+  // 席别余票属于原区间，改区间后清掉「可订」标记，避免继续显示成可订
+  leg.bookable = false;
+  refreshAfterLegChange(STOPS.onApply);
+  toast(leg.n + ' 区间已改为 ' + leg.f + ' → ' + leg.to, 'ok');
+  closeStops();
+}
+
+/** leg 变更后统一刷新：车票列表、任务卡片、推导区间、摘要 */
+function refreshAfterLegChange(extra) {
+  try {
+    if ((MON.rows || []).length) applyMonitor();   // 内部会调 loadPrices() 重拉新区间票价
+    if (typeof renderTaskPicked === 'function') renderTaskPicked();
+    if (typeof renderNtDerived === 'function') renderNtDerived();
+    if (typeof updateNtSummary === 'function') updateNtSummary();
+  } catch (e) { /* 刷新失败不影响数据正确性 */ }
+  if (typeof extra === 'function') { try { extra(); } catch (e) { } }
+}
+
 function syncSelCount() {
   var c = Object.keys(MON.sel).length;
   $('mSelCount').textContent = '已选 ' + c + ' 条';
@@ -2171,14 +2769,14 @@ function syncSelCount() {
   var selBar = $('mSelBar');
   if (scrollBox && selBar) {
     var barVisible = getComputedStyle(selBar).display !== 'none';
-    var bh = barVisible ? selBar.offsetHeight : 0;
+    var hasRows = !!document.querySelector('#mResults tr[data-i]');
+    var bh = barVisible && hasRows ? selBar.offsetHeight : 0;
     // bh 为 0 说明面板当前不可见（如还在别的视图），交给 CSS 兜底值
-    scrollBox.style.paddingBottom = bh ? (bh + 32) + 'px' : '';
+    scrollBox.style.paddingBottom = barVisible ? (bh ? (bh + 32) + 'px' : '0px') : '';
   }
-  // 「重置选择」紧贴「批量」左侧：只要处于批量界面就显示（哪怕一个都没勾选）。
-  // 之前用「有选中内容」作为条件，点批量时会看不到按钮，容易让人以为没有这个功能。
-  var slot = document.querySelector('#mPanel .batch-actions .reset-slot');
-  if (slot) slot.classList.toggle('on', inBatchUI());
+  // 「重置选择」贴在「已选 N 条」计数旁（2026-09 重设计）：只有在真有可清的勾选时出现，
+  // 平时不占位；非批量模式下悬浮栏本身只在勾选后才显示，批量模式下栏常驻但计数为 0 时隐藏按钮。
+  $('mSelReset').style.display = c > 0 ? '' : 'none';
 }
 function orderPush(leg) {
   APP.orderSel = APP.orderSel || [];
@@ -2191,22 +2789,35 @@ function renderOrderView() {
   $('oSelEmpty').style.display = sels.length ? 'none' : 'block';
   $('oSelections').innerHTML = sels.map(function (s, idx) {
     var leg = s.leg;
-    var seats = ['business', 'first', 'second', 'hardSleeper', 'hardSeat', 'softSleeper', 'special'];
-    var names = { business: '商务座', first: '一等座', second: '二等座', hardSleeper: '硬卧', hardSeat: '硬座', softSleeper: '软卧', special: '特等座' };
-    return '<div class="task-selection-item">' +
+    // 含 无座（表格 6 列之外的席别也可能买，统一从 12306 全席别里给）
+    var seats = ['business', 'first', 'second', 'hardSleeper', 'hardSeat', 'softSleeper', 'special', 'noSeat'];
+    var names = { business: '商务座', first: '一等座', second: '二等座', hardSleeper: '硬卧', hardSeat: '硬座', softSleeper: '软卧', special: '特等座', noSeat: '无座' };
+    return '<div class="task-selection-item" data-idx="' + idx + '">' +
       '<div class="train"><b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></div>' +
       '<div class="station"><b>' + esc(leg.f) + '  ' + esc(leg.d) + '</b><small>→ ' + esc(leg.to) + '  ' + esc(leg.a) + '</small></div>' +
       '<div class="task-seat-options">' + seats.map(function (k) {
         var v = leg.s ? leg.s[k] : '';
         var on = s.seats[k];
         var offered = seatOffered(leg, k);
-        var tip = v === '无' ? '当前无票，任务会等待放票' : (offered ? '' : '该车次不设此席别');
-        return '<label class="task-seat-option chip ' + (on ? 'on' : '') + '" title="' + esc(tip) + '" style="margin:0;background:' + (on ? 'var(--red-bg)' : 'var(--line-soft)') + ';border-radius:6px;font-size:11.5px;cursor:' + (offered ? 'pointer' : 'not-allowed') + ';color:' + (offered ? 'var(--text)' : 'var(--faint)') + ';display:flex;align-items:center;justify-content:center;height:30px"><span>' + names[k] + (offered ? '<small style="opacity:.7"> ' + esc(v === '有' ? '有' : v) + '</small>' : '') + '</span></label>';
+        var tip = '点选/取消该席别；' + (v === '无' ? '当前无票，任务会等待放票' : (offered ? '' : '该车次不设此席别'));
+        return '<span class="task-seat-option chip ' + (on ? 'on' : '') + '" data-k="' + k + '" title="' + esc(tip) + '" style="margin:0;background:' + (on ? 'var(--red-bg)' : 'var(--line-soft)') + ';border-radius:6px;font-size:11.5px;cursor:' + (offered ? 'pointer' : 'not-allowed') + ';color:' + (offered ? 'var(--text)' : 'var(--faint)') + ';display:flex;align-items:center;justify-content:center;height:30px"><span>' + names[k] + (offered ? '<small style="opacity:.7"> ' + esc(v === '有' ? '有' : v) + '</small>' : '') + '</span></span>';
       }).join('') + '</div>' +
       '<div style="display:flex;align-self:center"><button class="btn btn-ghost btn-sm" data-rm="' + idx + '">移除</button></div></div>';
   }).join('');
   $('oSelections').querySelectorAll('[data-rm]').forEach(function (b) {
     b.addEventListener('click', function () { APP.orderSel.splice(+b.dataset.rm, 1); renderOrderView(); });
+  });
+  // 席别 chip 可点选（「预定」入口不再强制先在表格里选席别）
+  $('oSelections').querySelectorAll('.task-seat-option[data-k]').forEach(function (chip) {
+    chip.addEventListener('click', function () {
+      var item = chip.closest('.task-selection-item');
+      var s = item && (APP.orderSel || [])[+item.dataset.idx];
+      if (!s) return;
+      var k = chip.dataset.k;
+      if (!seatOffered(s.leg, k)) { toast('该车次不设此席别', 'err'); return; }
+      if (s.seats[k]) delete s.seats[k]; else s.seats[k] = true;
+      renderOrderView();
+    });
   });
   updateOrderSummary();
 }
@@ -2227,7 +2838,7 @@ function orderSeatTotal() {
   var total = 0, cnt = 0;
   (APP.orderSel || []).forEach(function (s) {
     Object.keys(s.seats).forEach(function (k) {
-      if (s.seats[k]) { var p = seatPrice(s.leg, k); if (p) total += p; cnt++; }
+      if (s.seats[k]) { var p = priceOf(s.leg, k); if (p != null) { total += p; cnt++; } }
     });
   });
   return { total: total, cnt: cnt };
@@ -2240,7 +2851,8 @@ function updateOrderSummary() {
     row('席别数量', t.cnt + ' 个') +
     row('账号', esc(acc || '未选')) +
     row('乘客', ps.length ? esc(ps.join('、')) : '未选') +
-    row('预计金额', '约 ¥' + (t.total * (ps.length || 1)), '') ;
+    row('预计金额', t.cnt ? '¥' + fmtNum(Math.round(t.total * (ps.length || 1) * 10) / 10)
+                      : '<span style="color:var(--faint)">票价加载中</span>');
 }
 
 /* ---------- 6.1 下单（P3） ---------- */
@@ -2282,7 +2894,7 @@ function submitOrder(btn) {
   var f = orderPayload();
   if (!f.account_key) { toast('请选择使用账号（先到「账号管理」登录）', 'err'); return; }
   if (!f.train_numbers.length) { toast('请先返回车票查询勾选车次', 'err'); return; }
-  if (!f.seats.length) { toast('请点击该车次的席别单元格选择席别（如「二等座」）', 'err'); return; }
+  if (!f.seats.length) { toast('请点选上面车次卡片里的席别（如「二等座」）', 'err'); return; }
   if (!f.members.length) { toast('请至少选择一位乘车人', 'err'); return; }
   if (!f.train_date) { toast('缺少出发日期，请回车票查询选择日期后重新预定', 'err'); return; }
   var d = new Date(f.train_date + 'T00:00:00'), today = new Date();
@@ -2364,9 +2976,7 @@ function jobDelete(id) {
 }
 
 /* 编辑：把任务回填到「新建任务」页后保存（PATCH），不改变原任务当前的启用状态。
-   统一落到**区间查询**模式 —— 只有该模式有可编辑的区间/日期/时段/座次/车次筛选控件；
-   车次查询的白名单在引擎侧同样表现为 stations × left_dates + train_numbers，
-   所以用「只抢指定车次」表达是等价的，抢票行为不变。 */
+  query_mode 已保存的任务恢复原查询方式；旧任务按是否存在车次白名单兼容推断。 */
 function jobEdit(id) {
   api('/api/jobs/' + encodeURIComponent(id)).then(function (j) {
     APP.editJobId = id;
@@ -2375,13 +2985,22 @@ function jobEdit(id) {
 }
 
 function applyJobToForm(j) {
-  APP.taskPicked = []; APP.pickOrder = [];
-  setNtMode('range');
+  // 新任务保存了明确查询模式；旧任务没有该字段时，用车次白名单兼容推断。
+  var savedMode = j.query_mode === 'train' || j.query_mode === 'range'
+    ? j.query_mode
+    : ((j.train_numbers || []).length ? 'train' : 'range');
+  // 数据库只保存车次号、区间、日期和席别，不保存查票响应里的完整 leg。
+  // 编辑旧任务时用这些持久字段重建最小卡片，避免车次列表为空；余票未知时显示“—”。
+  APP.taskPicked = savedMode === 'train' ? restoreTaskTrains(j) : [];
+  APP.pickOrder = APP.taskPicked.map(function (s) { return s.leg.n; });
+  setNtMode(savedMode);
   if ($('ntName')) $('ntName').value = j.job_name || '';
   // 区间地点
   $('ntPairs').innerHTML = '';
   var st = (j.stations && j.stations.length) ? j.stations : [{ left: '', arrive: '' }];
   st.forEach(function (p) { addNtPair(p.left || '', p.arrive || ''); });
+  // 站点匹配方式（exact / expand）—— 必须回填，否则编辑既有任务会被静默改回默认值
+  setNtStnMode(j.station_mode || 'exact');
   // 乘车日期
   APP.selDates = (j.left_dates || []).slice();
   // 出发时段（<input type=time> 不接受 24:00，界面用 23:59 表示当天结束）
@@ -2415,9 +3034,70 @@ function applyJobToForm(j) {
   if ($('ntIntMin')) $('ntIntMin').value = iv.min || APP.queryInterval || 1;
   if ($('ntIntMax')) $('ntIntMax').value = iv.max || iv.min || APP.queryInterval || 1;
   setNtStartAt(j.start_at || '');
+  if (savedMode === 'train') {
+    syncSeatsFromPicked();
+    renderTaskPicked();
+    refreshTaskTrainData(j);
+  }
   renderNtDates();
   renderNtSeats();
   updateNtSummary();
+}
+
+function restoreTaskTrains(j) {
+  var pair = (j.stations && j.stations[0]) || {};
+  var seats = (j.seats || []).slice();
+  var seatMap = {};
+  seats.forEach(function (name) {
+    var key = SEAT_KEY[name];
+    if (key) seatMap[key] = '—';
+  });
+  return (j.train_numbers || []).map(function (number) {
+    return {
+      leg: {
+        n: String(number), tn: '', f: pair.left || '', d: '',
+        to: pair.arrive || '', a: '', m: null, s: seatMap
+      },
+      seats: seats.slice()
+    };
+  });
+}
+
+function refreshTaskTrainData(j) {
+  var numbers = (j.train_numbers || []).map(function (n) { return String(n); });
+  var pairs = j.stations || [], dates = j.left_dates || [], requests = [];
+  pairs.forEach(function (pair) {
+    dates.forEach(function (date) {
+      if (pair.left && pair.arrive && date) requests.push({ left: pair.left, arrive: pair.arrive, date: date });
+    });
+  });
+  if (!numbers.length || !requests.length) return;
+  var querySeq = (APP.taskTrainQuerySeq || 0) + 1;
+  APP.taskTrainQuerySeq = querySeq;
+  Promise.all(requests.map(function (q) {
+    return api('/api/tickets?' + new URLSearchParams(q).toString())
+      .then(function (d) { return d.rows || []; })
+      .catch(function () { return []; });
+  })).then(function (groups) {
+    if (APP.taskTrainQuerySeq !== querySeq || !APP.editJobId) return;
+    var latest = {};
+    groups.forEach(function (rows) {
+      rows.forEach(function (leg) {
+        var number = String(leg.n || '');
+        if (number && numbers.indexOf(number) >= 0 && !latest[number]) latest[number] = leg;
+      });
+    });
+    APP.taskPicked = numbers.map(function (number) {
+      var leg = latest[number];
+      if (leg) return { leg: leg, seats: (j.seats || []).slice() };
+      // 接口暂时没有返回该车次时仍保留任务白名单，避免编辑后误删车次。
+      return restoreTaskTrains({ stations: pairs, train_numbers: [number], seats: j.seats || [] })[0];
+    });
+    APP.pickOrder = numbers.slice();
+    syncSeatsFromPicked();
+    renderTaskPicked();
+    loadPrices(APP.taskPicked.map(function (s) { return s.leg; }), dates[0]);
+  });
 }
 
 // 账号下拉：能选就直接选上；列表还没加载完就记到 pendingAccount 由 loadAccountsForNew 补
@@ -2495,10 +3175,13 @@ function collectNtForm() {
   var mode = train ? 'all' : ntTrainMode();
   var f = {
     name: $('ntName').value.trim(),
+    query_mode: train ? 'train' : 'range',
     account_key: $('ntAccount').value || '',
     left_dates: (APP.selDates || []).slice(),
     // 顺序即优先级（引擎 handle_seats 按序尝试）
     stations: ntPairs(),          // 车次查询模式下由车次推导（见 pickedPairs）
+    // 站点匹配方式：引擎按它过滤行的实际到发站（见 AGENTS.md §5.25）
+    station_mode: ntStnMode(),
     members: (APP.paxSel || []).slice(),
     allow_less_member: !!$('ntLessMember').checked,
     seats: (APP.selSeats || []).slice(),
@@ -2750,83 +3433,130 @@ function logTermColor(l) {
 function loadSettings() {
   api('/api/settings').then(function (d) {
     var c = d.config, st = d.state || {};
-    var cards = [];
+    var sections = [];
     function fldLabel(label, path, extra) {
+      extra = extra || {};
       var v = deepGet(c, path);
       var isSecret = !!deepGet(st, path);
       var stv = deepGet(st, path) || {};
-      var maxW = 'max-width:340px';
       var field;
-      var numPaths = ['query.interval', 'user.heartbeat_interval', 'query.request_max_retry', 'query.job_timeout', 'cdn.check_time_out', 'server.port', 'cluster.redis_port'];
-      var isBool = typeof v === 'boolean' || /enabled|allow/.test(path) || (typeof v === 'number' && numPaths.indexOf(path) < 0);
+      var numPaths = ['query.interval', 'user.heartbeat_interval', 'query.request_max_retry', 'query.job_timeout', 'query.presale_days', 'cdn.check_time_out', 'server.port', 'cluster.redis_port'];
+      var isBool = extra.type === 'bool' || typeof v === 'boolean' || /enabled|allow/.test(path) || (typeof v === 'number' && numPaths.indexOf(path) < 0);
       if (isBool) {
-        var on = v === 1 || v === true;
-        field = '<label class="switch-row"><span style="font-size:13px">' + label + '</span><label class="tgl"><input type="checkbox" data-path="' + path + '"' + (on ? ' checked' : '') + '><i></i></label></label>';
+        var on = v === 1 || v === true || v === '1';
+        return '<div class="setting-toggle"><div><b>' + esc(label) + '</b>' + (extra.hint ? '<small>' + esc(extra.hint) + '</small>' : '') + '</div><label class="tgl"><input type="checkbox" aria-label="' + esc(label) + '" data-path="' + path + '"' + (extra.inputAttrs ? ' ' + extra.inputAttrs : '') + (on ? ' checked' : '') + '><i></i></label></div>';
+      } else if (extra.options) {
+        field = '<select class="ctl" data-path="' + path + '">' + extra.options.map(function (o) { return '<option value="' + esc(o[0]) + '"' + (String(v == null ? '' : v) === String(o[0]) ? ' selected' : '') + '>' + esc(o[1]) + '</option>'; }).join('') + '</select>';
       } else if (typeof v === 'number') {
-        field = '<div class="f-col" style="max-width:220px"><div class="f-lab">' + label + '</div><input class="ctl" type="number" step="any" data-path="' + path + '" value="' + v + '"></div>';
+        field = '<input class="ctl" type="number" step="any" data-path="' + path + '" value="' + esc(v) + '">';
       } else {
         var input = isSecret
-          ? '<input class="ctl" type="password" data-path="' + path + '" placeholder="' + (stv.configured ? '已配置 ' + esc(stv.tail || '') + '（留空不改）' : '未配置') + '">'
+          ? '<input class="ctl" type="password" data-path="' + path + '" data-configured="' +
+            (stv.configured ? '1' : '0') + '" placeholder="' +
+            (stv.configured ? '已配置 ' + esc(stv.tail || '') + '（留空不改）' : '未配置') + '">'
           : '<input class="ctl" type="text" data-path="' + path + '" value="' + esc(v || '') + '">';
-        field = '<div class="f-col" style="' + maxW + '"><div class="f-lab">' + label + '</div>' + input + '</div>';
+        field = input;
       }
-      return field;
+      return '<label class="setting-field"' + (extra.relatedTo ? ' data-related-to="' + extra.relatedTo + '"' : '') + '><span>' + esc(label) + (extra.hint ? '<small>' + esc(extra.hint) + '</small>' : '') + '</span>' + field + '</label>';
     }
-    cards.push(setCard('查询与网络', [
-      fldLabel('查询间隔(秒)', 'query.interval'),
-      fldLabel('请求重试次数', 'query.request_max_retry'),
-      fldLabel('账号心跳间隔(秒)', 'user.heartbeat_interval'),
-      fldLabel('多线程查询', 'query.thread_enabled'),
-      fldLabel('启用 CDN', 'cdn.enabled'),
-      fldLabel('日志写入文件', 'log.to_file')
-    ]));
-    cards.push(setCard('通知渠道（命中/下单提醒）', [
-      fldLabel('短信语音（钉钉信控）', 'notification.voice_code.enabled'),
-      fldLabel('渠道', 'notification.voice_code.type'),
-      fldLabel('AppCode', 'notification.voice_code.app_code'),
-      fldLabel('钉钉', 'notification.dingtalk.enabled'),
-      fldLabel('Webhook', 'notification.dingtalk.webhook'),
-      fldLabel('Telegram', 'notification.telegram.enabled'),
-      fldLabel('接入地址', 'notification.telegram.bot_api_url'),
-      fldLabel('Server酱', 'notification.serverchan.enabled'),
-      fldLabel('SendKey', 'notification.serverchan.key'),
-      fldLabel('PushBear', 'notification.pushbear.enabled'),
-      fldLabel('Key', 'notification.pushbear.key'),
-      fldLabel('Bark', 'notification.bark.enabled'),
-      fldLabel('Push URL', 'notification.bark.push_url'),
-      fldLabel('邮件', 'notification.email.enabled'),
-      fldLabel('发件人', 'notification.email.sender'),
-      fldLabel('收件人', 'notification.email.receiver'),
-      fldLabel('SMTP 主机', 'notification.email.host'),
-      fldLabel('SMTP 账号', 'notification.email.user'),
-      fldLabel('SMTP 密码', 'notification.email.password')
-    ]));
-    cards.push(setCard('集群与节点', [
-      fldLabel('启用集群', 'cluster.enabled'),
-      fldLabel('本节点可当选 Master', 'cluster.node_is_master'),
-      fldLabel('从节点可晋升', 'cluster.node_slave_can_be_master'),
-      fldLabel('节点名', 'cluster.node_name'),
-      fldLabel('Redis 主机', 'cluster.redis_host'),
-      fldLabel('Redis 端口', 'cluster.redis_port'),
-      fldLabel('Redis 密码', 'cluster.redis_password')
-    ]));
-    // 网页与服务
-    cards.push(setCard('网页与服务', [
-      '<div class="f-col" style="max-width:260px"><div class="f-lab">管理台用户名（不可改）</div><input class="ctl" type="text" value="' + esc(c.web.username) + '" disabled></div>',
-      '<div class="f-col" style="max-width:240px"><div class="f-lab">重置管理台密码（留空不改）</div><input class="ctl" type="password" data-path="web.password" placeholder="新密码 ≥6 位"></div>',
-      '<div class="f-col" style="max-width:160px"><div class="f-lab">服务监听地址</div><input class="ctl" type="text" data-path="server.host" value="' + esc(c.server.host) + '"></div>',
-      '<div class="f-col" style="max-width:120px"><div class="f-lab">服务端口</div><input class="ctl" type="number" data-path="server.port" value="' + c.server.port + '"></div>',
-      '<div class="f-col" style="max-width:200px"><div class="f-lab">验证码平台</div><input class="ctl" type="text" data-path="auth_code.platform" value="' + esc(c.auth_code.platform || '') + '"></div>',
-      '<div class="f-col" style="max-width:220px"><div class="f-lab">验证码 API 地址</div><input class="ctl" type="text" data-path="auth_code.api" value="' + esc(c.auth_code.api || '') + '"></div>',
-      '<div class="f-col" style="max-width:180px"><div class="f-lab">验证码账号</div><input class="ctl" type="text" data-path="auth_code.account.user" value="' + esc((c.auth_code.account || {}).user || '') + '"></div>',
-      '<div class="f-col" style="max-width:180px"><div class="f-lab">验证码密码</div><input class="ctl" type="password" data-path="auth_code.account.pwd" placeholder="已配置（留空不改）"></div>'
-    ]));
-    // RAIL 设备缓存
-    cards.push(setCard('RAIL 设备缓存', [
-      '<div class="f-col" style="max-width:220px"><div class="f-lab">设备 ID（留空自动）</div><input class="ctl" type="text" data-path="rail.device_id" value="' + esc(c.rail.device_id || '') + '"></div>',
-      '<div class="f-col" style="max-width:220px"><div class="f-lab">设备过期值</div><input class="ctl" type="text" data-path="rail.expiration" value="' + esc(c.rail.expiration || '') + '"></div>'
-    ]));
-    $('setGrid').innerHTML = cards.join('') + '<div class="set-note">配置持久化于 runtime/webx.json（chmod 600）。保存后立即生效，无需重启；密钥类字段留空表示保持原值。日志文件：' + esc((c.log.path || '') + (c.log.path_exists ? '（存在）' : '（未生成）')) + '</div>';
+    function intervalControl() {
+      var raw = deepGet(c, 'query.interval');
+      var min = raw && typeof raw === 'object' ? Number(raw.min) : Number(raw || 1) / 2;
+      var max = raw && typeof raw === 'object' ? Number(raw.max) : Number(raw || 1);
+      if (!isFinite(min) || !isFinite(max)) { min = 0.5; max = 1; }
+      var preset = Math.abs(min - 0.5) < 0.001 && Math.abs(max - 1) < 0.001 ? 'default' : (Math.abs(min - 1) < 0.001 && Math.abs(max - 1) < 0.001 ? 'fixed' : 'custom');
+      return '<div class="interval-setting"><label class="setting-field"><span>查询间隔<small>每次查询随机落在所选区间内</small></span><select class="ctl" id="settingsIntervalPreset"><option value="default"' + (preset === 'default' ? ' selected' : '') + '>0.5 - 1 秒（默认）</option><option value="fixed"' + (preset === 'fixed' ? ' selected' : '') + '>1 秒</option><option value="custom"' + (preset === 'custom' ? ' selected' : '') + '>自定义</option></select></label><div class="interval-custom"' + (preset === 'custom' ? '' : ' hidden') + '><label class="setting-field"><span>最小值（秒）</span><input class="ctl" type="number" min="0.1" step="0.1" data-path="query.interval.min" value="' + esc(min) + '"></label><label class="setting-field"><span>最大值（秒）</span><input class="ctl" type="number" min="0.1" step="0.1" data-path="query.interval.max" value="' + esc(max) + '"></label></div></div>';
+    }
+    function section(id, title, desc, content) {
+      sections.push('<section class="settings-section" id="' + id + '"><div class="settings-section-head"><h3>' + title + '</h3><p>' + desc + '</p></div>' + content + '</section>');
+    }
+    function channel(title, desc, enabledPath, required, fields) {
+      return '<article class="setting-channel" data-required-paths="' + required.join(',') + '"><div class="channel-head"><div><h4>' + title + '</h4><p>' + desc + '</p></div><div class="channel-actions">' + fldLabel('启用', enabledPath, { type: 'bool', inputAttrs: 'data-channel-enabled' }) + '<button type="button" class="channel-config" data-channel-toggle aria-expanded="false">设置</button></div></div><div class="channel-fields" hidden>' + fields + '</div></article>';
+    }
+    section('set-query', '查询与运行', '影响查询节奏、账号心跳和运行时资源使用。', '<div class="settings-grid">' +
+      intervalControl() +
+      fldLabel('请求重试次数', 'query.request_max_retry') +
+      fldLabel('任务超时（秒）', 'query.job_timeout') +
+      fldLabel('账号心跳间隔（秒）', 'user.heartbeat_interval') +
+      fldLabel('多线程查询', 'query.thread_enabled', { type: 'bool', hint: '每个任务独立线程查询' }) +
+      '<div class="setting-pair setting-cdn-pair">' + fldLabel('启用 CDN', 'cdn.enabled', { type: 'bool' }) + fldLabel('CDN 检测超时（秒）', 'cdn.check_time_out', { relatedTo: 'cdn.enabled' }) + '</div>' +
+      fldLabel('日志写入文件', 'log.to_file', { type: 'bool' }) + '</div>');
+    section('set-notify', '通知渠道', '每个渠道独立配置；开关只控制当前渠道，不会影响其他提醒方式。', '<div class="channel-grid">' +
+      channel('短信语音', '验证码或重要状态的语音提醒', 'notification.voice_code.enabled', ['notification.voice_code.app_code', 'notification.voice_code.phone'], fldLabel('服务商', 'notification.voice_code.type', { options: [['dingxin', '鼎信'], ['yiyuan', '易源']] }) + fldLabel('AppCode', 'notification.voice_code.app_code') + fldLabel('手机号', 'notification.voice_code.phone')) +
+      channel('钉钉机器人', '向钉钉群机器人发送命中与下单提醒', 'notification.dingtalk.enabled', ['notification.dingtalk.webhook'], fldLabel('Webhook 地址', 'notification.dingtalk.webhook')) +
+      channel('Telegram', '通过 Bot API 推送消息', 'notification.telegram.enabled', ['notification.telegram.bot_api_url'], fldLabel('Bot API 地址', 'notification.telegram.bot_api_url')) +
+      channel('Server酱', '通过 SendKey 推送到微信', 'notification.serverchan.enabled', ['notification.serverchan.key'], fldLabel('SendKey', 'notification.serverchan.key')) +
+      channel('PushBear', '通过 Key 推送到微信', 'notification.pushbear.enabled', ['notification.pushbear.key'], fldLabel('PushBear Key', 'notification.pushbear.key')) +
+      channel('Bark', '推送到 iPhone 的 Bark 地址', 'notification.bark.enabled', ['notification.bark.push_url'], fldLabel('Push URL', 'notification.bark.push_url')) +
+      channel('邮件', '使用 SMTP 发送通知邮件', 'notification.email.enabled', ['notification.email.sender', 'notification.email.receiver', 'notification.email.host', 'notification.email.user', 'notification.email.password'], fldLabel('发件人', 'notification.email.sender') + fldLabel('收件人', 'notification.email.receiver') + fldLabel('SMTP 主机', 'notification.email.host') + fldLabel('SMTP 账号', 'notification.email.user') + fldLabel('SMTP 密码', 'notification.email.password')) + '</div>');
+    section('set-service', '服务与登录', '管理台监听、验证码平台与登录凭据。', '<div class="settings-grid">' +
+      '<div class="setting-field"><span>管理台用户名<small>不可修改</small></span><input class="ctl" type="text" value="' + esc(c.web.username) + '" disabled></div>' +
+      fldLabel('重置管理台密码', 'web.password', { hint: '留空表示不修改' }) +
+      '<div class="setting-pair">' + fldLabel('服务监听地址', 'server.host') + fldLabel('服务端口', 'server.port') + '</div>' +
+      '<div class="setting-pair setting-auth-pair">' + fldLabel('验证码平台', 'auth_code.platform') + fldLabel('验证码 API 地址', 'auth_code.api') + '</div>' +
+      '<div class="setting-pair setting-auth-pair">' + fldLabel('验证码账号', 'auth_code.account.user') + fldLabel('验证码密码', 'auth_code.account.pwd') + '</div></div>');
+    section('set-cluster', '集群与设备', '集群节点和 RAIL 设备缓存配置。未启用集群时，节点字段不会参与本地查询。', '<div class="settings-grid">' +
+      fldLabel('启用集群', 'cluster.enabled', { type: 'bool' }) + fldLabel('本节点可当选 Master', 'cluster.node_is_master', { type: 'bool' }) +
+      fldLabel('从节点可晋升', 'cluster.node_slave_can_be_master', { type: 'bool' }) + fldLabel('节点名', 'cluster.node_name') +
+      fldLabel('Redis 主机', 'cluster.redis_host') + fldLabel('Redis 端口', 'cluster.redis_port') + fldLabel('Redis 密码', 'cluster.redis_password') +
+      '<div class="setting-pair setting-rail-pair">' + fldLabel('缓存 RAIL 设备 ID', 'rail.cache_enabled', { type: 'bool', hint: '启用后才使用右侧设备参数' }) +
+      fldLabel('设备 ID', 'rail.device_id', { relatedTo: 'rail.cache_enabled' }) + fldLabel('设备过期值', 'rail.expiration', { relatedTo: 'rail.cache_enabled' }) + '</div></div>');
+    $('setGrid').innerHTML = '<div class="settings-layout"><div class="settings-main">' + sections.join('') + '</div><div class="settings-note">配置持久化于 <b>runtime/webx.json</b>；密钥字段留空表示保持原值。日志：' + esc((c.log.path || '') + (c.log.path_exists ? '（存在）' : '（未生成）')) + '</div></div>';
+    var intervalPreset = $('settingsIntervalPreset');
+    if (intervalPreset) intervalPreset.addEventListener('change', function () {
+      var custom = intervalPreset.value === 'custom';
+      var box = document.querySelector('#view-settings .interval-custom');
+      if (box) box.hidden = !custom;
+      if (!custom) {
+        var minInput = document.querySelector('[data-path="query.interval.min"]');
+        var maxInput = document.querySelector('[data-path="query.interval.max"]');
+        if (minInput) minInput.value = intervalPreset.value === 'fixed' ? '1' : '0.5';
+        if (maxInput) maxInput.value = '1';
+      }
+    });
+    document.querySelectorAll('#view-settings [data-channel-toggle]').forEach(function (button) {
+      button.addEventListener('click', function () {
+        var card = button.closest('.setting-channel');
+        var fields = card && card.querySelector('.channel-fields');
+        if (!fields) return;
+        fields.hidden = !fields.hidden;
+        card.classList.toggle('open', !fields.hidden);
+        button.setAttribute('aria-expanded', String(!fields.hidden));
+        button.textContent = fields.hidden ? '设置' : '收起';
+      });
+    });
+    function channelReady(card) {
+      return (card.dataset.requiredPaths || '').split(',').every(function (path) {
+        var input = card.querySelector('[data-path="' + path + '"]');
+        return input && (String(input.value || '').trim() || input.dataset.configured === '1');
+      });
+    }
+    function syncRelatedFields() {
+      document.querySelectorAll('#view-settings [data-related-to]').forEach(function (field) {
+        var input = field.querySelector('[data-path]');
+        var controller = document.querySelector('#view-settings [data-path="' + field.dataset.relatedTo + '"]');
+        var disabled = controller && !controller.checked;
+        if (input) input.disabled = disabled;
+        field.classList.toggle('is-disabled', disabled);
+      });
+    }
+    document.querySelectorAll('#view-settings [data-channel-enabled]').forEach(function (input) {
+      if (input.checked && !channelReady(input.closest('.setting-channel'))) input.checked = false;
+    });
+    document.querySelectorAll('#view-settings [data-channel-enabled], #view-settings [data-path="cdn.enabled"], #view-settings [data-path="rail.cache_enabled"]').forEach(function (input) {
+      input.addEventListener('change', function () {
+        var card = input.closest('.setting-channel');
+        if (input.hasAttribute('data-channel-enabled') && input.checked && !channelReady(card)) {
+          input.checked = false;
+          toast('请先点击“设置”填写完整的通知配置', 'err');
+          var button = card && card.querySelector('[data-channel-toggle]');
+          if (button && card.querySelector('.channel-fields').hidden) button.click();
+          return;
+        }
+        syncRelatedFields();
+      });
+    });
+    syncRelatedFields();
   }).catch(function (e) { toast(e.message, 'err'); });
 }
 function deepGet(obj, path) {
@@ -2834,10 +3564,6 @@ function deepGet(obj, path) {
   path.split('.').forEach(function (p) { cur = (cur == null || typeof cur !== 'object') ? undefined : cur[p]; });
   return cur;
 }
-function setCard(title, fields) {
-  return '<div class="card"><div class="card-h"><h3>' + title + '</h3></div><div style="padding:14px 18px;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 18px">' + fields.join('') + '</div></div>';
-}
-
 /* ---------- 站点绑定（静态） ---------- */
 function wireStatic() {
   // 导航
@@ -2900,15 +3626,18 @@ function wireStatic() {
   $('mSearch').addEventListener('click', doMonitorSearch);
   $('mFrom').addEventListener('keydown', function (e) { if (e.key === 'Enter') doMonitorSearch(); });
   $('mTo').addEventListener('keydown', function (e) { if (e.key === 'Enter') doMonitorSearch(); });
-  $('mBatchToggle').addEventListener('click', function () {
-    MON.batch = !MON.batch;
+  function setBatchMode(on) {
+    MON.batch = !!on;
+    if (MON.batch) syncBatchChecksFromSeats();
+    if (!MON.batch) keepOnlyOneSelection();
     $('mPanel').classList.toggle('batch-mode', MON.batch);
-    $('mBatchToggle').classList.toggle('is-active', MON.batch);
-    $('mBatchToggle').setAttribute('aria-pressed', MON.batch ? 'true' : 'false');
+    syncModeSeg();
     // 任务添加态本质就是「批量模式」：关掉批量即结束本次添加（复选框与悬浮栏一起消失，保持一致）
     if (!MON.batch && inTaskPick()) exitPickMode();
-    syncSelCount();   // 刷新「重置选择」的显隐/滑出状态
-  });
+    syncSelCount();
+  }
+  // 操作列表头：点击「批量」切换批量选择模式
+  $('mBatchToggle').addEventListener('click', function () { setBatchMode(MON.batch ? false : true); });
   $('mFloatBind').addEventListener('click', openTaskBindModal);
   // 任务上下文（从新建任务页进来）：「添加到任务」= 保存本次修改，然后返回
   $('mFloatAddTask').addEventListener('click', function () {
@@ -2919,7 +3648,7 @@ function wireStatic() {
     commitPick();
     // 勾选已转入任务，查询页的临时勾选清掉：否则会残留「看不见的选中态」，
     // 让「重置选择」按钮一直亮着
-    MON.sel = {}; MON.selSeats = {}; MON.selBy = {};
+    MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
     exitPickMode();
     var n = (APP.taskPicked || []).length;
     go('new');
@@ -2937,13 +3666,27 @@ function wireStatic() {
   // 因此一次勾选跨线路的多个车次时，除首条线路外其余车次永远查不到（且界面上完全看不出来）
   $('mFloatPrefill').addEventListener('click', pickAddToTask);
   $('mSelReset').addEventListener('click', function () {
-    MON.sel = {}; MON.selSeats = {}; MON.selBy = {};
+    MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
     applyMonitor();
   });
   // 批量关联弹窗
   $('closeTaskModal').addEventListener('click', function () { closeTaskBindModal(); });
   $('cancelTaskModal').addEventListener('click', function () { closeTaskBindModal(); });
   $('confirmTaskBind').addEventListener('click', confirmTaskBind);
+  // 经停站弹窗：点遮罩/关闭按钮/按 Esc 退出
+  $('closeStops').addEventListener('click', closeStops);
+  $('stopsModal').addEventListener('click', function (e) {
+    if (e.target === $('stopsModal')) closeStops();
+  });
+  // 「应用区间」把上/下车选择写回车次；「恢复原区间」回到该车次当前区间
+  $('stopsApply').addEventListener('click', applyStopsPick);
+  $('stopsReset').addEventListener('click', function () {
+    syncStopsSelection();
+    renderStops();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && $('stopsModal').classList.contains('open')) closeStops();
+  });
   // 订单
   $('oBack').addEventListener('click', function () { go('monitor'); });
   $('oAccount').addEventListener('change', function () { loadOrderPassengers($('oAccount').value); });
