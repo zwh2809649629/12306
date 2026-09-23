@@ -11,7 +11,7 @@ DELETE /api/jobs/<id>
 import json
 import re
 
-from flask import Blueprint, request
+from flask import Blueprint, current_app, request
 
 from py12306.log.common_log import CommonLog
 from py12306.webx.db import DataStore
@@ -139,6 +139,11 @@ def create_job():
         'is_active': 1,
     })
     ConfigSync.publish_jobs()
+    try:
+        from py12306.webx.task_catalog import enqueue_job_catalog
+        enqueue_job_catalog(current_app._get_current_object(), job_id)
+    except Exception as e:
+        CommonLog.add_quick_log('webx 任务车次详情缓存启动失败: %s' % e).flush()
     CommonLog.add_quick_log('webx 创建任务: %s (%s)' % (name, job_id)).flush()
     # 把「区间 → 实际匹配的车站」回给前端写进日志：同城扩展是引擎侧的过滤规则，
     # 不写出来用户根本不知道「广州」= 6 个站、「广州南」= 只 1 个站。
@@ -219,6 +224,14 @@ def update_job(job_id):
         return {'code': 1, 'msg': '无可更新字段', 'data': None}
     db.job_update(job_id, patch)
     ConfigSync.publish_jobs()
+    catalog_fields = {'left_dates', 'stations', 'train_numbers', 'except_train_numbers',
+                      'period_from', 'period_to', 'station_mode', 'query_mode'}
+    if catalog_fields.intersection(patch):
+        try:
+            from py12306.webx.task_catalog import enqueue_job_catalog
+            enqueue_job_catalog(current_app._get_current_object(), job_id)
+        except Exception as e:
+            CommonLog.add_quick_log('webx 任务车次详情缓存更新失败: %s' % e).flush()
     return {'code': 0, 'msg': '已更新', 'data': {'job': _job_view_by_id(db, job_id)}}
 
 

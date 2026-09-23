@@ -577,7 +577,7 @@ body.hr-dragging{cursor:grabbing; user-select:none}
                     <div id="ntPairs">
                       <div class="pair">
                         <div class="stn-wrap"><input class="stn" type="text" data-role="left" value="北京" placeholder="出发站"><div class="stn-suggest hidden"></div></div>
-                        <span class="arr">→</span>
+                        <button type="button" class="pair-swap" title="交换出发站和到达站" aria-label="交换出发站和到达站"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg></button>
                         <div class="stn-wrap"><input class="stn" type="text" data-role="arrive" value="深圳" placeholder="到达站"><div class="stn-suggest hidden"></div></div>
                         <span class="del">✕</span>
                         <div class="pair-note" data-note="left" hidden></div>
@@ -747,7 +747,7 @@ body.hr-dragging{cursor:grabbing; user-select:none}
               </div>
             </div>
             <div class="filter-row">
-              <span class="filter-label">车次席别</span>
+              <span class="filter-label">有票席别</span>
               <div class="filter-options" id="mSeatFilter" data-filter-group="seats">
                 <label class="filter-option filter-all"><input type="checkbox" value="all" checked><span>全部</span></label>
                 <label class="filter-option"><input type="checkbox" value="business"><span>商务座</span></label>

@@ -24,7 +24,7 @@ py12306 只做「有票直订」（Job.is_has_ticket 要求 order_text == '预�
 import datetime
 import json
 
-from flask import Blueprint, request
+from flask import Blueprint, current_app, request
 
 from py12306.config import Config
 from py12306.log.common_log import CommonLog
@@ -184,6 +184,11 @@ def create_order():
                  train_number=train_numbers[0], passengers=members, seats=seats,
                  status='queued', message='已创建即时下单任务，等待余票')
     ConfigSync.publish_jobs()
+    try:
+        from py12306.webx.task_catalog import enqueue_job_catalog
+        enqueue_job_catalog(current_app._get_current_object(), job_id)
+    except Exception as e:
+        CommonLog.add_quick_log('webx 即时任务车次详情缓存启动失败: %s' % e).flush()
 
     CommonLog.add_quick_log(
         'webx 立即预定: %s %s %s→%s 席别 %s 乘车人 %s'

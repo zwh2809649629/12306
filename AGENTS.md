@@ -90,7 +90,9 @@ py12306/                   原版引擎（不要改）
   └ webx/                  ★ 所有二次开发代码都在这
       ├ config_store.py        webx.json 读写（原子写 + 密钥脱敏）
       ├ db.py                  SQLite 封装（唯一数据源）
-      ├ sync.py                webx(db/json) → 原版 Config 的桥接      ├─ stations.py            ★ 站名解析（本地表 ∪ 12306 官方表；同城站前缀展开）      ├ webx12306.py           独立 12306 登录助手（扫码/密码/乘客）
+      ├ sync.py                webx(db/json) → 原版 Config 的桥接      ├─ stations.py            ★ 站名解析（本地表 ∪ 12306 官方表；同城站前缀展开）
+      ├ task_catalog.py         任务创建/更新时预取车次与经停站，详情页只读缓存
+      ├ webx12306.py           独立 12306 登录助手（扫码/密码/乘客）
       ├ engine_hooks.py        ★ 包装原引擎方法（不改原文件的扩展方式）
       ├ presale.py             预售期唯一事实来源
       ├ server/                Flask 蓝图（REST API）
@@ -213,6 +215,7 @@ def _hook_something():
 | `UserJob.wait_for_ready` | ★ 账号等待限频 + 自愈（§5.27） |
 | `User.get_passenger_for_members` | ★ 跳过僵尸账号对象（§5.27） |
 | `Request/UserJob/Order` 下单状态机 | 诚实阶段日志、initDc 保护、防重和失败落库（§5.18） |
+| `QueryLog.print_job_start` | 查询开始日志使用该 Job 的 `query_count`，不再显示进程全局序号 |
 
 ---
 
@@ -787,10 +790,9 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
      ⚠️ 本地表**缺新站**：实测余票响应里出现过本地表没有的电报码 `PYA`（=番禺），
      此时引擎的 `get_info_of_left_station()` 会直接抛 `AttributeError` ——
      所以过滤**先拿行的原始电报码自己解析**，不要依赖那个方法。
-   - 被拦下的行会限频写一条 `job_event`（kind `skip`，标签「站点过滤」）
-     + 一行日志，形如：
-     `已按站点过滤 1 个非目标车站的车次（最近：C8012 深圳→广州东）`。
-     不写出来用户根本不知道过滤在起作用（也可能误以为「怎么少了这么多车」）。
+   - 首批余票响应处理完成后，如果有车次被拦，会写一条 `job_event`（kind `skip`，标签「站点过滤」）
+     和一条汇总日志：`已按站点过滤 N 条非目标车站的车次`。每个引擎 Job 实例只输出一次，
+     后续轮询继续累计过滤，但不重复刷屏；任务重新创建后重新统计。
 
 2. **界面侧**：区间输入框从「纯文本盲打」升级为
    - 带**车站联想下拉**（与车票查询页起终点输入框同一套：`bindStationSuggest` 已泛化，
@@ -836,7 +838,7 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
 | C8012（深圳→广州东）单独判定 | `True`（会被下单） | `False` |
 
 线上实证：一个运行中的「深圳北→广州南」任务详情里出现了
-`skip | 站点过滤 | 已按站点过滤 1 个非目标车站的车次（最近：C8012 深圳→广州东）`。
+`skip | 站点过滤 | 已按站点过滤 N 条非目标车站的车次`（每个任务实例一次）。
 
 **⚠️ 后续注意**：
 - 前缀规则是**近似**（12306 的同城扩展是按城市码，不是按名字前缀）——
@@ -849,7 +851,7 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
 ### 5.26 ★★ 抢票任务在累计查询，日志里却什么都没有
 
 **症状**：任务卡上「已查询」一直在涨、`runtime/query/status.json` 的 `query_count`
-也在涨，但任务详情/运行日志里看不到 `>> 第 N 次查询 …` / `出发日期 …` / `耗时 …`
+也在涨，但任务详情/运行日志里看不到 `>> 本任务第 N 次查询 …` / `出发日期 …` / `耗时 …`
 任何一轮查询日志。
 
 **根因（我们自己的钩子引入的）**：引擎把日志分「主线程 / 子线程」两套缓冲，
@@ -867,7 +869,7 @@ Job.start() 每轮结束: if is_main_thread(): QueryLog.flush(sep='\t\t', publis
 搬进了 daemon 线程**（`Query.start()` 原本跑在主线程）→ `is_main_thread()` 为假 →
 每轮日志只堆在 `thread_logs[tid]` 里**永不落盘**（还顺带无界增长占内存）。
 
-实测证据：`runtime/webx.log` 里最后一条 `>> 第 N 次查询` 停在 `13:56:58`，
+实测证据：`runtime/webx.log` 里最后一条 `>> 本任务第 N 次查询` 停在 `13:56:58`，
 而 `status.json` 的 `query_count` 在同一时刻之后仍从 **6145 涨到 6676+**。
 
 **修法**：`_hook_log_thread()` 把 webx 查询循环线程**视为主线程**。
@@ -877,7 +879,7 @@ Job.start() 每轮结束: if is_main_thread(): QueryLog.flush(sep='\t\t', publis
 识别方式是线程名/属性（`WEBX_LOG_THREAD_NAME = 'webx-query-loop'`）。
 副作用评估：`sleep_forever()` 也用这个判定，但全项目无人调用（已 grep 确认）。
 
-修后实测：重启后新日志里 `>> 第 N 次查询` 正常增长，任务详情 `logs` 返回 100 条。
+修后实测：重启后新日志里 `>> 本任务第 N 次查询` 正常增长，任务详情 `logs` 返回 100 条。
 
 ### 5.27 ★★ 界面显示账号已登录，日志却每 3 秒刷「账号正在登录中」
 
@@ -907,6 +909,18 @@ Job.start() 每轮结束: if is_main_thread(): QueryLog.flush(sep='\t\t', publis
 `User.users` 被摘成 0 个。
 线上验证：重启后新日志 `账号正在登录中` **0 次**，且 `用户恢复成功 / 乘客验证成功`
 正常出现（同一账号不再自相矛盾）。
+
+### 5.28 任务详情的车次与经停站使用任务缓存
+
+任务创建或修改查询范围（区间、日期、车次白/黑名单、时段、站点模式）时，
+`webx/task_catalog.py` 在后台按任务过滤条件查询车次并预取经停站，写入 `job_train_catalog`。
+详情页只读取该缓存，不调用车票查询或经停站接口。任务删除时 `DataStore.job_delete()` 同时删除缓存；
+WebX 启动时为没有缓存的旧任务补建。缓存还未完成时详情显示准备中，完成后刷新详情即可读取。
+缓存完成但车次为空时，`job_event` 和 `webx.log` 记录带任务名的「条件筛选未找到有效车次」警告，任务卡片与详情页同时显示；
+缓存生成失败单独显示错误，不要混报成「查无车次」。
+
+不要把该功能改回页面打开后临时查 12306，也不要把目录数据记进周期查询计数。
+如果修改 `station_mode`、时间段或车次过滤条件，必须重新排队生成该任务的目录缓存。
 
 ---
 
@@ -1000,6 +1014,7 @@ user_login    管理台账号（pbkdf2(salt, hash)，无明文）
 order_log     下单记录（queued → submitted → success / failed / cancelled）
 hit_log       余票命中记录
 daily_query   按天查询次数（由守护线程每 30s 轮询 QueryLog 差值累加）
+job_train_catalog 任务车次与经停站缓存（按 job_id；任务删除时一起删除）
 kv            杂项（JWT secret 等）
 ```
 

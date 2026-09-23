@@ -224,6 +224,9 @@ def _job_view(job, db):
     active = bool(job.get('is_active'))
     acc_ready, acc_name = _account_ready(db, job.get('account_key'), _account_state())
     od = _order_info(db, job['job_id'])
+    catalog = db.job_catalog_get(job['job_id'])
+    catalog_state = (catalog or {}).get('state') or 'missing'
+    catalog_count = int((catalog or {}).get('train_count') or 0)
     return {
         'job_id': job['job_id'],
         'job_name': job.get('job_name') or '',
@@ -273,6 +276,11 @@ def _job_view(job, db):
         'hit_count': job.get('hit_count') or 0,
         # 按任务统计的查询次数（引擎每发一条余票查询请求 +1，见 engine_hooks._hook_query_count）
         'query_count': job.get('query_count') or 0,
+        'catalog_state': catalog_state,
+        'catalog_train_count': catalog_count,
+        'catalog_empty': catalog_state in ('empty', 'partial', 'ready') and catalog_count == 0,
+        'catalog_failed': catalog_state == 'failed',
+        'catalog_message': (catalog or {}).get('message') or '',
         'hits': [{'train_number': h['train_number'], 'seat': h['seat'], 'num': h['num'],
                   'left_date': h['left_date'], 'at': h['at']} for h in hits],
     }
@@ -306,6 +314,17 @@ def jobs_detail(job_id):
     if not job:
         return {'code': 1, 'msg': '任务不存在', 'data': None}, 404
     view = _job_view(job, db)
+    catalog = db.job_catalog_get(job_id)
+    try:
+        catalog_items = json.loads(catalog.get('payload') or '[]') if catalog else []
+    except Exception:
+        catalog_items = []
+    view['train_catalog'] = {
+        'state': catalog.get('state') if catalog else 'missing',
+        'message': catalog.get('message') if catalog else '',
+        'updated_at': catalog.get('updated_at') if catalog else '',
+        'items': catalog_items,
+    }
     # 命中时间线（最近 50）
     view['hit_timeline'] = db.query(
         'SELECT * FROM hit_log WHERE job_id=? ORDER BY id DESC LIMIT 50', (job_id,))
@@ -346,6 +365,7 @@ EVENT_LABELS = {
     # 站点过滤：12306 的同城站扩展会让「深圳北→广州南」的查询结果里混入
     # 「深圳北→广州东」等车次，引擎按用户输入过滤掉它们时记这条（见 engine_hooks._hook_station_filter）
     'skip': '站点过滤',
+    'catalog_empty': '车次范围警告',
 }
 
 
@@ -358,10 +378,14 @@ def _job_events(db, job_id, limit=80):
     out = []
     for r in reversed(rows):        # job_event_list 是倒序（最新在前）
         kind = str(r.get('kind') or '')
+        message = r.get('message') or ''
+        prefix = '查询车次为空：'
+        if kind == 'catalog_empty':
+            message = '条件筛选未找到有效车次'
         out.append({
             'kind': kind,
             'label': EVENT_LABELS.get(kind, kind),
-            'message': r.get('message') or '',
+            'message': message,
             'at': r.get('at') or '',
         })
     return out

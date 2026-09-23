@@ -133,11 +133,36 @@ class DataStore:
                     at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_evt_job ON job_event(job_id);
+                -- 任务范围内的车次及经停站快照；详情页仅读取，不直接请求 12306。
+                CREATE TABLE IF NOT EXISTS job_train_catalog (
+                    job_id TEXT PRIMARY KEY,
+                    generation TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT,
+                    train_count INTEGER DEFAULT 0,
+                    message TEXT,
+                    updated_at TEXT
+                );
             ''')
             # 幂等迁移：早期库没有 start_at（CREATE TABLE IF NOT EXISTS 不会补列）。
             # 必须直接用 cur 查询：self.query() 会再取一次 self.lock，
             # 而 threading.Lock 不可重入 → 在持锁块内调用它必然死锁（启动就卡住）
             cols = {r['name'] for r in cur.execute('PRAGMA table_info(job)').fetchall()}
+            catalog_cols = {r['name'] for r in cur.execute('PRAGMA table_info(job_train_catalog)').fetchall()}
+            if 'train_count' not in catalog_cols:
+                cur.execute('ALTER TABLE job_train_catalog ADD COLUMN train_count INTEGER DEFAULT 0')
+            # Existing snapshots may have received the column with its default 0
+            # during an earlier startup. Repair only rows whose payload proves non-empty.
+            for row in cur.execute(
+                    'SELECT job_id, payload FROM job_train_catalog WHERE train_count=0').fetchall():
+                try:
+                    items = json.loads(row['payload'] or '[]')
+                    count = len(items) if isinstance(items, list) else 0
+                except Exception:
+                    count = 0
+                if count:
+                    cur.execute('UPDATE job_train_catalog SET train_count=? WHERE job_id=?',
+                                (count, row['job_id']))
             if 'start_at' not in cols:
                 cur.execute('ALTER TABLE job ADD COLUMN start_at TEXT')
             if 'seat_tiers' not in cols:
@@ -220,7 +245,7 @@ class DataStore:
     def job_update(self, job_id, data):
         allowed = ['job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                    'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'is_active',
+                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'station_mode', 'is_active',
                    'finished_at', 'finish_reason',
                    'updated_at']
         sets, vals = [], []
@@ -237,7 +262,29 @@ class DataStore:
         self.execute('UPDATE job SET %s WHERE job_id=?' % ','.join(sets), vals)
 
     def job_delete(self, job_id):
-        self.execute('DELETE FROM job WHERE job_id=?', (job_id,))
+        with self.lock:
+            self.conn.execute('DELETE FROM job_train_catalog WHERE job_id=?', (job_id,))
+            self.conn.execute('DELETE FROM job WHERE job_id=?', (job_id,))
+            self.conn.commit()
+
+    def job_catalog_begin(self, job_id, generation):
+        self.execute(
+            'INSERT INTO job_train_catalog(job_id, generation, state, payload, train_count, message, updated_at) '
+            'VALUES(?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET '
+            'generation=excluded.generation, state=excluded.state, payload=excluded.payload, '
+            'train_count=excluded.train_count, message=excluded.message, updated_at=excluded.updated_at',
+            (job_id, generation, 'building', '[]', 0, '', _now()))
+
+    def job_catalog_get(self, job_id):
+        rows = self.query('SELECT * FROM job_train_catalog WHERE job_id=?', (job_id,))
+        return rows[0] if rows else None
+
+    def job_catalog_set(self, job_id, generation, state, payload, message=''):
+        self.execute(
+            'UPDATE job_train_catalog SET state=?, payload=?, train_count=?, message=?, updated_at=? '
+            'WHERE job_id=? AND generation=?',
+            (state, json.dumps(payload or [], ensure_ascii=False), len(payload or []), str(message or ''),
+             _now(), job_id, generation))
 
     def job_toggle_active(self, job_id, active):
         # 重新启用时清掉「已结束」标记，否则任务会一直显示为已完成/已结束

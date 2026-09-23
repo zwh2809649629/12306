@@ -560,6 +560,10 @@ function setNavJobBadge(n) {
   el.classList.toggle('zero', v === 0);
 }
 
+function catalogCardEmptyWarning() {
+  return '条件筛选未找到有效车次：当前任务的区间、日期及时段内未找到符合条件的车次';
+}
+
 /* ---------- 2. 任务列表 ---------- */
 function loadJobs() {
   api('/api/jobs').then(function (d) {
@@ -608,6 +612,11 @@ function loadJobs() {
       } else if (done && j.finish_reason) {
         hint = '<div class="job-hint done">' + esc(j.finish_reason)
           + (j.finished_at ? '（' + esc(String(j.finished_at).slice(5, 16)) + '）' : '') + '</div>';
+      }
+      if (j.catalog_empty) {
+        hint += '<div class="job-hint">⚠ ' + esc(catalogCardEmptyWarning()) + '</div>';
+      } else if (j.catalog_failed) {
+        hint += '<div class="job-hint">⚠ 车次和经停站缓存生成失败：' + esc(j.catalog_message || '请编辑并保存任务重试') + '</div>';
       }
       // 右上角操作：开始/暂停 · 编辑 · 详情 · 删除（对齐设计稿）
       var acts = '<div class="acts">' +
@@ -716,15 +725,12 @@ function loadDetail(job_id) {
     var scope = trains.length
       ? detailTrainList(trains, true) + '<small>共 ' + trains.length + ' 个（只抢这些）</small>'
       : (excepts.length
-        ? '排除 ' + detailTrainList(excepts, false) + '<small>其余均抢</small>'
-        : '不限车次<small>区间内全部车次</small>');
+        ? '排除 ' + detailTrainList(excepts, false) + '<small>其余均抢</small><span id="dTrainScope"><small>正在准备实际车次与经停站…</small></span>'
+        : '<span id="dTrainScope">不限车次<small>正在准备区间车次与经停站…</small></span>');
     $('dFacts').innerHTML =
       dvGroup('行程') +
-      dv('查询方式', isTrainMode ? '车次查询<small>只抢列表内车次</small>' : '区间查询<small>查询区间内全部车次</small>') +
+      dv('查询方式', queryStationSummary(isTrainMode, j.station_mode || 'exact')) +
       dv('区间', (routes.join('；') || '—') + '<small>' + (j.stations || []).length + ' 组，依次轮询</small>') +
-      dv('站点匹配', (j.station_mode === 'exact'
-        ? '仅指定站名<small>只抢与输入完全同名的站</small>'
-        : '同城站扩展<small>城市名按该城市全部车站匹配；具体站只匹配自己</small>')) +
       dv('出行日期', esc((j.left_dates || []).map(shortDate).join('、') || '—') +
         '<small>共 ' + (j.left_dates || []).length + ' 天</small>') +
       dv('车次范围', scope) +
@@ -740,6 +746,7 @@ function loadDetail(job_id) {
       dv('查询间隔', '<b>' + esc(ivMin) + '–' + esc(ivMax) + '</b> 秒<small>本任务专用；待引擎支持后生效</small>') +
       dv('开始时间', (j.start_at ? esc(j.start_at) : '立即开始') +
         (j.start_at ? '<small>待引擎支持后生效</small>' : ''));
+    if (!trains.length) loadDetailRangeTrains(j);
     // ---------- 量化指标（全宽带）----------
     var m = j.metrics || {};
     var stat = function (k, v, sub, cls) {
@@ -769,7 +776,12 @@ function loadDetail(job_id) {
       stat('支付剩余', payLeft || '—', j.order_success ? '30 分钟支付窗口' : '未出票');
     // 命中表
     $('dHits').innerHTML = (j.hits || []).length ? j.hits.map(function (h) {
-      return '<tr><td><b>' + esc(h.train_number) + '</b></td><td>' + esc(h.seat) + '</td><td>' + esc(h.num) + '</td><td>' + esc(h.left_date) + '</td><td style="color:var(--sub)">' + esc(h.at) + '</td></tr>';
+      var train = esc(h.train_number || '');
+      var date = esc(h.left_date || detailTrainDate || '');
+      var link = h.train_number
+        ? '<button type="button" class="detail-train-link" data-detail-train="' + train + '" data-detail-date="' + date + '">' + train + '</button>'
+        : '—';
+      return '<tr><td>' + link + '</td><td>' + esc(h.seat) + '</td><td>' + esc(h.num) + '</td><td>' + esc(h.left_date) + '</td><td style="color:var(--sub)">' + esc(h.at) + '</td></tr>';
     }).join('') : '<tr><td colspan="5" style="color:var(--faint);text-align:center">暂无命中记录</td></tr>';
     // 下单阶段时序（命中 → 受理 → 确认页 → 校验 → 排队 → 确认 → 成单/失败）
     // 每条带「距上一步耗时」，直接看出卡在哪一步。
@@ -797,7 +809,7 @@ function loadDetail(job_id) {
     applyTrackMode();
     // 命中轨迹
     $('dTimeline').innerHTML = (j.hit_timeline || []).length ? j.hit_timeline.slice(0, 15).map(function (h) {
-      return '<div class="it"><time>' + esc(String(h.at).slice(5, 16)) + '</time><i class="fdot"></i><div><b>' + esc(h.train_number) + '</b> 命中 <b>' + esc(h.seat) + '</b> × ' + esc(h.num) + ' <span style="color:var(--faint)">(' + esc(shortDate(h.left_date)) + ')</span></div></div>';
+      return '<div class="it"><time>' + esc(String(h.at).slice(5, 16)) + '</time><i class="fdot"></i><div><b class="hit-train">' + esc(h.train_number) + '</b><div class="hit-meta">命中 <b>' + esc(h.seat) + '</b> × ' + esc(h.num) + ' <span style="color:var(--faint)">(' + esc(shortDate(h.left_date)) + ')</span></div></div></div>';
     }).join('') : '<div class="dv-empty">还没有命中记录。任务启动后这里会实时展示查询与命中轨迹。</div>';
     bindDetailTrainStops(j);
     // 日志（后端已按任务名过滤且取最新，见 routes_jobs._job_logs）
@@ -807,47 +819,74 @@ function loadDetail(job_id) {
   }).catch(function (e) { toast(e.message, 'err'); go('jobs'); });
 }
 
+function loadDetailRangeTrains(job) {
+  var box = $('dTrainScope');
+  if (!box) return;
+  var catalog = job.train_catalog || {};
+  if (catalog.state === 'building' || catalog.state === 'pending' || catalog.state === 'missing') {
+    box.innerHTML = '<small>车次与经停站缓存准备中，请稍后刷新任务详情</small>';
+    return;
+  }
+  var items = catalog.items || [];
+  if (!items.length) {
+    var message = catalog.message || (catalog.state === 'failed'
+      ? '车次与经停站缓存生成失败'
+      : '当前任务区间、日期及筛选条件下没有查询到车次');
+    if (catalog.state === 'failed') {
+      box.innerHTML = '<span class="detail-catalog-warning">⚠ 车次与经停站缓存生成失败：' + esc(message) + '</span>';
+    } else if (catalog.state !== 'building' && catalog.state !== 'pending' && catalog.state !== 'missing') {
+      box.innerHTML = '<span class="detail-catalog-warning">⚠ 条件筛选未找到有效车次</span>';
+    } else {
+      box.innerHTML = '<small>' + esc(message) + '</small>';
+    }
+    return;
+  }
+  box.innerHTML = '<span class="detail-train-list">' + items.map(function (item) {
+      return '<button type="button" class="detail-train-link" data-detail-train="' +
+        esc(item.train_number) + '" data-detail-date="' + esc(item.date) + '">' +
+        esc(item.train_number) + '<small>' + esc(shortDate(item.date)) + '</small></button>';
+    }).join('') + '</span><small>' + (job.except_train_numbers && job.except_train_numbers.length
+      ? '排除规则过滤后' : '不限车次，区间内') + '共 ' + items.length + ' 个车次（含经停站缓存）</small>';
+  bindDetailTrainStops(job);
+}
+
 function bindDetailTrainStops(job) {
-  document.querySelectorAll('#dFacts [data-detail-train]').forEach(function (button) {
-    button.addEventListener('click', function () {
+  document.querySelectorAll('#dFacts [data-detail-train], #dHits [data-detail-train]').forEach(function (button) {
+    button.onclick = function () {
       openDetailTrainStops(job, button.dataset.detailTrain, button.dataset.detailDate);
-    });
+    };
   });
 }
 
 function openDetailTrainStops(job, trainNumber, date) {
-  var pairs = (job.stations || []).filter(function (pair) {
-    return pair.left && pair.arrive;
-  });
-  if (!pairs.length || !trainNumber || !date) {
-    toast('缺少该车次的查询区间或日期，无法获取经停站', 'err');
+  if (!trainNumber || !date) {
+    toast('缺少车次或日期信息', 'err');
     return;
   }
-  toast('正在获取 ' + trainNumber + ' 的经停站…', '', 1800);
-  Promise.all(pairs.map(function (pair) {
-    return api('/api/tickets?' + new URLSearchParams({
-      left: pair.left, arrive: pair.arrive, date: date
-    }).toString()).then(function (data) {
-      return data.rows || [];
-    }).catch(function () { return []; });
-  })).then(function (groups) {
-    var leg = null;
-    groups.some(function (rows) {
-      return rows.some(function (row) {
-        if (String(row.n || '') !== String(trainNumber)) return false;
-        leg = row;
-        return true;
-      });
-    });
-    if (!leg) {
-      toast('当前日期未查询到车次 ' + trainNumber + '，无法显示经停站', 'err');
-      return;
-    }
-    openStopsForLeg(leg, null, date);
-  }).catch(function (e) {
-    toast(e.message || '获取车次信息失败', 'err');
+  var items = (job.train_catalog && job.train_catalog.items) || [];
+  var item = items.find(function (x) {
+    return String(x.train_number) === String(trainNumber) && String(x.date) === String(date);
   });
+  if (!item) {
+    toast('任务缓存中没有车次 ' + trainNumber + ' 的经停站，请编辑并保存任务刷新缓存', 'err');
+    return;
+  }
+  if (!item.stops_data || !(item.stops_data.stops || []).length) {
+    toast(item.stops_error || '该车次的经停站缓存暂不可用，请编辑并保存任务重建缓存', 'err');
+    return;
+  }
+  var leg = {
+    n: item.train_number,
+    no: item.train_no,
+    f: item.from_station,
+    to: item.to_station,
+    d: item.departure,
+    a: item.arrival,
+    m: item.duration
+  };
+  openStopsForLeg(leg, null, item.date, item.stops_data);
 }
+
 // 执行轨迹的租户：TRACK.mode = 'stage'（下单阶段）| 'hit'（命中轨迹）。
 // userSet 记录「用户主动切过」，避免每次轮询刷新都把选择重置回默认值。
 var TRACK = { mode: 'stage', userSet: false };
@@ -873,6 +912,16 @@ document.addEventListener('click', function (e) {
   TRACK.userSet = true;
   applyTrackMode();
 });
+function queryStationSummary(isTrainMode, stationMode) {
+  var method = isTrainMode ? '车次查询' : '区间查询';
+  var methodNote = isTrainMode ? '只抢列表内车次' : '查询区间内全部车次';
+  var station = stationMode === 'expand' ? '同城站扩展' : '仅指定站名';
+  var stationNote = stationMode === 'expand'
+    ? '城市名匹配该城市全部车站；具体站只匹配自己'
+    : '只匹配与输入完全同名的站';
+  return method + ' · ' + station + '<small>' + methodNote + '；' + stationNote + '</small>';
+}
+
 // 配置行：<span>标题</span><b>值 + 可选小字说明</b>
 function dv(k, v) {
   return '<div class="detail-fact"><span>' + k + '</span><b>' + v + '</b></div>';
@@ -1329,7 +1378,7 @@ function addNtPair(left, arrive) {
   row.innerHTML =
     '<div class="stn-wrap"><input class="stn" type="text" data-role="left" value="" placeholder="出发站">' +
       '<div class="stn-suggest hidden"></div></div>' +
-    '<span class="arr">→</span>' +
+    '<button type="button" class="pair-swap" title="交换出发站和到达站" aria-label="交换出发站和到达站"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/></svg></button>' +
     '<div class="stn-wrap"><input class="stn" type="text" data-role="arrive" value="" placeholder="到达站">' +
       '<div class="stn-suggest hidden"></div></div>' +
     '<span class="del">✕</span>' +
@@ -1342,6 +1391,20 @@ function addNtPair(left, arrive) {
   refreshPairNotes();
 }
 function wireNtPair(row) {
+  var swap = row.querySelector('.pair-swap');
+  if (swap && !swap.dataset.wired) {
+    swap.dataset.wired = '1';
+    swap.addEventListener('click', function () {
+      var left = row.querySelector('[data-role=left]');
+      var arrive = row.querySelector('[data-role=arrive]');
+      var value = left.value;
+      left.value = arrive.value;
+      arrive.value = value;
+      refreshNtQueryLoad();
+      updateNtSummary();
+      refreshPairNotes();
+    });
+  }
   row.querySelector('.del').addEventListener('click', function () {
     row.remove();
     if (!$('ntPairs').querySelector('.pair')) addNtPair('北京', '深圳');
@@ -1747,17 +1810,12 @@ function updateNtSummary() {
   else if (train) trainsTxt = '未选车次<small>请到车票查询添加</small>';
   else trainsTxt = '不限车次<small>区间内全部车次</small>';
   $('ntSummary').innerHTML =
-    row('查询方式', train ? '车次查询<small>只抢列表内车次</small>' : '区间查询<small>查询区间内全部车次</small>') +
+    row('查询方式', queryStationSummary(train, ntStnMode())) +
     row('账号', esc($('ntAccount').value || '未选')) +
     row('乘车人', APP.paxSel && APP.paxSel.length
       ? esc(APP.paxSel.join('、')) + '<small>' + APP.paxSel.length + ' 人' + ($('ntLessMember').checked ? ' · 允许部分先行' : '') + '</small>'
       : '未选') +
     row('区间', pairs.length ? esc(pairs.map(function (p) { return p.left + '→' + p.arrive; }).join(' · ')) + '<small>' + pairs.length + ' 组，依次轮询</small>' : '未填') +
-    row('站点匹配', ntMode() === 'range'
-      ? (ntStnMode() === 'exact'
-        ? '仅指定站名<small>只抢与输入完全同名的站（「广州」= 广州站）</small>'
-        : '同城站扩展<small>城市名按该城市全部车站匹配（「广州」= 10 个广州站）；具体站只匹配自己</small>')
-      : '—') +
     row('日期', APP.selDates.length ? esc(APP.selDates.map(shortDate).join('、')) + '<small>共 ' + APP.selDates.length + ' 天</small>' : '未选') +
     // 标签跟模式走：车次模式没有可编辑的「席别优先级」列表，那里叫「座次顺序」
     row(train ? '座次顺序' : '席别优先级', seatPri || '未选', 'seat-priority') +
@@ -2478,7 +2536,8 @@ function matchHour(leg, ranges) {
 }
 function matchStation(val, list) {
   if (!list || !list.length) return true;
-  return list.some(function (s) { return val === s || String(val || '').indexOf(s) === 0; });
+  // 筛选项来自余票结果中的实际站名，选择哪个站就只保留该站，不能按城市名前缀扩展。
+  return list.indexOf(String(val || '')) >= 0;
 }
 function setMonSort(key) {
   if (!key) { MON.sort = null; applyMonitor(); return; }
@@ -2511,7 +2570,9 @@ function applyMonitor() {
     if (!matchStation(leg.f, F.fromSt)) return false;
     if (!matchStation(leg.to, F.toSt)) return false;
     if (F.seats.length) {
-      var hasAny = F.seats.some(function (k) { return seatOffered(leg, k); });
+      var hasAny = F.seats.some(function (k) {
+        return seatHasTicket(leg && leg.s ? leg.s[k] : undefined);
+      });
       if (!hasAny) return false;
     }
     if (!matchHour(leg, F.hour)) return false;
@@ -2594,7 +2655,7 @@ var STOPS = { leg: null, data: null, from: -1, to: -1, onApply: null };
 
 function openStops(i) { openStopsForLeg(MON.rows[i], null); }
 
-function openStopsForLeg(leg, onApply, dateOverride) {
+function openStopsForLeg(leg, onApply, dateOverride, cachedStops) {
   if (!leg) return;
   if (!leg.no) { toast('该车次缺少 12306 内部编号，无法查询经停站', 'err'); return; }
   STOPS.leg = leg;
@@ -2611,6 +2672,12 @@ function openStopsForLeg(leg, onApply, dateOverride) {
   $('stopsPick').innerHTML = '';
   $('stopsModal').classList.add('open');
   var date = dateOverride || (($('mDate') || {}).value || '');
+  if (cachedStops) {
+    STOPS.data = cachedStops;
+    syncStopsSelection();
+    renderStops();
+    return;
+  }
   api('/api/tickets/stops?train_no=' + encodeURIComponent(leg.no) +
       '&date=' + encodeURIComponent(date))
     .then(function (d) {

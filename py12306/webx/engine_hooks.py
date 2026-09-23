@@ -156,6 +156,7 @@ def install():
     install._installed = True
     try:
         _hook_response_json()
+        _hook_log_timestamps()
         _hook_job_do_order()
         _hook_order_success()
         _hook_save_user()
@@ -194,6 +195,93 @@ def install():
         except Exception:
             pass
         return False
+
+
+def _hook_log_timestamps():
+    """统一给 BaseLog.flush() 输出的每个日志批次加毫秒时间戳。"""
+    import datetime
+    import threading
+
+    from py12306.log.base import BaseLog
+    from py12306.log.query_log import QueryLog
+    from py12306.query.job import Job
+    import py12306.log.query_log as query_log_module
+
+    if getattr(BaseLog.flush, '_webx_timestamp_wrapped', False):
+        return
+
+    original_flush = BaseLog.flush.__func__
+    flush_lock = threading.RLock()
+    query_job_context = threading.local()
+
+    if not getattr(Job.start, '_webx_query_log_context_wrapped', False):
+        original_job_start = Job.start
+
+        def job_start(self, *args, **kwargs):
+            previous = getattr(query_job_context, 'job', None)
+            query_job_context.job = self
+            try:
+                return original_job_start(self, *args, **kwargs)
+            finally:
+                if previous is None:
+                    try:
+                        del query_job_context.job
+                    except AttributeError:
+                        pass
+                else:
+                    query_job_context.job = previous
+
+        job_start._webx_query_log_context_wrapped = True
+        job_start._webx_original = original_job_start
+        Job.start = job_start
+
+    def flush(cls, *args, **kwargs):
+        with flush_lock:
+            instance = cls()
+            logs = instance.get_logs()
+            if logs:
+                first = next((i for i, item in enumerate(logs)
+                              if str(item or '').strip()), None)
+                if first is not None:
+                    stamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                    logs[first] = '%s %s' % (stamp, logs[first])
+            return original_flush(cls, *args, **kwargs)
+
+    flush._webx_timestamp_wrapped = True
+    flush._webx_original = original_flush
+    BaseLog.flush = classmethod(flush)
+
+    # QueryLog.print_job_start 以前自己附带秒级时间，统一时间戳后去掉重复时间。
+    if not getattr(QueryLog.print_job_start, '_webx_timestamp_wrapped', False):
+        def print_job_start(cls, job_name):
+            instance = cls()
+            job = getattr(query_job_context, 'job', None)
+            query_count = None
+            if job is not None:
+                try:
+                    from py12306.webx.db import DataStore
+                    row = DataStore().job_get(_job_id_for(job))
+                    if row:
+                        query_count = int(row.get('query_count') or 0) + 1
+                except Exception:
+                    pass
+                if query_count is None:
+                    query_count = int(getattr(job, '_webx_query_count', 0) or 0) + 1
+            if query_count is None:
+                query_count = int(instance.data.get('query_count', 0)) + 1
+                message = '>> 第 {query_count} 次查询 {job_name}'.format(
+                    query_count=query_count, job_name=job_name)
+            else:
+                message = '>> 本任务第 {query_count} 次查询 {job_name}'.format(
+                    query_count=query_count, job_name=job_name)
+            instance.add_log(message)
+            instance.refresh_data()
+            if query_log_module.is_main_thread():
+                instance.flush(publish=False)
+            return instance
+
+        print_job_start._webx_timestamp_wrapped = True
+        QueryLog.print_job_start = classmethod(print_job_start)
 
 
 # ---------------- 日志落盘：查询循环所在的线程必须被当成「主线程」 ----------------
@@ -487,6 +575,7 @@ def _hook_query_count():
 
     def query_by_date(self, *args, **kwargs):
         try:
+            self._webx_query_count = int(getattr(self, '_webx_query_count', 0) or 0) + 1
             from py12306.webx.db import DataStore
             DataStore().job_record_query(_job_id_for(self))
         except Exception:
@@ -577,10 +666,6 @@ def _record_job_finished(job):
 #
 # 与原实现一致：回调内 try/except 兜底，异常绝不影响抢票主流程。
 
-_STATION_SKIP = {}          # 引擎 Job.id → {'at': 时间戳, 'nums': [车次…], 'sample': 描述}
-_STATION_SKIP_LOG_INTERVAL = 60
-
-
 def _allowed_stations(requested, mode='expand'):
     """
     用户输入 → 允许的实际站名集合；无法判断时返回 None（= 不拦截）。
@@ -640,34 +725,37 @@ def _row_station_ok(job):
     return (actual_left in ok_l and actual_arrive in ok_r), actual_left, actual_arrive
 
 
-def _note_station_skip(job, train_number, actual_left, actual_arrive):
-    """把「被站点过滤掉的车次」记一条事件（限频），并打到日志。"""
-    import time
+def _note_station_skip(job, train_number):
+    """累计当前任务首次查询结果中被站点规则过滤的车次。"""
     try:
-        key = str(getattr(job, 'id', '') or id(job))
-        now = time.time()
-        rec = _STATION_SKIP.setdefault(key, {'at': 0.0, 'n': 0, 'nums': []})
-        rec['n'] += 1
-        if train_number and train_number not in rec['nums']:
-            rec['nums'].append(train_number)
-        if now - rec['at'] < _STATION_SKIP_LOG_INTERVAL:
-            return
-        rec['at'] = now
-        nums = rec['nums'][:8]
-        rec['nums'] = []
-        msg = ('近 %d 秒已按站点过滤 %d 条非目标车站的车次（最近：%s %s→%s）'
-               % (_STATION_SKIP_LOG_INTERVAL, rec['n'], '、'.join(nums) or '-',
-                  actual_left, actual_arrive))
-        rec['n'] = 0
-        try:
-            from py12306.log.common_log import CommonLog
-            CommonLog.add_quick_log('%s%s' % (_jn(job), msg)).flush()
-        except Exception:
-            pass
-        _evjob(job, 'skip', msg)
+        job._webx_station_skip_count = getattr(job, '_webx_station_skip_count', 0) + 1
+        nums = getattr(job, '_webx_station_skip_trains', None)
+        if nums is None:
+            nums = job._webx_station_skip_trains = []
+        if train_number and train_number not in nums:
+            nums.append(train_number)
     except Exception:
         pass
 
+
+def _emit_station_skip_summary(job):
+    """每个 Job 实例首次完成一批余票响应后，汇总打印一次站点过滤数。"""
+    if getattr(job, '_webx_station_skip_logged', False):
+        return
+    count = int(getattr(job, '_webx_station_skip_count', 0) or 0)
+    if count <= 0:
+        return
+    job._webx_station_skip_logged = True
+    trains = getattr(job, '_webx_station_skip_trains', []) or []
+    message = '已按站点过滤 %d 条非目标车站的车次' % count
+    if trains:
+        message += '（车次：%s%s）' % ('、'.join(trains[:8]), '…' if len(trains) > 8 else '')
+    try:
+        from py12306.log.common_log import CommonLog
+        CommonLog.add_quick_log('%s%s' % (_jn(job), message)).flush()
+    except Exception:
+        pass
+    _evjob(job, 'skip', message)
 
 def _hook_station_filter():
     from py12306.query.job import Job
@@ -681,11 +769,27 @@ def _hook_station_filter():
         try:
             ok, actual_left, actual_arrive = _row_station_ok(self)
             if not ok:
-                _note_station_skip(self, self.get_info_of_train_number(), actual_left, actual_arrive)
+                _note_station_skip(self, self.get_info_of_train_number())
                 return False
         except Exception:
             pass
         return True
+
+    if not getattr(Job.handle_response, '_webx_station_summary_wrapped', False):
+        original_handle_response = Job.handle_response
+
+        def handle_response(self, *args, **kwargs):
+            try:
+                return original_handle_response(self, *args, **kwargs)
+            finally:
+                try:
+                    _emit_station_skip_summary(self)
+                except Exception:
+                    pass
+
+        handle_response._webx_station_summary_wrapped = True
+        handle_response._webx_original = original_handle_response
+        Job.handle_response = handle_response
 
     is_trains_number_valid._webx_wrapped = True
     is_trains_number_valid._webx_original = original
@@ -710,6 +814,9 @@ def _hook_job_init_data():
         try:
             if isinstance(info, dict) and 'webx_station_mode' in info:
                 self.webx_station_mode = info.get('webx_station_mode')
+            self._webx_station_skip_count = 0
+            self._webx_station_skip_trains = []
+            self._webx_station_skip_logged = False
         except Exception:
             pass
         return result

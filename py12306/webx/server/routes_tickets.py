@@ -323,6 +323,20 @@ def tickets():
                 'f_code': left_st,
                 'to_code': arrive_st,
             })
+        # 任务详情可传 station_mode，让展示结果与引擎站点过滤保持同一语义。
+        station_mode = (request.args.get('station_mode') or '').strip().lower()
+        if station_mode in ('exact', 'expand'):
+            try:
+                from py12306.webx import stations as station_store
+                if station_mode == 'exact':
+                    allowed_left = {left}
+                    allowed_arrive = {arrive}
+                else:
+                    allowed_left = set(station_store.expand(left) or [left])
+                    allowed_arrive = set(station_store.expand(arrive) or [arrive])
+                rows = [r for r in rows if (r.get('f') in allowed_left and r.get('to') in allowed_arrive)]
+            except Exception:
+                pass
         return {'code': 0, 'msg': '', 'data': {'rows': rows, 'left': left, 'arrive': arrive,
                                               'date': date, 'api_type': api_type}}
     except Exception as e:

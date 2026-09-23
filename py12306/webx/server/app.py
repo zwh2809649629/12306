@@ -109,6 +109,16 @@ def create_app():
             'runtime_dir': Config().RUNTIME_DIR,
         })
 
+    # 旧任务在功能部署前没有车次/经停站缓存；正常服务启动后后台补建一次。
+    # 测试客户端不得因此发起外网车票/经停站请求。
+    try:
+        from py12306.app import Const
+        if not Const.IS_TEST:
+            from py12306.webx.task_catalog import enqueue_missing_catalogs
+            enqueue_missing_catalogs(app)
+    except Exception:
+        pass
+
     return app
 
 
