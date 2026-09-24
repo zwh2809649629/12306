@@ -65,7 +65,7 @@ class Query:
     def start(self):
         # return # DEBUG
         QueryLog.init_data()
-        stay_second(3)
+        # stay_second(3)  # 20260924 去除等待3s
         # 多线程
         while True:
             if Config().QUERY_JOB_THREAD_ENABLED:  # 多线程
