@@ -14,6 +14,15 @@ function esc(s) {
     return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
   });
 }
+function routeText(left, arrive, separator) {
+  return String(left == null ? '' : left) + (separator == null ? ' 至 ' : separator) + String(arrive == null ? '' : arrive);
+}
+function routeHtml(left, arrive, extraClass) {
+  return '<span class="route-compact' + (extraClass ? ' ' + extraClass : '') + '"><span class="route-from">' + esc(left) + '</span><i class="route-arrow" aria-hidden="true"></i><span class="route-to">' + esc(arrive) + '</span></span>';
+}
+function routeDetailText(left, arrive) {
+  return '<span class="route-detail-text">' + esc(left) + '➜' + esc(arrive) + '</span>';
+}
 function token() { return localStorage.getItem(TOKEN_KEY) || ''; }
 function api(path, options) {
   options = options || {};
@@ -498,11 +507,11 @@ function loadDashboard() {
 
     // 任务表
     $('dashJobs').innerHTML = d.jobs.length ? d.jobs.map(function (j) {
-      var route = (j.stations || []).map(function (p) { return p.left + ' → ' + p.arrive; }).join('、') || '—';
+      var route = (j.stations || []).map(function (p) { return routeDetailText(p.left, p.arrive); }).join('、') || '—';
       var seats = (j.seats || []).join(' / ') || '—';
       var dates = (j.left_dates || []).map(shortDate).join('、') || '—';
       var last = j.last_hit_at ? esc(String(j.last_hit_at).slice(5, 16)) + ' 命中' : '暂无记录';
-      return '<tr style="cursor:pointer" data-job="' + j.job_id + '"><td><b>' + esc(j.job_name || '未命名') + '</b></td><td>' + esc(route) + '</td><td>' + esc(dates) + '</td><td>' + esc(seats) + '</td><td>' + jobStatusTag(j.status) + '</td><td style="color:var(--sub)">' + last + '</td></tr>';
+      return '<tr style="cursor:pointer" data-job="' + j.job_id + '"><td><b>' + esc(j.job_name || '未命名') + '</b></td><td>' + route + '</td><td>' + esc(dates) + '</td><td>' + esc(seats) + '</td><td>' + jobStatusTag(j.status) + '</td><td style="color:var(--sub)">' + last + '</td></tr>';
     }).join('') : '<tr><td colspan="6" style="color:var(--faint)">暂无任务，点左侧「新建任务」开始</td></tr>';
     $('dashJobs').querySelectorAll('tr[data-job]').forEach(function (tr) {
       tr.addEventListener('click', function () { go('detail', { job_id: tr.dataset.job }); });
@@ -580,7 +589,7 @@ function loadJobs() {
     JOB_INDEX = {};
     jobs.forEach(function (j) { JOB_INDEX[j.job_id] = j; });
     $('jobsList').innerHTML = jobs.map(function (j) {
-      var routes = (j.stations || []).map(function (p) { return esc(p.left) + ' <b style="color:var(--red);margin:0 6px">→</b> ' + esc(p.arrive); });
+      var routes = (j.stations || []).map(function (p) { return routeDetailText(p.left, p.arrive); });
       var stTag = jobStatusTag(j.status);
       // 卡片要能直接看到「抢哪些车次」「谁坐」——只写「指定 N 车次」看不到具体车次，
       // 也无法确认乘车人是否选对。车次多时做截断，避免卡片被撑成一长条。
@@ -640,7 +649,7 @@ function loadJobs() {
       }
       return '<div class="job' + ((j.status === 'running' || j.status === 'scheduled') ? '' : ' paused') + '">' +
         '<div class="l1"><span class="jname">' + esc(j.job_name || '未命名任务') + '</span><span class="job-id">' + esc(j.job_id || '—') + '</span>' +
-          '<span class="route">' + routes.join('；') + '</span>' + stTag + acts + '</div>' +
+          '<span class="route">' + routes.join('、') + '</span>' + stTag + acts + '</div>' +
         hint +
         '<div class="l2">' + tags + '</div>' +
         '<div class="l3"><span class="l3stat">' + stat + '</span>' + createdMeta + '<span>账号 ' + esc(j.account_name || j.account_key || '—') + '</span></div></div>';
@@ -707,7 +716,7 @@ function loadDetail(job_id) {
       }
     }
     // 行程信息
-    var routes = (j.stations || []).map(function (p) { return esc(p.left) + ' → ' + esc(p.arrive); });
+    var routes = (j.stations || []).map(function (p) { return routeDetailText(p.left, p.arrive); });
     // 优先级结构由 job.seat_tiers 持久化（引擎不读，纯展示）；
     // 老数据没有该列 → 接口回落为 [seats]，这里自然渲染成单级。
     // 展平后的顺序与 seats 一致，所以用座次名反查它属于第几级即可。
@@ -743,7 +752,7 @@ function loadDetail(job_id) {
     $('dFacts').innerHTML =
       dvGroup('行程') +
       dv('查询方式', queryStationSummary(isTrainMode, j.station_mode || 'exact')) +
-      dv('区间', (routes.join('；') || '—') + '<small>' + (j.stations || []).length + ' 组，依次轮询</small>') +
+      dv('区间', (routes.join('、') || '—') + '<small>' + (j.stations || []).length + ' 组，依次轮询</small>') +
       dv('出行日期', esc((j.left_dates || []).map(shortDate).join('、') || '—') +
         '<small>共 ' + (j.left_dates || []).length + ' 天</small>') +
       dv('车次范围', scope) +
@@ -1744,7 +1753,7 @@ function renderNtDerived() {
   var dates = (APP.selDates || []).map(shortDate);
   box.innerHTML =
     '<div class="dv-row"><span class="dv-k">查询区间</span><span class="dv-v">' +
-      (pairs.length ? pairs.map(function (p) { return '<b>' + esc(p.left) + '</b> → <b>' + esc(p.arrive) + '</b>'; }).join('、') +
+      (pairs.length ? pairs.map(function (p) { return routeHtml(p.left, p.arrive); }).join('、') +
         '<small>' + pairs.length + ' 组，依次轮询</small>' : '—') +
     '</span></div>' +
     '<div class="dv-row"><span class="dv-k">抢票车次</span><span class="dv-v">' + esc(nums.join('、')) +
@@ -1845,7 +1854,7 @@ function updateNtSummary() {
     row('乘车人', APP.paxSel && APP.paxSel.length
       ? esc(APP.paxSel.join('、')) + '<small>' + APP.paxSel.length + ' 人' + ($('ntLessMember').checked ? ' · 允许部分先行' : '') + '</small>'
       : '未选') +
-    row('区间', pairs.length ? esc(pairs.map(function (p) { return p.left + '→' + p.arrive; }).join(' · ')) + '<small>' + pairs.length + ' 组，依次轮询</small>' : '未填') +
+    row('区间', pairs.length ? pairs.map(function (p) { return routeDetailText(p.left, p.arrive); }).join('、') + '<small>' + pairs.length + ' 组，依次轮询</small>' : '未填') +
     row('日期', APP.selDates.length ? esc(APP.selDates.map(shortDate).join('、')) + '<small>共 ' + APP.selDates.length + ' 天</small>' : '未选') +
     // 标签跟模式走：车次模式没有可编辑的「席别优先级」列表，那里叫「座次顺序」
     row(train ? '座次顺序' : '席别优先级', seatPri || '未选', 'seat-priority') +
@@ -2054,7 +2063,7 @@ function renderTaskPicked() {
       '<button class="train task-train-stops" type="button" data-tn="' + esc(leg.n) + '"'
         + (leg.no ? ' title="查看经停站，可改上车站 / 下车站"' : ' title="该车次缺少 12306 内部编号"') + '>'
         + '<b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></button>' +
-      '<div class="route"><b>' + esc(leg.f) + ' ' + esc(leg.d) + ' → ' + esc(leg.to) + ' ' + esc(leg.a) + '</b><small>' + esc(taskDate) + ' · ' + fmtDur(leg.m) + '</small></div>' +
+      '<div class="route"><b>' + routeHtml(leg.f + ' ' + leg.d, leg.to + ' ' + leg.a) + '</b><small>' + esc(taskDate) + ' · ' + fmtDur(leg.m) + '</small></div>' +
       '<div class="task-seat-options">' + chip + '</div>' +
       '<button class="remove-selection" data-tn="' + esc(leg.n) + '" title="移除">×</button></div>';
   }).join('');
@@ -2325,10 +2334,10 @@ function openTaskBindModal() {
   }).catch(function (e) { toast(e.message, 'err'); });
 }
 function renderBindOptions(jobs, sel, names) {
-  var rows = sel.slice(0, 6).map(function (i) { var l = MON.rows[i]; return esc(l.n) + ' ' + esc(l.f) + '→' + esc(l.to); }).join('、');
+  var rows = sel.slice(0, 6).map(function (i) { var l = MON.rows[i]; return routeText(l.n + '（' + l.f, l.to + '）', '➜'); }).join('、');
   $('taskPreview').textContent = '将 ' + sel.length + ' 个车次关联到所选任务：' + (sel.length > 6 ? rows + '…' : rows);
   $('bindChoices').innerHTML = jobs.map(function (j) {
-    var routes = (j.stations || []).map(function (p) { return esc(p.left) + '→' + esc(p.arrive); }).join('、');
+    var routes = (j.stations || []).map(function (p) { return routeHtml(p.left, p.arrive); }).join('、');
     var st = j.is_active ? '运行中' : '已暂停';
     return '<label class="choice"><input type="radio" name="jobBind" value="' + esc(j.job_id) + '"><span>' +
       '<b>' + routes + ' · ' + esc(j.job_name || '未命名') + '</b>' +
@@ -2569,7 +2578,7 @@ function doMonitorSearch() {
       MON.searched = true;
       MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
       MON.sort = null;
-      $('mRoute').textContent = left + ' → ' + arrive + ' · ' + date;
+      $('mRoute').innerHTML = routeHtml(left, arrive, 'route-title') + '<span class="route-date"> · ' + esc(date) + '</span>';
       // 收集出发/到达车站选项
       var fo = {}, to = {};
       MON.rows.forEach(function (l) { if (l.f) fo[l.f] = (fo[l.f] || 0) + 1; if (l.to) to[l.to] = (to[l.to] || 0) + 1; });
@@ -2726,7 +2735,7 @@ function openStopsForLeg(leg, onApply, dateOverride, cachedStops) {
   STOPS.onApply = onApply || null;
   $('stopsTitle').textContent = (leg.n || '') + ' 经停站';
   $('stopsSum').innerHTML =
-    '<span class="tag info">' + esc(leg.f) + ' → ' + esc(leg.to) + '</span>' +
+    '<span class="tag info">' + routeHtml(leg.f, leg.to) + '</span>' +
     '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>';
   $('stopsBody').innerHTML = '<tr><td colspan="7" class="stops-msg">正在获取经停站…</td></tr>';
   $('stopsNote').innerHTML = '';
@@ -2821,7 +2830,7 @@ function renderStops() {
   });
   var picked = stopsPickSummary();
   $('stopsPick').innerHTML = picked
-    ? '已选区间：<b>' + esc(picked.f) + ' → ' + esc(picked.to) + '</b>' +
+    ? '已选区间：<b>' + routeHtml(picked.f, picked.to) + '</b>' +
       '<small>' + picked.d + ' 开 · 历时 ' + fmtDur(picked.m) + '</small>'
     : '';
   $('stopsNote').innerHTML = '共 <b>' + stops.length + '</b> 站 · 全程 <b>' +
@@ -2858,12 +2867,12 @@ function applyStopsPick() {
   leg.f_code = '';
   leg.to_code = '';
   $('stopsSum').innerHTML =
-    '<span class="tag info">' + esc(leg.f) + ' → ' + esc(leg.to) + '</span>' +
+    '<span class="tag info">' + routeHtml(leg.f, leg.to) + '</span>' +
     '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>';
   // 席别余票属于原区间，改区间后清掉「可订」标记，避免继续显示成可订
   leg.bookable = false;
   refreshAfterLegChange(STOPS.onApply);
-  toast(leg.n + ' 区间已改为 ' + leg.f + ' → ' + leg.to, 'ok');
+  toast(leg.n + ' 区间已改为 ' + routeText(leg.f, leg.to, '➜'), 'ok');
   closeStops();
 }
 
@@ -2922,7 +2931,7 @@ function renderOrderView() {
     var names = { business: '商务座', first: '一等座', second: '二等座', hardSleeper: '硬卧', hardSeat: '硬座', softSleeper: '软卧', special: '特等座', noSeat: '无座' };
     return '<div class="task-selection-item" data-idx="' + idx + '">' +
       '<div class="train"><b>' + esc(leg.n) + '</b><small>' + esc(leg.tn) + '</small></div>' +
-      '<div class="station"><b>' + esc(leg.f) + '  ' + esc(leg.d) + '</b><small>→ ' + esc(leg.to) + '  ' + esc(leg.a) + '</small></div>' +
+      '<div class="station"><b>' + routeHtml(leg.f + '  ' + leg.d, leg.to + '  ' + leg.a) + '</b></div>' +
       '<div class="task-seat-options">' + seats.map(function (k) {
         var v = leg.s ? leg.s[k] : '';
         var on = s.seats[k];

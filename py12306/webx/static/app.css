@@ -229,6 +229,13 @@ input[type=date]:disabled,input[type=time]:disabled,input[type=datetime-local]:d
 .job .jname{font-size:15.5px; font-weight:700; color:var(--ink); flex-shrink:0}
 .job .route{font-size:12.5px; font-weight:600; color:var(--sub); display:flex; align-items:center; gap:8px; min-width:0}
 .job .route svg{width:15px; height:15px; color:var(--red)}
+.route-compact{display:inline-flex;align-items:baseline;gap:5px;min-width:0;max-width:100%;white-space:nowrap;vertical-align:baseline}
+.route-compact .route-from,.route-compact .route-to{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.route-arrow{position:relative;display:inline-block;align-self:center;flex:0 0 15px;width:15px;height:1em;color:inherit;font-style:normal;line-height:1}
+.route-arrow::before{content:"➜";position:absolute;left:0;top:50%;font-size:1em;line-height:1;transform:translateY(-50%)}
+.route-title{font-size:inherit;font-weight:inherit;color:inherit}
+.route-detail-text{white-space:nowrap}
+.route-date{color:inherit;font-weight:inherit}
 .job .l1 .tag{margin-left:0}
 .job .l1 .acts{margin-left:auto; display:flex; gap:4px; flex-shrink:0}
 /* 账号未登录 / 任务已结束的说明条（不只靠一个标签，用户容易看漏） */
@@ -1008,6 +1015,7 @@ body:has(#view-detail.is-active){overflow-y:hidden}
 #view-detail .detail-fact>span{flex:0 0 58px;margin-bottom:0}
 #view-detail .detail-fact>b{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 6px;min-width:0;
   font-size:12.5px;line-height:1.45;word-break:break-word}
+#view-detail .detail-fact>b .route-detail-text{color:inherit}
 #view-detail .detail-fact b small{margin-top:0;font-weight:400;font-size:10.5px;color:var(--faint);line-height:1.35}
 #view-detail .dv-group{
   grid-column:1 / -1;margin:10px 0 0;padding:0 0 2px;

@@ -12,7 +12,7 @@ POST /api/orders/<id>/cancel        撤销：停用关联任务 + 记录置为 c
 py12306 引擎只在 **Job 上下文** 里下单（Job.handle_seats 命中 → Order.order()，
 见 py12306/query/job.py）。管理台没有第二条路可走，因此「立即预定」= 创建一个
 窄范围的一次性任务：
-    job_name = "[即时] G79 北京西→深圳北"（ONE_SHOT_PREFIX 标记）
+    job_name = "[即时] G79 北京西 至 深圳北"（ONE_SHOT_PREFIX 标记）
     train_numbers = 指定车次   interval 0.5~1s   left_dates = 单个日期
 出票成功后 engine_hooks 会把该任务停用（一次性），并回填 order_log。
 
@@ -158,7 +158,7 @@ def create_order():
 
     # ---- 建「即时」任务 ----
     seg = stations[0]
-    name = ('%s%s %s→%s' % (ONE_SHOT_PREFIX, train_numbers[0], seg['left'], seg['arrive']))[:40]
+    name = ('%s%s %s 至 %s' % (ONE_SHOT_PREFIX, train_numbers[0], seg['left'], seg['arrive']))[:40]
     try:
         job_id = db.job_create({
             'job_name': name,
@@ -191,7 +191,7 @@ def create_order():
         CommonLog.add_quick_log('webx 即时任务车次详情缓存启动失败: %s' % e).flush()
 
     CommonLog.add_quick_log(
-        'webx 立即预定: %s %s %s→%s 席别 %s 乘车人 %s'
+        'webx 立即预定: %s %s %s 至 %s 席别 %s 乘车人 %s'
         % (train_numbers[0], train_date, seg['left'], seg['arrive'],
            '、'.join(seats), '、'.join(members))).flush()
 

@@ -814,7 +814,7 @@ def _note_station_skip(job, train_number, actual_left='', actual_arrive=''):
         nums = getattr(job, '_webx_station_skip_trains', None)
         if nums is None:
             nums = job._webx_station_skip_trains = []
-        route = '%s→%s' % (actual_left or '未知', actual_arrive or '未知')
+        route = '%s 至 %s' % (actual_left or '未知', actual_arrive or '未知')
         detail = '%s（%s）' % (train_number, route) if train_number else route
         if detail not in nums:
             nums.append(detail)
@@ -832,7 +832,7 @@ def _warn_station_unresolved(job, code, side, actual_left='', actual_arrive=''):
             return
         warned.add(key)
         train = _call(job, 'get_info_of_train_number') or '未知车次'
-        route = '%s→%s' % (actual_left or '未知站', actual_arrive or '未知站')
+        route = '%s 至 %s' % (actual_left or '未知站', actual_arrive or '未知站')
         message = '%s车次 %s（%s）站点解析失败：%s站电报码 %s 未映射' % (_jn(job), train, route, side, code or '空')
         from py12306.log.common_log import CommonLog
         CommonLog.add_quick_log(message).flush()
@@ -1006,7 +1006,7 @@ def _hook_query_train_log():
             if route and job.allow_train_numbers:
                 left = route.get('left') or ''
                 arrive = route.get('arrive') or ''
-                numbers = '，'.join('%s(%s→%s)' % (n, left, arrive) for n in job.allow_train_numbers)
+                numbers = '，'.join('%s(%s 至 %s)' % (n, left, arrive) for n in job.allow_train_numbers)
             logger.add_log('筛选车次：{}'.format(numbers))
             logger.add_log('')
         logger.flush()
@@ -1024,7 +1024,7 @@ def _hook_query_train_log():
                 if number and str(content).strip() == number:
                     _, left, arrive = _row_station_ok(job)
                     if left or arrive:
-                        content = '%s（%s→%s）' % (content, left or '未知', arrive or '未知')
+                        content = '%s（%s 至 %s）' % (content, left or '未知', arrive or '未知')
             except Exception:
                 pass
         return original(cls, content, *args, **kwargs)

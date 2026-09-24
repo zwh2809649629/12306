@@ -30,9 +30,9 @@ def _norm_period(value, dflt):
 def _default_name(stations, dates):
     pairs = [s for s in (stations or []) if s.get('left') and s.get('arrive')]
     if len(pairs) == 1:
-        seg = pairs[0]['left'] + '→' + pairs[0]['arrive']
+        seg = pairs[0]['left'] + ' 至 ' + pairs[0]['arrive']
     elif pairs:
-        seg = pairs[0]['left'] + '⇌' + pairs[-1]['left'] + '等%d区间' % len(pairs)
+        seg = pairs[0]['left'] + ' 至 ' + pairs[-1]['arrive'] + '等%d个区间' % len(pairs)
     else:
         seg = '未命名区间'
     date_part = ''
@@ -161,7 +161,7 @@ def create_job():
     # 不写出来用户根本不知道「广州」= 6 个站、「广州南」= 只 1 个站。
     if hints:
         for h in hints:
-            CommonLog.add_quick_log('webx 区间站点(%s): %s → %s'
+            CommonLog.add_quick_log('webx 区间站点(%s): %s 至 %s'
                                     % (station_mode, h['input'], h['note'])).flush()
     return {'code': 0, 'msg': '已创建',
             'data': {'job_id': job_id, 'station_notes': hints or [], 'station_mode': station_mode,
