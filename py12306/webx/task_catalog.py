@@ -142,9 +142,9 @@ def _build_and_save(app, job_id, generation):
         for date in dates:
             if not _current(job_id, generation):
                 return
-            path = '/api/tickets?' + urlencode({
-                'left': left, 'arrive': arrive, 'date': str(date), 'station_mode': mode,
-            })
+            params = {'left': left, 'arrive': arrive, 'date': str(date)}
+            params['station_mode'] = mode
+            path = '/api/tickets?' + urlencode(params)
             result = _invoke_route(app, tickets, path)
             if result.get('code') != 0:
                 errors.append(str(result.get('msg') or '车票查询失败'))

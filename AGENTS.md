@@ -90,7 +90,7 @@ py12306/                   原版引擎（不要改）
   └ webx/                  ★ 所有二次开发代码都在这
       ├ config_store.py        webx.json 读写（原子写 + 密钥脱敏）
       ├ db.py                  SQLite 封装（唯一数据源）
-      ├ sync.py                webx(db/json) → 原版 Config 的桥接      ├─ stations.py            ★ 站名解析（本地表 ∪ 12306 官方表；同城站前缀展开）
+      ├ sync.py                webx(db/json) → 原版 Config 的桥接      ├─ stations.py            ★ 站名解析（本地表 ∪ 12306 官方表；城市按官方归属扩展）
       ├ task_catalog.py         任务创建/更新时预取车次与经停站，详情页只读缓存
       ├ webx12306.py           独立 12306 登录助手（扫码/密码/乘客）
       ├ engine_hooks.py        ★ 包装原引擎方法（不改原文件的扩展方式）
@@ -400,6 +400,8 @@ if self.allow_train_numbers: return self.get_info_of_train_number() in ...   # �
 ```
 时段是 **AND 条件且优先级高于车次白名单** → 能**静默否决**已明确要抢的车次。
 所以「车次查询」模式一律强制全天时段。
+原生 `Job.init_data()` 和 `Job.is_trains_number_valid()` 曾把 `HH:MM` 的分钟误传给 `timedelta.seconds`，
+导致 `15:50` 被解释成 `15:00:50`。`engine_hooks` 用 WebX 包装按 `timedelta(minutes=...)` 校正上下界和出发时间，不改原生文件。
 
 ### 5.15 静默失效三连（都是"看着成功、实际没生效"）
 
@@ -490,6 +492,11 @@ if self.allow_train_numbers: return self.get_info_of_train_number() in ...   # �
 ——用锁与运行标记保证同一时刻只有一个查询循环；任务变更后若存在可运行 Job
 且循环已退出，则以 daemon 线程重启 `start()`；刷新前先摘掉已 `destroy` 的 Job，
 使「暂停后再启用」能重建实例。
+
+账号临时过期/重新扫码时，`Job.check_passengers()` 不应因当前没有就绪 UserJob 就调用
+`destroy()`：WebX 包装应保留任务，等待账号恢复；已就绪但确实找不到所选乘客才按原逻辑结束。
+`ConfigSync.publish_jobs()` 在 `new == old` 时仍要核对 Query.jobs；若 DB 有 active、未结束任务但引擎实例缺失，
+就调用 `Query.update_query_jobs(auto=True)` 重建。30 秒对账守护负责兜底补载，但未来定时任务不提前放入 Query。
 
 ### 5.20 ★ 任务只能用 `Job.id` 定位，不能用 `job_name`
 
@@ -773,8 +780,8 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
 
 **修法（两个层面）**：
 
-1. **引擎侧（核心）**：`engine_hooks._hook_station_filter()` 包装 `Job.is_trains_number_valid`，
-   在原有判断之上再加一道**站点校验** —— 行的实际到发站必须落在用户输入的「前缀展开集合」里。
+1. **引擎侧（核心）**：`engine_hooks._hook_station_filter()` 包装 `Job.is_trains_number_valid`。
+   所有查询模式均按 `station_mode` 校验行的实际上下车站；车次查询另需满足 `train_numbers` 白名单。两项是 AND 条件。
    判断逻辑在 `py12306/webx/stations.py`：
 
    | 输入 | 实际允许的站 | 说明 |
@@ -793,6 +800,7 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
    - 首批余票响应处理完成后，如果有车次被拦，会写一条 `job_event`（kind `skip`，标签「站点过滤」）
      和一条汇总日志：`已按站点过滤 N 条非目标车站的车次`。每个引擎 Job 实例只输出一次，
      后续轮询继续累计过滤，但不重复刷屏；任务重新创建后重新统计。
+   - 每车次查询行和站点过滤汇总都记录原始票行的实际起站→到站，不能只看任务配置区间推断票行站点。
 
 2. **界面侧**：区间输入框从「纯文本盲打」升级为
    - 带**车站联想下拉**（与车票查询页起终点输入框同一套：`bindStationSuggest` 已泛化，
@@ -812,7 +820,7 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
    | 取值 | 含义 | 例（输入 `广州`） |
    |---|---|---|
    | `exact`（**默认**，UI 在**左**侧） | 仅指定站名：只认完全同名的站 | 只 1 个（广州站） |
-   | `expand`（UI 右侧） | 同城站扩展：城市名匹配该城市全部车站，具体站只匹配自己 | 10 个广州站 |
+   | `expand`（UI 右侧） | 同城站扩展：城市名匹配官方归属的全部车站，具体站只匹配自己 | 该城市全部车站 |
 
    - 默认取 `exact`：最不容易买错站（就是 §5.25 这个 bug 的根因所在）。
    - `exact` 下输入不是**完整站名**（如 `番`）时 `create_job` 直接 400 ——
@@ -841,10 +849,8 @@ if self.get_last_heartbeat() and (time_int() - self.get_last_heartbeat()) < Conf
 `skip | 站点过滤 | 已按站点过滤 N 条非目标车站的车次`（每个任务实例一次）。
 
 **⚠️ 后续注意**：
-- 前缀规则是**近似**（12306 的同城扩展是按城市码，不是按名字前缀）——
-  例如「广州」匹配不到 `番禺 / 花都 / 新塘`（它们不以「广州」开头，虽然同城）。
-  所以界面**必须把那行匹配说明露出来**；用户真想要这些站时，
-  显式加多组区间（`深圳北→番禺`）即可，不要偷偷放宽规则。
+- `expand` 使用 12306 官方站名表里的 city 归属，而非站名前缀；城市名扩展该城市全部车站，具体站名仍只匹配该站。
+- 界面匹配说明应展示实际展开结果。
 - 本地站点表与官方表的合并入口是 `webx/stations.py`；`routes_tickets` 的
   站名→电报码解析也走它（不要再在别处各写一份站名表）。
 
@@ -914,6 +920,7 @@ Job.start() 每轮结束: if is_main_thread(): QueryLog.flush(sep='\t\t', publis
 
 任务创建或修改查询范围（区间、日期、车次白/黑名单、时段、站点模式）时，
 `webx/task_catalog.py` 在后台按任务过滤条件查询车次并预取经停站，写入 `job_train_catalog`。
+所有模式的目录查询都按 `station_mode` 过滤，再按白/黑名单和时段过滤；车次查询也不能省略站点匹配。
 详情页只读取该缓存，不调用车票查询或经停站接口。任务删除时 `DataStore.job_delete()` 同时删除缓存；
 WebX 启动时为没有缓存的旧任务补建。缓存还未完成时详情显示准备中，完成后刷新详情即可读取。
 缓存完成但车次为空时，`job_event` 和 `webx.log` 记录带任务名的「条件筛选未找到有效车次」警告，任务卡片与详情页同时显示；
@@ -1102,7 +1109,8 @@ c = create_app().test_client()          # 然后 c.get('/api/xxx')
 
 | 项 | 状态 |
 |---|---|
-| **任务级「开始时间」「查询间隔」** | 已落库（`job.start_at` / `interval_min/max`）+ UI 已标注「待引擎支持」，但**引擎侧尚未消费**。需要：`sync.job_info_dict()` 加 `interval`/`start_at` 键 → 会改变 `Job.id`（md5 of info dict）→ **一次性任务重建**；`Job.update_interval()` 优先用任务级间隔；调度层支持 `start_at`。 |
+| **任务级开始时间** | 已支持北京时间秒级一次性调度；未来任务暂不进入 `QUERY_JOBS`，到点后由 WebX 任务级线程启动，避免默认串行循环延迟。时间不放进 `job_info_dict()`，保持 `Job.id` 稳定。服务错过目标时间后恢复时立即启动；暂停/删除会取消计划。API 显式校验 `start_mode`，选择 `at` 却未提交 `start_at` 时拒绝创建；创建日志记录最终模式和时间。 |
+| **任务级查询间隔** | `interval_min/max` 已落库但引擎仍只使用全局 `QUERY_INTERVAL`，尚未消费。 |
 | **候补购票** | 引擎不支持（`Job.is_has_ticket` 要求 `order_text == '预订'`），接口不提供 waiting 模式。 |
 | **中转方案** | `routes_tickets` 只返回直达。 |
 | **票价** | 已是 12306 **真实票价**（`/api/tickets/prices` 逐车次查，见 §5.22）。

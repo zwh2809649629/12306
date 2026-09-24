@@ -293,6 +293,8 @@ class ConfigSync:
         for job in db.job_list():
             if not job.get('is_active'):
                 continue  # 暂停的任务从 QUERY_JOBS 摘除（destroy 既有 Job）
+            if job.get('finished_at'):
+                continue  # 任务结束后只有显式重新启用（清掉 finished_at）才重建
             if job.get('job_id') in done_ids:
                 # 自愈：已出票的任务不该再进 QUERY_JOBS，否则引擎会重建 Job 继续查询
                 # （列表显示「已完成」、日志却还在刷查询）。
@@ -306,6 +308,14 @@ class ConfigSync:
                 except Exception:
                     pass
                 continue
+            # Future tasks remain in webx.db until their China-time deadline.
+            # Keeping them out of QUERY_JOBS guarantees the engine cannot query early.
+            try:
+                from py12306.webx.job_schedule import is_future_start
+                if is_future_start(job.get('start_at')):
+                    continue
+            except Exception:
+                pass
             out.append(cls.job_info_dict(job))
         return out
 
@@ -315,8 +325,28 @@ class ConfigSync:
         old = Config().QUERY_JOBS
         Config().QUERY_JOBS = new
         _bump_envs('QUERY_JOBS')
+        try:
+            from py12306.webx.job_schedule import notify_schedule_changed
+            notify_schedule_changed()
+        except Exception:
+            pass
         if auto is None: auto = not first
-        if auto and new != old:
+        refresh_engine = bool(auto and new != old)
+        if auto and not refresh_engine:
+            # A destroyed Job may be absent from Query.jobs even though the DB/Config
+            # still contains the same active definition. Recreate that missing instance.
+            try:
+                from py12306.query.query import Query
+                query = Query.__dict__.get('__it__')
+                if query is not None and getattr(query, 'is_ready', False):
+                    from py12306.helpers.func import md5
+                    expected = {str(md5(info)) for info in new}
+                    alive = {str(getattr(job, 'id', '') or '') for job in (query.jobs or [])
+                             if getattr(job, 'is_alive', False)}
+                    refresh_engine = expected != alive
+            except Exception:
+                pass
+        if refresh_engine:
             try:
                 from py12306.query.query import Query
                 Query().update_query_jobs(auto=True)

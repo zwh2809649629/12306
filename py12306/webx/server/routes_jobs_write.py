@@ -114,10 +114,21 @@ def create_job():
         tiers = [t for t in tiers if t] or [seats]
     else:
         tiers = [seats]
-    # 定时开始（引擎尚未支持，先落库；格式 'YYYY-MM-DD HH:MM'，非法则视为未设置）
-    start_at = str(body.get('start_at') or '').strip()
-    if start_at and not re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$', start_at):
+    # 定时开始按北京时间存储，支持到秒；非法时间和已过期的新时间明确拒绝。
+    from py12306.webx.job_schedule import is_future_start, normalize_start_at
+    try:
+        start_at = normalize_start_at(body.get('start_at'))
+    except ValueError as exc:
+        return {'code': 1, 'msg': str(exc), 'data': None}
+    start_mode = str(body.get('start_mode') or ('at' if start_at else 'now')).strip().lower()
+    if start_mode not in ('now', 'at'):
+        return {'code': 1, 'msg': '开始模式无效，请重新选择', 'data': None}
+    if start_mode == 'at' and not start_at:
+        return {'code': 1, 'msg': '已选择定时开始，请填写到秒的开始时间', 'data': None}
+    if start_mode == 'now':
         start_at = ''
+    if start_at and not is_future_start(start_at):
+        return {'code': 1, 'msg': '定时开始时间必须晚于当前北京时间', 'data': None}
     job_id = db.job_create({
         'job_name': name,
         'account_key': account_key,
@@ -144,7 +155,8 @@ def create_job():
         enqueue_job_catalog(current_app._get_current_object(), job_id)
     except Exception as e:
         CommonLog.add_quick_log('webx 任务车次详情缓存启动失败: %s' % e).flush()
-    CommonLog.add_quick_log('webx 创建任务: %s (%s)' % (name, job_id)).flush()
+    start_note = ('定时开始 北京时间 ' + start_at) if start_at else '立即开始'
+    CommonLog.add_quick_log('webx 创建任务: %s (%s) [%s]' % (name, job_id, start_note)).flush()
     # 把「区间 → 实际匹配的车站」回给前端写进日志：同城扩展是引擎侧的过滤规则，
     # 不写出来用户根本不知道「广州」= 6 个站、「广州南」= 只 1 个站。
     if hints:
@@ -152,7 +164,8 @@ def create_job():
             CommonLog.add_quick_log('webx 区间站点(%s): %s → %s'
                                     % (station_mode, h['input'], h['note'])).flush()
     return {'code': 0, 'msg': '已创建',
-            'data': {'job_id': job_id, 'station_notes': hints or [], 'station_mode': station_mode}}
+            'data': {'job_id': job_id, 'station_notes': hints or [], 'station_mode': station_mode,
+                     'start_mode': start_mode, 'start_at': start_at}}
 
 
 @bp.route('/api/jobs/toggle', methods=['POST'])
@@ -207,10 +220,31 @@ def update_job(job_id):
         qm = str(body.get('query_mode') or '').strip().lower()
         if qm in ('train', 'range'):
             patch['query_mode'] = qm
-    # 定时开始：与 create 同一套校验（非法则视为未设置）
-    if 'start_at' in body:
-        sa = str(body.get('start_at') or '').strip()
-        patch['start_at'] = sa if re.match(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$', sa) else ''
+    # 定时开始：接受旧的分钟格式并补秒；新改的时间必须在未来。
+    if 'start_at' in body or 'start_mode' in body:
+        from py12306.webx.job_schedule import is_future_start, normalize_start_at
+        try:
+            raw_start = body.get('start_at') if 'start_at' in body else j.get('start_at')
+            sa = normalize_start_at(raw_start)
+        except ValueError as exc:
+            return {'code': 1, 'msg': str(exc), 'data': None}
+        try:
+            old_sa = normalize_start_at(j.get('start_at'))
+        except ValueError:
+            old_sa = ''
+        start_mode = str(body.get('start_mode') or ('at' if sa else 'now')).strip().lower()
+        if start_mode not in ('now', 'at'):
+            return {'code': 1, 'msg': '开始模式无效，请重新选择', 'data': None}
+        if start_mode == 'at' and not sa:
+            return {'code': 1, 'msg': '已选择定时开始，请填写到秒的开始时间', 'data': None}
+        if start_mode == 'now':
+            sa = ''
+        if sa and sa != old_sa and not is_future_start(sa):
+            return {'code': 1, 'msg': '新的定时开始时间必须晚于当前北京时间', 'data': None}
+        patch['start_at'] = sa
+        if sa and sa != old_sa:
+            patch['finished_at'] = None
+            patch['finish_reason'] = None
     for field in ('period_from', 'period_to'):
         if field in body:
             patch[field] = _norm_period(body.get(field), j.get(field) or ('00:00' if field == 'period_from' else '24:00'))

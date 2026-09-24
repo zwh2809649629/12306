@@ -154,10 +154,11 @@ def _job_status(job, active, alive, acc_ready, order_success, paying):
        因为暂停会从 QUERY_JOBS 摘除任务 → 引擎 `Job.destroy()` → 我们的钩子
        会写 finished_at，若先判 finished_at 就会把「已暂停」错显示成「已结束」。
     3. 引擎已结束（finished_at）→ finished。
-    4. 账号掉了 → blocked：引擎卡在 `wait_for_ready()`，一条查询都发不出去，
+    4. 开始时间仍在未来 → scheduled（任务已启用，但尚未进入查询）。
+    5. 账号掉了 → blocked：引擎卡在 `wait_for_ready()`，一条查询都发不出去，
        **绝不能显示「运行中」**（用户就是这样「卡住没提示」）。
-    5. 在内存且存活 → running。
-    6. 其余 → pending（已启用但还未被引擎加载）。
+    6. 在内存且存活 → running。
+    7. 其余 → pending（已启用但还未被引擎加载）。
     """
     if order_success:
         return 'paying' if paying else 'completed'
@@ -165,6 +166,12 @@ def _job_status(job, active, alive, acc_ready, order_success, paying):
         return 'paused'
     if job.get('finished_at'):
         return 'finished'
+    try:
+        from py12306.webx.job_schedule import is_future_start
+        if is_future_start(job.get('start_at')):
+            return 'scheduled'
+    except Exception:
+        pass
     if not acc_ready:
         return 'blocked'
     if alive:
@@ -172,12 +179,10 @@ def _job_status(job, active, alive, acc_ready, order_success, paying):
     return 'pending'
 
 
-# 列表排序权重（用户明确指定的顺序）：
-#   运行中 > 下单成功未超过30分钟(待支付) > 账号未登录 > 待启动
-#          > 已暂停 > 已完成(超时) > 已结束
+# 列表排序权重：运行中 / 待支付优先，其次账号阻塞与定时中，再到待启动和终态。
 # 放在后端是为了让「抢票任务」与「总览」两处顺序天然一致。
-_STATUS_RANK = {'running': 0, 'paying': 1, 'blocked': 2, 'pending': 3,
-                'paused': 4, 'completed': 5, 'finished': 6}
+_STATUS_RANK = {'running': 0, 'paying': 1, 'blocked': 2, 'scheduled': 3, 'pending': 4,
+                'paused': 5, 'completed': 6, 'finished': 7}
 
 
 def status_rank(status):
@@ -227,6 +232,11 @@ def _job_view(job, db):
     catalog = db.job_catalog_get(job['job_id'])
     catalog_state = (catalog or {}).get('state') or 'missing'
     catalog_count = int((catalog or {}).get('train_count') or 0)
+    try:
+        from py12306.webx.job_schedule import normalize_start_at
+        start_at = normalize_start_at(job.get('start_at'))
+    except Exception:
+        start_at = job.get('start_at') or ''
     return {
         'job_id': job['job_id'],
         'job_name': job.get('job_name') or '',
@@ -262,7 +272,7 @@ def _job_view(job, db):
         'allow_less_member': bool(job.get('allow_less_member')),
         'period': {'from': job.get('period_from') or '00:00', 'to': job.get('period_to') or '24:00'},
         'interval': {'min': job.get('interval_min'), 'max': job.get('interval_max')},
-        'start_at': job.get('start_at') or '',
+        'start_at': start_at,
         'query_mode': job.get('query_mode') or '',
         # 站点匹配方式：exact=仅指定站名（新建任务的默认）/ expand=同城站扩展（「广州」= 10 个站）。
         # 12306 的余票结果本来就会混入同城其它站（AGENTS.md §5.25），这里决定过滤的宽严。

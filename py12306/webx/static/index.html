@@ -636,13 +636,13 @@ body.hr-dragging{cursor:grabbing; user-select:none}
                      它的提示就掉到了右列（查询间隔）内容的下方，读起来像是查询间隔的说明。 -->
                 <div class="stg-grid">
                   <div class="stg-card">
-                    <div class="stg-head">开始时间<span class="pending-tag" title="需要 py12306 抢票引擎支持，当前版本保存后尚未生效">待引擎支持</span></div>
+                    <div class="stg-head">开始时间<span class="opt-x">北京时间 · 精确到秒</span></div>
                     <div class="seg" id="ntStartMode">
                       <button type="button" class="seg-btn on" data-start="now">立即开始</button>
                       <button type="button" class="seg-btn" data-start="at">定时开始</button>
                     </div>
-                    <input class="ctl" id="ntStartAt" type="datetime-local" disabled>
-                    <div class="stg-hint">选「定时开始」后需填写开始时间；需引擎侧新增调度能力才会生效。</div>
+                    <input class="ctl" id="ntStartAt" type="datetime-local" step="1" disabled>
+                    <div class="stg-hint">到达所选秒数后触发查询；服务停机错过时间会在恢复后立即补启动，手动暂停的任务需重新启用。</div>
                   </div>
                   <div class="stg-card">
                     <div class="stg-head">查询间隔（秒）<span class="pending-tag" title="需要 py12306 抢票引擎支持，当前版本保存后尚未生效">待引擎支持</span></div>
@@ -674,7 +674,7 @@ body.hr-dragging{cursor:grabbing; user-select:none}
                   <div class="en-row"><span class="en-k">命中规则</span><span class="en-v">按座次优先级依次检查，首个「余票 ≥ 乘车人数」的席别立即提交下单</span></div>
                   <div class="en-row"><span class="en-k">余票不足</span><span class="en-v" id="ntMemberNote">—</span></div>
                   <div class="en-row"><span class="en-k">任务结束</span><span class="en-v">下单成功即自动结束该任务（一次性）</span></div>
-                  <div class="en-row"><span class="en-k">当前不支持</span><span class="en-v">候补购票；开始时间与任务级查询间隔已预留，待引擎侧实现</span></div>
+                  <div class="en-row"><span class="en-k">当前不支持</span><span class="en-v">候补购票；任务级查询间隔仍使用全局设置</span></div>
                 </div>
                 <div class="query-load" id="ntQueryLoadHint" style="margin-top:12px">—</div>
               </div></div></div>

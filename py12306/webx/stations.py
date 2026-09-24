@@ -16,12 +16,9 @@
    引擎会把「深圳北 → 广州东」的票也一起抢下来（实测真的下了单）。
    修法见 `engine_hooks._hook_station_filter()`：按 `expand()` 的结果过滤行的实际站。
 
-`expand()` 用的是**前缀规则**（与 12306 站名命名规则一致：城市名 + 方位）：
-    深圳北 → [深圳北]                                  ← 具体站只匹配自己
-    广州南 → [广州南]
-    广州   → [广州, 广州东, 广州南, 广州西, 广州北, 广州白云]   ← 城市名保留「全站」语义
-    北京   → [北京, 北京东, 北京南, 北京西, 北京北, 北京朝阳, 北京丰台, 北京大兴]
-    番禺   → [番禺]（只有官方表有）
+`expand()` 优先使用 12306 官方站名表的城市归属：城市名扩展到该城市全部车站，
+具体站名仍只匹配该站（例如「茂名」包含「马踏」，「茂名南」仍只匹配茂名南）。
+官方城市元数据暂不可用时才退回名称前缀匹配。
 **未知站名返回 None**（而不是空集合）—— 调用方据此「不过滤」，
 避免把用户输错的站名变成「一条也抢不到」的静默失败。
 """
@@ -40,6 +37,7 @@ _STATION_JS_RETRY = 300               # 拉取失败后的重试间隔（别把 
 
 _state = {
     'official': None,                 # name → 电报码
+    'cities': None,                   # station name → official city name
     'official_at': 0.0,
     'busy': False,
     'extra': {},                      # 余票响应 data.map 累积的 name → 电报码
@@ -53,6 +51,10 @@ def _cache_path():
     return Config().RUNTIME_DIR + 'station_codes.json'
 
 
+
+
+def _city_cache_path():
+    return Config().RUNTIME_DIR + 'station_cities.json'
 def _read_disk():
     path = _cache_path()
     try:
@@ -67,6 +69,7 @@ def _read_disk():
 def _fetch_official(session=None):
     """从 12306 拉站名表；`station_names = '@拼音|站名|电报码|...@...'`"""
     table = {}
+    cities = {}
     try:
         if session is None:
             from py12306.webx.server.routes_tickets import _query_session     # 延迟导入避免循环
@@ -78,7 +81,16 @@ def _fetch_official(session=None):
                 parts = item.split('|')
                 if len(parts) >= 3 and parts[1] and parts[2]:
                     table[parts[1]] = parts[2].upper()
+                    # 官方表第 8 列（parts[7]）为车站所属城市；名称不一定有前缀关系。
+                    if len(parts) >= 8 and parts[7]:
+                        cities[parts[1]] = parts[7]
         if table:
+            if cities:
+                path = _city_cache_path()
+                with open(path + '.tmp', 'w', encoding='utf-8') as fh:
+                    json.dump(cities, fh, ensure_ascii=False)
+                os.replace(path + '.tmp', path)
+                _state['cities'] = cities
             path = _cache_path()
             with open(path + '.tmp', 'w', encoding='utf-8') as fh:
                 json.dump(table, fh, ensure_ascii=False)
@@ -166,9 +178,37 @@ def code_of(name):
     return (official() or {}).get(s)
 
 
+def city_map():
+    """官方车站所属城市映射；旧 station_codes 缓存不含城市字段，故单独懒加载。"""
+    if _state['cities']:
+        return _state['cities']
+    path = _city_cache_path()
+    try:
+        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < _STATION_JS_TTL:
+            with open(path, 'r', encoding='utf-8') as fh:
+                value = json.load(fh) or {}
+            if value:
+                _state['cities'] = value
+                return value
+    except Exception:
+        pass
+    try:
+        with _lock:
+            if not _state['cities'] and not _state['busy']:
+                _state['busy'] = True
+                try:
+                    _fetch_official()
+                finally:
+                    _state['busy'] = False
+                    _state['official_at'] = time.time()
+    except Exception:
+        pass
+    return _state['cities'] or {}
+
+
 def expand(name):
     """
-    该输入会匹配到的**实际车站名**列表（前缀规则，具体站只匹配自己）。
+    该输入会匹配到的**实际车站名**列表（城市按官方归属展开，具体站只匹配自己）。
 
     - 解析不出来（不在任何站名表里）→ 返回 `None`，调用方应据此**不过滤**，
       避免把输错的站名变成「一条也抢不到」的静默失败。
@@ -177,7 +217,15 @@ def expand(name):
     s = str(name or '').strip()
     if not s:
         return None
-    hit = [n for n in names() if n.startswith(s)]
+    all_names = names()
+    cities = city_map()
+    # 城市名按官方 city 字段展开，覆盖「马踏」这样的非前缀同城站。
+    if s in set(cities.values()):
+        hit = [station for station, city in cities.items() if city == s]
+        if hit:
+            return sorted(set(hit), key=lambda n: (len(n), n))
+    # 具体站名仍只匹配自身；不完整输入保留前缀提示行为。
+    hit = [n for n in all_names if n.startswith(s)]
     if not hit:
         return None
     hit.sort(key=lambda n: (len(n), n))
@@ -225,8 +273,7 @@ def describe(name, mode='exact'):
     `mode`（默认 `exact`，与新建任务的默认一致）：
       - `exact`（仅指定站名）：只认完全同名的站 —— `广州` 只算 `广州` 一个站。
         输入不是完整站名（如 `番`）时无法工作，界面要能看出来。
-      - `expand`（同城站扩展）：按前缀展开 —— `广州` 会匹配 10 个广州站，
-        `深圳北` 只匹配自己。这是 12306 查询结果的实际形态（同城其它站也会返回）。
+      - `expand`（同城站扩展）：城市按官方 city 归属展开，具体站（如「深圳北」）只匹配自己。
 
     `exact` 字段表示输入本身就是某个完整站名（从下拉里选过 / 手打完整）；
     `note` 是给用户看的一句话。

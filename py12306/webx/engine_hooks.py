@@ -53,6 +53,8 @@ def _set_cur_job(job):
         pass
 
 
+_TICKET_STATION_CTX = {}
+_QUERY_ROUTE_JOB_CTX = {}
 def _cur_job_name():
     try:
         import threading
@@ -166,10 +168,15 @@ def install():
         _hook_get_user_info()
         _hook_can_access_passengers()
         _hook_query_loop()
+        _hook_scheduled_job_runner()
         _hook_query_count()
         _hook_job_destroy()
         _hook_job_init_data()
+        _hook_job_check_passengers()
+        _hook_job_refresh_station()
         _hook_station_filter()
+        _hook_query_train_log()
+        _hook_ticket_station_log()
         _hook_log_thread()
         _hook_wait_for_ready()
         _hook_get_passenger_for_members()
@@ -180,8 +187,10 @@ def install():
                 'webx 引擎钩子已安装: response.json(Dict 修复) / do_order / order_did_success / '
                 'save_user(空会话守卫) / request_device_id(防递归) / qr_login(让位网页扫码) / '
                 'get_user_passengers / get_user_info(登录态确认) / can_access_passengers(就绪探针) / '
+                'train_log(车次行实际区间) / '
                 'query_loop(启用任务后自动查询) / query_count(按任务计数) / '
                 'job_destroy(结束状态落库) / station_filter(只抢指定车站，修同城站扩展误下单) / '
+                'seat_log(命中日志记录实际出发站和终点站) / '
                 'log_thread(查询循环日志落盘) / wait_ready(账号等待限频+自愈) / '
                 'get_passenger_for_members(跳过僵尸账号对象) / '
                 'order_flow(订单状态机+阶段事件+防重复提交)').flush()
@@ -272,8 +281,13 @@ def _hook_log_timestamps():
                 message = '>> 第 {query_count} 次查询 {job_name}'.format(
                     query_count=query_count, job_name=job_name)
             else:
-                message = '>> 本任务第 {query_count} 次查询 {job_name}'.format(
-                    query_count=query_count, job_name=job_name)
+                task_id = _job_id_for(job) if job is not None else None
+                if task_id:
+                    message = '>> {job_name} {task_id} 第 {query_count} 次查询。'.format(
+                        job_name=job_name, task_id=task_id, query_count=query_count)
+                else:
+                    message = '>> 本任务第 {query_count} 次查询 {job_name}'.format(
+                        query_count=query_count, job_name=job_name)
             instance.add_log(message)
             instance.refresh_data()
             if query_log_module.is_main_thread():
@@ -511,7 +525,34 @@ def _hook_query_loop():
                 return None
             self._webx_query_loop_running = True
         try:
-            return original_start(self, *args, **kwargs)
+            from py12306.config import Config
+            if Config().QUERY_JOB_THREAD_ENABLED:
+                return original_start(self, *args, **kwargs)
+
+            # Default engine mode is single-threaded. Dispatch ordinary jobs one round
+            # at a time, while scheduler-owned jobs run in their own worker and are
+            # omitted here. This avoids both duplicate execution and a busy loop when
+            # only scheduled workers remain.
+            from py12306.helpers.func import jobs_do
+            from py12306.log.query_log import QueryLog
+            from py12306.webx.job_schedule import is_engine_job_claimed, wait_query_wake
+            QueryLog.init_data()
+            while True:
+                live = [job for job in (self.jobs or []) if getattr(job, 'is_alive', True)]
+                if len(live) != len(self.jobs or []):
+                    self.jobs[:] = live
+                runnable = [job for job in live
+                            if not is_engine_job_claimed(getattr(job, 'id', ''))]
+                if runnable:
+                    jobs_do(runnable, 'run')
+                elif live:
+                    if Const.IS_TEST:
+                        return None
+                    wait_query_wake(1.0)
+                else:
+                    return None
+                if Const.IS_TEST:
+                    return None
         finally:
             with state_lock:
                 self._webx_query_loop_running = False
@@ -549,6 +590,27 @@ def _hook_query_loop():
     update_query_jobs._webx_original = original_update
     Query.start = start
     Query.update_query_jobs = update_query_jobs
+
+
+def _hook_scheduled_job_runner():
+    from py12306.query.job import Job
+    if getattr(Job.start, '_webx_schedule_wrapped', False):
+        return
+    original = Job.start
+
+    def start(self, *args, **kwargs):
+        try:
+            from py12306.webx.job_schedule import current_worker_engine_id, is_engine_job_claimed
+            engine_id = str(getattr(self, 'id', '') or '')
+            if is_engine_job_claimed(engine_id) and current_worker_engine_id() != engine_id:
+                return None
+        except Exception:
+            pass
+        return original(self, *args, **kwargs)
+
+    start._webx_schedule_wrapped = True
+    start._webx_original = original
+    Job.start = start
 
 
 # ---------------- 任务结束：Query.Job.destroy ----------------
@@ -625,6 +687,9 @@ def _record_job_finished(job):
         row = db.job_get(job_id) or {}
         if not row.get('is_active'):
             return          # 用户已暂停 → 不是「结束」，保留为 paused
+        from py12306.webx.job_schedule import is_future_start
+        if is_future_start(row.get('start_at')):
+            return          # 任务被重新排到未来：移出查询列表不代表任务已结束
     except Exception:
         pass
     reason = '引擎已结束该任务'
@@ -660,7 +725,7 @@ def _record_job_finished(job):
 # 于是「深圳北 → 广州东」(C8012) 完全符合条件 → 真的被下单（实测出了订单号）。
 #
 # 修法：包装 `Job.is_trains_number_valid`，在原有判断之上**再加一道站点校验** ——
-# 行的**实际**到发站（`ticket_info[6]/[7]`）必须落在用户输入的前缀展开集合里
+# 行的**实际**到发站（`ticket_info[6]/[7]`）必须落在用户输入对应的站点集合里
 # （规则见 `webx/stations.py`：具体站只匹配自己，城市名匹配该城市全部站）。
 # 拿不到站名 / 站名无法解析时**放行**，避免把「站名写错」变成「一条也抢不到」的静默失败。
 #
@@ -671,7 +736,7 @@ def _allowed_stations(requested, mode='expand'):
     用户输入 → 允许的实际站名集合；无法判断时返回 None（= 不拦截）。
 
     `mode`：
-      - `expand`（同城站扩展，默认）：`广州` → 10 个广州站（前缀规则）
+      - `expand`（同城站扩展，默认）：城市按 12306 官方 city 归属扩展，具体站只匹配自己
       - `exact`（仅指定站名）  ：`广州` → 只算 `广州` 一个站；
         输入不是完整站名时返回 None（= 不拦截，避免静默变成「一条也抢不到」）
     """
@@ -685,6 +750,19 @@ def _allowed_stations(requested, mode='expand'):
         return None
 
 
+def _refresh_job_query_mode(job):
+    """Refresh query_mode from the unique WebX row without changing Job.id."""
+    try:
+        from py12306.webx.db import DataStore
+        job_id = _job_id_for(job)
+        row = DataStore().job_get(job_id) if job_id else None
+        mode = str((row or {}).get('query_mode') or '').strip().lower()
+        if mode in ('train', 'range'):
+            job.webx_query_mode = mode
+    except Exception:
+        pass
+
+
 def _job_station_mode(job):
     """
     任务级站点匹配方式（由 `_hook_job_init_data` 从 job_info_dict 挂到实例上）。
@@ -696,7 +774,7 @@ def _job_station_mode(job):
 
 
 def _row_station_ok(job):
-    """行里的实际到发站是否就是用户要的那对站"""
+    """Filter actual ticket endpoints for both range and train query modes."""
     try:
         requested_left = getattr(job, 'left_station', '') or ''
         requested_arrive = getattr(job, 'arrive_station', '') or ''
@@ -709,6 +787,10 @@ def _row_station_ok(job):
         if info is not None:
             actual_left = st.name_of(info[6])
             actual_arrive = st.name_of(info[7])
+            if not actual_left:
+                _warn_station_unresolved(job, info[6], '出发', actual_left, actual_arrive)
+            if not actual_arrive:
+                _warn_station_unresolved(job, info[7], '到达', actual_left, actual_arrive)
         if not actual_left:
             actual_left = job.get_info_of_left_station()
         if not actual_arrive:
@@ -725,18 +807,38 @@ def _row_station_ok(job):
     return (actual_left in ok_l and actual_arrive in ok_r), actual_left, actual_arrive
 
 
-def _note_station_skip(job, train_number):
-    """累计当前任务首次查询结果中被站点规则过滤的车次。"""
+def _note_station_skip(job, train_number, actual_left='', actual_arrive=''):
+    """累计被过滤的车次行，并记录其实际上下车站。"""
     try:
         job._webx_station_skip_count = getattr(job, '_webx_station_skip_count', 0) + 1
         nums = getattr(job, '_webx_station_skip_trains', None)
         if nums is None:
             nums = job._webx_station_skip_trains = []
-        if train_number and train_number not in nums:
-            nums.append(train_number)
+        route = '%s→%s' % (actual_left or '未知', actual_arrive or '未知')
+        detail = '%s（%s）' % (train_number, route) if train_number else route
+        if detail not in nums:
+            nums.append(detail)
     except Exception:
         pass
 
+def _warn_station_unresolved(job, code, side, actual_left='', actual_arrive=''):
+    """Warn once when an actual ticket station code has no name mapping."""
+    try:
+        warned = getattr(job, '_webx_unresolved_station_codes', None)
+        if warned is None:
+            warned = job._webx_unresolved_station_codes = set()
+        key = '%s:%s' % (side, code)
+        if key in warned:
+            return
+        warned.add(key)
+        train = _call(job, 'get_info_of_train_number') or '未知车次'
+        route = '%s→%s' % (actual_left or '未知站', actual_arrive or '未知站')
+        message = '%s车次 %s（%s）站点解析失败：%s站电报码 %s 未映射' % (_jn(job), train, route, side, code or '空')
+        from py12306.log.common_log import CommonLog
+        CommonLog.add_quick_log(message).flush()
+        _evjob(job, 'warning', message)
+    except Exception:
+        pass
 
 def _emit_station_skip_summary(job):
     """每个 Job 实例首次完成一批余票响应后，汇总打印一次站点过滤数。"""
@@ -749,13 +851,72 @@ def _emit_station_skip_summary(job):
     trains = getattr(job, '_webx_station_skip_trains', []) or []
     message = '已按站点过滤 %d 条非目标车站的车次' % count
     if trains:
-        message += '（车次：%s%s）' % ('、'.join(trains[:8]), '…' if len(trains) > 8 else '')
+        message += '（车次及实际区间：%s%s）' % ('、'.join(trains[:8]), '…' if len(trains) > 8 else '')
     try:
         from py12306.log.common_log import CommonLog
         CommonLog.add_quick_log('%s%s' % (_jn(job), message)).flush()
     except Exception:
         pass
     _evjob(job, 'skip', message)
+
+def _webx_time_delta(value):
+    """Parse HH:MM as hours and minutes; 24:00 naturally becomes one day."""
+    from datetime import timedelta
+    try:
+        hour, minute = str(value or '').strip().split(':', 1)
+        return timedelta(hours=int(hour), minutes=int(minute))
+    except Exception:
+        return None
+
+def _hook_job_refresh_station():
+    """Resolve new stations (e.g. 茂名南) through WebX's official station map."""
+    from py12306.query.job import Job
+    if getattr(Job.refresh_station, '_webx_station_resolve_wrapped', False):
+        return
+    original = Job.refresh_station
+
+    def refresh_station(self, station, *args, **kwargs):
+        left = str((station or {}).get('left') or '').strip()
+        arrive = str((station or {}).get('arrive') or '').strip()
+        try:
+            from py12306.webx import stations as st
+            left_code = st.code_of(left)
+            arrive_code = st.code_of(arrive)
+            if left_code and arrive_code:
+                self.left_station = left
+                self.arrive_station = arrive
+                self.left_station_code = left_code
+                self.arrive_station_code = arrive_code
+                return None
+        except Exception:
+            pass
+        return original(self, station, *args, **kwargs)
+
+    refresh_station._webx_station_resolve_wrapped = True
+    refresh_station._webx_original = original
+    Job.refresh_station = refresh_station
+    for method_name, index_name in (
+            ('get_info_of_left_station', 'INDEX_LEFT_STATION'),
+            ('get_info_of_arrive_station', 'INDEX_ARRIVE_STATION')):
+        method = getattr(Job, method_name)
+        if getattr(method, '_webx_station_name_wrapped', False):
+            continue
+        original_name = method
+
+        def station_name(self, _method=original_name, _index_name=index_name):
+            try:
+                from py12306.webx import stations as st
+                index = getattr(self, _index_name)
+                name = st.name_of(self.ticket_info[index])
+                if name:
+                    return name
+            except Exception:
+                pass
+            return _method(self)
+        station_name._webx_station_name_wrapped = True
+        station_name._webx_original = original_name
+        setattr(Job, method_name, station_name)
+
 
 def _hook_station_filter():
     from py12306.query.job import Job
@@ -764,12 +925,22 @@ def _hook_station_filter():
     original = Job.is_trains_number_valid
 
     def is_trains_number_valid(self, *args, **kwargs):
-        if not original(self, *args, **kwargs):
+        left_time = _webx_time_delta(self.get_info_of_train_left_time())
+        if left_time is None:
+            return original(self, *args, **kwargs)
+        if left_time < self.from_time or left_time > self.to_time:
             return False
+        train_number = self.get_info_of_train_number().upper()
+        if self.except_train_numbers:
+            if train_number in map(str.upper, self.except_train_numbers):
+                return False
+        elif self.allow_train_numbers:
+            if train_number not in map(str.upper, self.allow_train_numbers):
+                return False
         try:
             ok, actual_left, actual_arrive = _row_station_ok(self)
             if not ok:
-                _note_station_skip(self, self.get_info_of_train_number())
+                _note_station_skip(self, self.get_info_of_train_number(), actual_left, actual_arrive)
                 return False
         except Exception:
             pass
@@ -779,9 +950,18 @@ def _hook_station_filter():
         original_handle_response = Job.handle_response
 
         def handle_response(self, *args, **kwargs):
+            import threading
+            thread_id = threading.get_ident()
+            previous = _QUERY_ROUTE_JOB_CTX.get(thread_id)
+            _QUERY_ROUTE_JOB_CTX[thread_id] = self
             try:
+                _refresh_job_query_mode(self)
                 return original_handle_response(self, *args, **kwargs)
             finally:
+                if previous is None:
+                    _QUERY_ROUTE_JOB_CTX.pop(thread_id, None)
+                else:
+                    _QUERY_ROUTE_JOB_CTX[thread_id] = previous
                 try:
                     _emit_station_skip_summary(self)
                 except Exception:
@@ -796,13 +976,137 @@ def _hook_station_filter():
     Job.is_trains_number_valid = is_trains_number_valid
 
 
+def _hook_query_train_log():
+    """Annotate per-train query lines with the response row's actual endpoints."""
+    from py12306.log.query_log import QueryLog
+    method = QueryLog.add_log
+    original = getattr(method, '__func__', method)
+    if getattr(original, '_webx_query_route_wrapped', False):
+        return
+
+    def print_init_jobs(cls, jobs):
+        logger = cls()
+        logger.add_log('# 发现 {} 个任务 #'.format(len(jobs)))
+        for index, job in enumerate(jobs, 1):
+            logger.add_log('================== 任务 {} =================='.format(index))
+            task_id = _job_id_for(job) or getattr(job, 'id', '')
+            logger.add_log('任务名称：{}'.format(job.job_name))
+            logger.add_log('任务id：{}'.format(task_id))
+            for station in job.stations:
+                logger.add_log('出发站：{} 到达站：{}'.format(station.get('left'), station.get('arrive')))
+
+            logger.add_log('乘车日期：{}'.format(job.left_dates))
+            logger.add_log('坐席：{}'.format('，'.join(job.allow_seats)))
+            logger.add_log('乘车人：{}'.format('，'.join(job.members)))
+            if job.except_train_numbers:
+                numbers = '排除 ' + '，'.join(job.except_train_numbers)
+            else:
+                numbers = '，'.join(job.allow_train_numbers if job.allow_train_numbers else ['不筛选'])
+            route = job.stations[0] if len(job.stations) == 1 else None
+            if route and job.allow_train_numbers:
+                left = route.get('left') or ''
+                arrive = route.get('arrive') or ''
+                numbers = '，'.join('%s(%s→%s)' % (n, left, arrive) for n in job.allow_train_numbers)
+            logger.add_log('筛选车次：{}'.format(numbers))
+            logger.add_log('')
+        logger.flush()
+        return logger
+    print_init_jobs._webx_query_route_wrapped = True
+    QueryLog.print_init_jobs = classmethod(print_init_jobs)
+
+
+    def add_log(cls, content='', *args, **kwargs):
+        import threading
+        job = _QUERY_ROUTE_JOB_CTX.get(threading.get_ident())
+        if job:
+            try:
+                number = str(job.get_info_of_train_number() or '').strip()
+                if number and str(content).strip() == number:
+                    _, left, arrive = _row_station_ok(job)
+                    if left or arrive:
+                        content = '%s（%s→%s）' % (content, left or '未知', arrive or '未知')
+            except Exception:
+                pass
+        return original(cls, content, *args, **kwargs)
+
+    add_log._webx_query_route_wrapped = True
+    add_log._webx_original = original
+    QueryLog.add_log = classmethod(add_log)
+
+
+
+def _hook_ticket_station_log():
+    """Append actual ticket endpoints to the seat-hit log without touching native files."""
+    from py12306.query.job import Job
+    from py12306.log.query_log import QueryLog
+
+    bound_log = QueryLog.print_ticket_seat_available
+    original_log = getattr(bound_log, '__func__', bound_log)
+    if not getattr(original_log, '_webx_station_log_wrapped', False):
+        def print_ticket_seat_available(cls, left_date, train_number, seat_type, rest_num):
+            import threading
+            route = _TICKET_STATION_CTX.get(threading.get_ident())
+            if not route or not (route[0] or route[1]):
+                return original_log(cls, left_date, train_number, seat_type, rest_num)
+            from_station, to_station = route
+            try:
+                logger = cls()
+                logger.add_quick_log(
+                    '[ 查询到座位可用 出发时间 {left_date} 车次 {train_number} '
+                    '出发站 {from_station} 终点站 {to_station} '
+                    '座位类型 {seat_type} 余票数量 {rest_num} ]'.format(
+                        left_date=left_date, train_number=train_number,
+                        from_station=from_station or '未知', to_station=to_station or '未知',
+                        seat_type=seat_type, rest_num=rest_num))
+                logger.flush()
+                return logger
+            except Exception:
+                return original_log(cls, left_date, train_number, seat_type, rest_num)
+
+        print_ticket_seat_available._webx_station_log_wrapped = True
+        print_ticket_seat_available._webx_original = original_log
+        QueryLog.print_ticket_seat_available = classmethod(print_ticket_seat_available)
+
+    if getattr(Job.handle_seats, '_webx_station_log_wrapped', False):
+        return
+    original_handle_seats = Job.handle_seats
+
+    def handle_seats(self, *args, **kwargs):
+        import threading
+        ticket_info = args[1] if len(args) > 1 else kwargs.get('ticket_info')
+        route = ('', '')
+        try:
+            from py12306.webx import stations as st
+            if ticket_info is not None and len(ticket_info) > 7:
+                route = (st.name_of(ticket_info[6]) or '', st.name_of(ticket_info[7]) or '')
+            if not route[0]:
+                route = (self.get_info_of_left_station() or '', route[1])
+            if not route[1]:
+                route = (route[0], self.get_info_of_arrive_station() or '')
+        except Exception:
+            pass
+        thread_id = threading.get_ident()
+        previous = _TICKET_STATION_CTX.get(thread_id)
+        _TICKET_STATION_CTX[thread_id] = route
+        try:
+            return original_handle_seats(self, *args, **kwargs)
+        finally:
+            if previous is None:
+                _TICKET_STATION_CTX.pop(thread_id, None)
+            else:
+                _TICKET_STATION_CTX[thread_id] = previous
+
+    handle_seats._webx_station_log_wrapped = True
+    handle_seats._webx_original = original_handle_seats
+    Job.handle_seats = handle_seats
+
+
 def _hook_job_init_data():
     """
     把 webx 自有任务字段挂到引擎 Job 实例上。
 
-    引擎的 `Job.init_data` 只读它认识的键，`job_info_dict` 里多出来的
-    `webx_station_mode` 会被丢掉；而站点过滤（`_hook_station_filter`）需要它。
-    包一层把它存到实例上，避免每行都去查一次数据库。
+    引擎的 `Job.init_data` 只读它认识的键，`webx_station_mode` 需挂到实例供区间查询过滤；
+    `query_mode` 则按 webx_id 从数据库读取一次，与车次白名单、站点过滤联合生效，不改变 Job.id。
     """
     from py12306.query.job import Job
     if getattr(Job.init_data, '_webx_wrapped', False):
@@ -812,8 +1116,25 @@ def _hook_job_init_data():
     def init_data(self, info, *args, **kwargs):
         result = original(self, info, *args, **kwargs)
         try:
+            period = info.get('period') if isinstance(info, dict) else None
+            if isinstance(period, dict):
+                for key, attr in (('from', 'from_time'), ('to', 'to_time')):
+                    if key in period:
+                        parsed = _webx_time_delta(period.get(key))
+                        if parsed is not None:
+                            setattr(self, attr, parsed)
             if isinstance(info, dict) and 'webx_station_mode' in info:
                 self.webx_station_mode = info.get('webx_station_mode')
+            self.webx_query_mode = 'range'
+            if isinstance(info, dict) and info.get('webx_id'):
+                try:
+                    from py12306.webx.db import DataStore
+                    row = DataStore().job_get(str(info.get('webx_id')))
+                    mode = str((row or {}).get('query_mode') or '').strip().lower()
+                    if mode in ('train', 'range'):
+                        self.webx_query_mode = mode
+                except Exception:
+                    pass
             self._webx_station_skip_count = 0
             self._webx_station_skip_trains = []
             self._webx_station_skip_logged = False
@@ -824,6 +1145,36 @@ def _hook_job_init_data():
     init_data._webx_wrapped = True
     init_data._webx_original = original
     Job.init_data = init_data
+
+
+def _hook_job_check_passengers():
+    """Do not destroy a task just because its account is temporarily recovering."""
+    from py12306.query.job import Job
+    if getattr(Job.check_passengers, '_webx_account_wait_wrapped', False):
+        return
+    original = Job.check_passengers
+
+    def check_passengers(self, *args, **kwargs):
+        if getattr(self, 'passengers', None):
+            return original(self, *args, **kwargs)
+        try:
+            from py12306.webx.job_schedule import _job_account_ready
+            if not _job_account_ready(self):
+                if not getattr(self, '_webx_account_wait_logged', False):
+                    self._webx_account_wait_logged = True
+                    from py12306.log.common_log import CommonLog
+                    CommonLog.add_quick_log(
+                        '%s账号未就绪，暂不结束任务，等待账号恢复后继续' % _jn(self)).flush()
+                return False
+        except Exception:
+            return False
+        self._webx_account_wait_logged = False
+        return original(self, *args, **kwargs)
+
+    check_passengers._webx_account_wait_wrapped = True
+    check_passengers._webx_original = original
+
+    Job.check_passengers = check_passengers
 
 
 # ---------------- 下单状态机：诚实语义 + initDc 保护 + 防重 ----------------
@@ -1937,7 +2288,16 @@ def _hook_order_success():
             _record_success(self)
         except Exception:
             pass
-        return original(self)
+        try:
+            return original(self)
+        except Exception as exc:
+            # 订单号已经确认成功；通知/站名展示异常不能把成功订单改写成链路失败。
+            try:
+                from py12306.log.order_log import OrderLog
+                OrderLog.add_quick_log(_jn(self) + '订单已成功，成功通知异常：%s' % exc).flush()
+            except Exception:
+                pass
+            return True
 
     order_did_success._webx_wrapped = True
     order_did_success._webx_original = original

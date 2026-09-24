@@ -65,7 +65,7 @@ class DataStore:
                     period_to TEXT DEFAULT '24:00',
                     interval_min REAL,
                     interval_max REAL,
-                    start_at TEXT,              -- 定时开始时间 'YYYY-MM-DD HH:MM'（引擎待支持）
+                    start_at TEXT,              -- 北京时间定时启动 'YYYY-MM-DD HH:MM:SS'（旧分钟格式兼容）
                     query_mode TEXT DEFAULT 'range', -- train / range，仅用于管理台编辑回显
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT,

@@ -155,7 +155,7 @@ def _start_webx_daemons():
 
 
 def _reconcile_paused_jobs():
-    """自愈：DB 里已暂停、引擎却还在跑的任务，重新摘掉。
+    """自愈：对齐数据库与引擎任务集合，清理残留并补载意外退出的启用任务。
 
     暂停走的是 PATCH（**先写 db 再 publish_jobs**）：正常情况下
     `Query.refresh_jobs()` 会对不在 QUERY_JOBS 里的 Job 调 `destroy()`。
@@ -164,32 +164,41 @@ def _reconcile_paused_jobs():
     期间界面上已经是「已暂停」，日志却还在刷查询 —— 用户看到的就是
     「显示已暂停但后台还在运行」。
 
-    这里每 30 秒对一次账：只要有「引擎里存活、但 db 已不是 active」的任务，
-    就重新发布一次任务列表让引擎把它摘除，并记一条日志说明发生了什么。
-    **只在真的不一致时才动作**，正常情况零开销。
+    这里每 30 秒对账：摘除 DB 已暂停/结束但引擎仍存活的实例；也会补载 DB
+    中仍启用、未结束且已到启动时间，但意外不在引擎里的任务。未来定时任务不会提前加载。
+    只在检测到不一致时操作。
     """
     from py12306.query.query import Query
     ins = Query.__dict__.get('__it__')
-    if ins is None:
+    if ins is None or not getattr(ins, 'is_ready', False):
         return
     from py12306.helpers.func import md5
     from py12306.webx.sync import ConfigSync
-    allowed = set()
-    for job in DataStore().job_list():
-        if not job.get('is_active'):
-            continue
-        try:
-            allowed.add(md5(ConfigSync.job_info_dict(job)))
-        except Exception:
-            pass
+    # Use the same eligibility rules as publish_jobs: excludes paused, finished,
+    # successful, and future-scheduled tasks.
+    desired = ConfigSync._jobs_from_db()
+    expected = {str(md5(info)): info for info in desired}
+    alive_jobs = [j for j in (getattr(ins, 'jobs', None) or [])
+                  if getattr(j, 'is_alive', True)]
+    alive_ids = {str(getattr(j, 'id', '') or '') for j in alive_jobs}
     stale = [j for j in (getattr(ins, 'jobs', None) or [])
-             if getattr(j, 'is_alive', True) and str(getattr(j, 'id', '')) not in allowed]
-    if not stale:
+             if getattr(j, 'is_alive', True) and str(getattr(j, 'id', '')) not in expected]
+    missing = set(expected) - alive_ids
+    if not stale and not missing:
         return
-    names = sorted({str(getattr(j, 'job_name', '') or '') for j in stale})
     ConfigSync.publish_jobs()
-    CommonLog.add_quick_log(
-        'webx 对账：任务已暂停但引擎仍在运行，已重新摘除 → %s' % '、'.join(names)).flush()
+    notes = []
+    if stale:
+        names = sorted({str(getattr(j, 'job_name', '') or '') for j in stale})
+        notes.append('摘除 DB 已暂停/结束的引擎任务：%s' % '、'.join(names))
+    if missing:
+        names = sorted({str(expected[engine_id].get('job_name') or engine_id)
+                        for engine_id in missing})
+        notes.append('重载 DB 启用但引擎缺失的任务：%s' % '、'.join(names))
+
+
+    if notes:
+        CommonLog.add_quick_log('webx 对账：%s' % '；'.join(notes)).flush()
 
 
 def main():
@@ -225,6 +234,15 @@ def main():
         Cdn.run()
     except Exception as e:
         CommonLog.add_quick_log('webx Cdn.run 失败: %s' % e).flush()
+
+    # 定时调度独立于 12306 查询初始化；后者可能因频控长时间阻塞。
+    # 先启动调度器，避免服务启动期间错过已保存的秒级目标。
+    try:
+        from py12306.webx.job_schedule import start_scheduler
+        if start_scheduler():
+            CommonLog.add_quick_log('webx 秒级定时调度器已启动（北京时间 UTC+8）').flush()
+    except Exception as e:
+        CommonLog.add_quick_log('webx 定时任务调度器启动失败: %s' % e).flush()
 
     ####### 12306 查询初始化（频控时可能很慢），完成后再跑抢票任务
     CommonLog.add_quick_log('webx 正在初始化 12306 查询（频控时可能较慢，账号心跳已先启动）').flush()

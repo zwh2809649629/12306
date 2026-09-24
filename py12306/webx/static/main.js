@@ -355,6 +355,7 @@ function doLogin() {
 
 /* ---------- Boot ---------- */
 function bootApp() {
+  restoreMonitorRoute();
   api('/api/boot').then(function (d) {
     APP.seats = d.seats || [];
     APP.server = d.server || {};
@@ -402,6 +403,7 @@ var JOB_STATUS = {
   running:   { text: '运行中',   cls: 'ok',    dot: true },
   paying:    { text: '待支付',   cls: 'hot',   dot: true },   // 下单成功且仍在 30 分钟窗口内
   paused:    { text: '已暂停',   cls: 'muted' },
+  scheduled: { text: '定时中',   cls: 'info' },
   pending:   { text: '待启动',   cls: 'warn' },
   blocked:   { text: '账号未登录', cls: 'warn' },
   completed: { text: '已完成',   cls: 'muted' },               // 下单成功但已超过支付时限
@@ -606,6 +608,10 @@ function loadJobs() {
         // 账号未就绪 → 引擎会卡在 wait_for_ready()，一条查询也发不出去，必须明确提示
         hint = '<div class="job-hint">账号<b>' + esc(j.account_name || j.account_key || '') + '</b>当前未登录，任务已中止。'
           + '<button class="link-btn" type="button" data-act="goacc">去账号管理登录</button></div>';
+      } else if (j.status === 'scheduled') {
+        var remain = scheduleRemaining(j.start_at);
+        hint = '<div class="job-hint scheduled">北京时间 ' + esc(j.start_at || '') + ' 开始查询'
+          + (remain ? '（' + esc(remain) + '）' : '') + '</div>';
       } else if (j.status === 'paying' || j.status === 'completed') {
         // 下单成功：30 分钟内红色催付，超时后转灰（12306 会取消超时未付订单）
         hint = payHint(j, 'job-hint ' + (j.status === 'paying' ? 'pay' : 'paid'));
@@ -625,12 +631,19 @@ function loadJobs() {
         '<button class="icon-btn" type="button" data-act="detail" data-id="' + j.job_id + '" title="查看详情" aria-label="查看任务详情">' + ICONS.eye + '</button>' +
         '<button class="icon-btn danger" type="button" data-act="del" data-id="' + j.job_id + '" title="删除" aria-label="删除任务">' + ICONS.trash + '</button>' +
         '</div>';
-      return '<div class="job' + (j.status === 'running' ? '' : ' paused') + '">' +
-        '<div class="l1"><span class="jname">' + esc(j.job_name || '未命名任务') + '</span>' +
+      var createdMeta = '<span>创建 ' + esc(j.created_at || '') + '</span>';
+      if (j.start_at) {
+        var startMs = Date.parse(String(j.start_at).replace(' ', 'T') + '+08:00');
+        var reached = !isNaN(startMs) && Date.now() >= startMs;
+        createdMeta += '<span class="job-start-meta ' + (reached ? 'reached' : 'pending') + '">启动 ' +
+          esc(j.start_at) + '</span>';
+      }
+      return '<div class="job' + ((j.status === 'running' || j.status === 'scheduled') ? '' : ' paused') + '">' +
+        '<div class="l1"><span class="jname">' + esc(j.job_name || '未命名任务') + '</span><span class="job-id">' + esc(j.job_id || '—') + '</span>' +
           '<span class="route">' + routes.join('；') + '</span>' + stTag + acts + '</div>' +
         hint +
         '<div class="l2">' + tags + '</div>' +
-        '<div class="l3"><span class="l3stat">' + stat + '</span><span>创建 ' + esc(j.created_at || '') + '</span><span>账号 ' + esc(j.account_name || j.account_key || '—') + '</span></div></div>';
+        '<div class="l3"><span class="l3stat">' + stat + '</span>' + createdMeta + '<span>账号 ' + esc(j.account_name || j.account_key || '—') + '</span></div></div>';
     }).join('');
     $('jobsList').querySelectorAll('button[data-act]').forEach(function (b) {
       var act = b.dataset.act, id = b.dataset.id;
@@ -714,7 +727,7 @@ function loadDetail(job_id) {
     var trains = j.train_numbers || [];
     var excepts = j.except_train_numbers || [];
     var members = (j.members || []).filter(Boolean);
-    var isTrainMode = trains.length > 0;
+    var isTrainMode = j.query_mode === 'train' || (j.query_mode !== 'range' && trains.length > 0);
     var detailTrainDate = (j.left_dates || [])[0] || '';
     var detailTrainList = function (numbers, clickable) {
       return '<span class="detail-train-list">' + numbers.map(function (trainNumber) {
@@ -744,8 +757,8 @@ function loadDetail(job_id) {
       dv('查询时段', esc(j.period.from) + ' – ' + esc(j.period.to) +
         (isTrainMode ? '<small>车次已指定，引擎强制全天</small>' : '<small>按出发时刻筛选</small>')) +
       dv('查询间隔', '<b>' + esc(ivMin) + '–' + esc(ivMax) + '</b> 秒<small>本任务专用；待引擎支持后生效</small>') +
-      dv('开始时间', (j.start_at ? esc(j.start_at) : '立即开始') +
-        (j.start_at ? '<small>待引擎支持后生效</small>' : ''));
+      dv('开始时间', (j.start_at ? '北京时间 ' + esc(j.start_at) : '立即开始') +
+        (j.start_at ? '<small>到点触发查询（UTC+8）</small>' : ''));
     if (!trains.length) loadDetailRangeTrains(j);
     // ---------- 量化指标（全宽带）----------
     var m = j.metrics || {};
@@ -913,8 +926,11 @@ document.addEventListener('click', function (e) {
   applyTrackMode();
 });
 function queryStationSummary(isTrainMode, stationMode) {
-  var method = isTrainMode ? '车次查询' : '区间查询';
-  var methodNote = isTrainMode ? '只抢列表内车次' : '查询区间内全部车次';
+  if (isTrainMode) {
+    return '车次查询 · 指定车次<small>车次白名单与实际上下车站均需匹配</small>';
+  }
+  var method = '区间查询';
+  var methodNote = '查询区间内全部车次';
   var station = stationMode === 'expand' ? '同城站扩展' : '仅指定站名';
   var stationNote = stationMode === 'expand'
     ? '城市名匹配该城市全部车站；具体站只匹配自己'
@@ -1407,7 +1423,7 @@ function wireNtPair(row) {
   }
   row.querySelector('.del').addEventListener('click', function () {
     row.remove();
-    if (!$('ntPairs').querySelector('.pair')) addNtPair('北京', '深圳');
+    if (!$('ntPairs').querySelector('.pair')) { var d = monitorRouteDefaults(); addNtPair(d.left, d.arrive); }
     refreshNtQueryLoad();
     updateNtSummary();
     refreshPairNotes();
@@ -1596,6 +1612,7 @@ function refreshNewView() {
   bindNtModeSeg();
   bindNtStartMode();
   bindStnMode();
+  syncNtRangeFromMonitor();
   applyNtMode();
   syncSeatsFromPicked();
   // 日期 chip 必须重绘：车票查询导入车次时会向 APP.selDates 写入查询日期，
@@ -1629,6 +1646,19 @@ function refreshEngineNotes() {
 var SEAT_ORDER = ['商务座', '一等座', '二等座', '硬卧', '软卧', '硬座', '无座', '特等座'];
 // 查询方式由用户显式选择（顶部 seg），默认车次查询
 function ntMode() { return APP.ntMode === 'range' ? 'range' : 'train'; }
+function monitorRouteDefaults() {
+  var left = (($('mFrom') || {}).value || '').trim();
+  var arrive = (($('mTo') || {}).value || '').trim();
+  return { left: left || '北京', arrive: arrive || '深圳' };
+}
+function syncNtRangeFromMonitor() {
+  if (APP.editJobId || ntMode() !== 'range') return;
+  var d = monitorRouteDefaults();
+  var pair = $('ntPairs') && $('ntPairs').querySelector('.pair');
+  if (!pair) return;
+  pair.querySelector('[data-role=left]').value = d.left;
+  pair.querySelector('[data-role=arrive]').value = d.arrive;
+}
 function setNtMode(m) {
   APP.ntMode = (m === 'range') ? 'range' : 'train';
   APP.seatPickTier = -1;      // 切模式时收起座次面板
@@ -1823,7 +1853,7 @@ function updateNtSummary() {
     row('时间段', train
       ? '全天<small>车次已指定，不做时间过滤</small>'
       : esc(ntPeriodLabel()) + '<small>按出发时刻筛选</small>') +
-    row('开始时间', esc(ntStartLabel()) + '<small>需引擎支持后生效</small>') +
+    row('开始时间', esc(ntStartLabel()) + '<small>秒级调度 · 北京时间 UTC+8</small>') +
     row('查询间隔', iv.min + '–' + iv.max + ' 秒<small>本任务专用；需引擎支持后生效</small>') +
     row('每轮请求', load.perRound ? '<b>' + load.perRound + '</b> 次<small>' + load.stations + ' 区间 × ' + load.dates + ' 日期</small>' : '—') +
     row('参考金额', ntEstimateLabel());
@@ -1839,8 +1869,7 @@ function updateNtSummary() {
 function row(k, v, cls) { return '<div class="r"><span class="k">' + k + '</span><span class="v"><span class="' + (cls || '') + '">' + (v || '未填') + '</span></span></div>'; }
 
 /* ---------- 策略：开始时间 / 查询间隔 ----------
-   注意：这两项都需要 py12306 抢票引擎侧改动才会生效（引擎目前只用全局 QUERY_INTERVAL，
-   且没有定时启动能力）。此处先做到「可填、可存（写进 job 表）」，UI 上已标注「待引擎支持」。 */
+   开始时间由 WebX 调度器按北京时间精确到秒触发；任务级查询间隔仍待引擎支持。 */
 function ntStartMode() {
   var seg = $('ntStartMode');
   var on = seg && seg.querySelector('.seg-btn.on');
@@ -1866,9 +1895,17 @@ function syncNtStartMode() {
 }
 function ntStartAtValue() {
   if (ntStartMode() !== 'at') return '';
-  // datetime-local 给的是 'YYYY-MM-DDTHH:MM'，统一成 'YYYY-MM-DD HH:MM' 存库
+  // datetime-local step=1 给到秒；兼容浏览器/旧数据省略秒的值，统一存为秒级北京时间。
   var v = ($('ntStartAt') || {}).value || '';
+  if (v && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(v)) v += ':00';
   return v ? v.replace('T', ' ') : '';
+}
+function scheduleRemaining(value) {
+  if (!value) return '';
+  var ms = Date.parse(String(value).replace(' ', 'T') + '+08:00');
+  if (!isFinite(ms)) return '';
+  var seconds = Math.max(0, Math.ceil((ms - Date.now()) / 1000));
+  return seconds ? '还有 ' + fmtDurSec(seconds) : '即将启动';
 }
 function ntIntervalValue() {
   var a = parseFloat(($('ntIntMin') || {}).value), b = parseFloat(($('ntIntMax') || {}).value);
@@ -1880,7 +1917,7 @@ function ntIntervalValue() {
 function ntStartLabel() {
   if (ntStartMode() !== 'at') return '立即开始';
   var v = ntStartAtValue();
-  return v ? ('定时 ' + v) : '定时开始（未填时间）';
+  return v ? ('北京时间 ' + v) : '定时开始（未填时间）';
 }
 
 /* 车次标签框 */
@@ -2154,7 +2191,7 @@ function applyPickToRows() {
 function syncDraftFromSelection() {
   if (!inTaskPick()) return;
   var idx = {};
-  MON.rows.forEach(function (r, i) { if (!(r.n in idx)) idx[r.n] = i; });
+  MON.rows.forEach(function (r, i) { if (!(r.n in idx) || MON.sel[i]) idx[r.n] = i; });
   // 席别按「同车次号的所有行」取并集：用户可能是在第二行（另一到达站）点的席别，
   // 只读首行会得到空席别，导致草稿席别为空、创建时被校验拦住。
   // 分两段：表格能表达的席别以表格勾选为准；表格表达不了的（软卧/特等座，表格没有这两列）
@@ -2495,6 +2532,29 @@ function swapStations() {
   // 已经查过车次：交换方向后立即重查，否则列表里展示的会是反方向的结果
   if (MON.searched) doMonitorSearch();
 }
+function monitorRouteStorageKey() {
+  var user = localStorage.getItem(USERNAME_KEY) || 'default';
+  return 'webx_monitor_route_v1:' + encodeURIComponent(user);
+}
+function restoreMonitorRoute() {
+  try {
+    var saved = JSON.parse(localStorage.getItem(monitorRouteStorageKey()) || 'null');
+    var from = String(saved && saved.from || '').trim();
+    var to = String(saved && saved.to || '').trim();
+    if (!from || !to) return false;
+    $('mFrom').value = from;
+    $('mTo').value = to;
+    return true;
+  } catch (e) { return false; }
+}
+function rememberMonitorRoute(from, to) {
+  from = String(from || '').trim();
+  to = String(to || '').trim();
+  if (!from || !to) return;
+  try {
+    localStorage.setItem(monitorRouteStorageKey(), JSON.stringify({ from: from, to: to }));
+  } catch (e) { }
+}
 function doMonitorSearch() {
   var left = $('mFrom').value.trim(), arrive = $('mTo').value.trim(), date = $('mDate').value;
   if (!left || !arrive || !date) { toast('请填写出发地、目的地和日期', 'err'); return; }
@@ -2504,6 +2564,7 @@ function doMonitorSearch() {
   // 返回 Promise：从新建任务页重新进入时需等查询完成再回写上次的勾选态
   return api('/api/tickets?' + new URLSearchParams({ left: left, arrive: arrive, date: date }))
     .then(function (d) {
+      rememberMonitorRoute(left, arrive);
       MON.rows = d.rows || [];
       MON.searched = true;
       MON.sel = {}; MON.selSeats = {}; MON.selBy = {}; MON.selOrder = [];
@@ -3100,6 +3161,7 @@ function applyJobToForm(j) {
   var iv = j.interval || {};
   if ($('ntIntMin')) $('ntIntMin').value = iv.min || APP.queryInterval || 1;
   if ($('ntIntMax')) $('ntIntMax').value = iv.max || iv.min || APP.queryInterval || 1;
+  // 编辑时保留原始计划时间（包括已经触发/过去的时间），便于查看和按需修改。
   setNtStartAt(j.start_at || '');
   if (savedMode === 'train') {
     syncSeatsFromPicked();
@@ -3135,7 +3197,7 @@ function refreshTaskTrainData(j) {
   var pairs = j.stations || [], dates = j.left_dates || [], requests = [];
   pairs.forEach(function (pair) {
     dates.forEach(function (date) {
-      if (pair.left && pair.arrive && date) requests.push({ left: pair.left, arrive: pair.arrive, date: date });
+      if (pair.left && pair.arrive && date) requests.push({ left: pair.left, arrive: pair.arrive, date: date, station_mode: j.station_mode || 'exact' });
     });
   });
   if (!numbers.length || !requests.length) return;
@@ -3201,7 +3263,9 @@ function setNtStartAt(v) {
   var at = !!v;
   var seg = $('ntStartMode');
   if (seg) seg.querySelectorAll('.seg-btn').forEach(function (b) { b.classList.toggle('on', (b.dataset.start === 'at') === at); });
-  if ($('ntStartAt')) $('ntStartAt').value = at ? String(v).replace(' ', 'T') : '';
+  var value = at ? String(v).replace(' ', 'T') : '';
+  if (at && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(value)) value += ':00';
+  if ($('ntStartAt')) $('ntStartAt').value = value;
   syncNtStartMode();
 }
 
@@ -3209,7 +3273,7 @@ function setNtStartAt(v) {
 function setEditMode(on) {
   var h = $('newTitle'), c = $('newSub'), btn = $('taskFlowNext'), cancel = $('taskFlowCancel');
   if (h) h.textContent = on ? '编辑抢票任务' : '新建抢票任务';
-  if (c) c.textContent = on ? '保存后立即热重载；原任务的启用状态保持不变' : '创建后将立即参与热重载，无需重启服务';
+  if (c) c.textContent = on ? '保存后立即热重载；原任务的启用状态保持不变' : '保存后立即生效；定时任务按北京时间到秒启动';
   if (btn) btn.textContent = on ? '保存修改' : '创建任务';
   if (cancel) cancel.classList.toggle('hidden', !on);
 }
@@ -3263,6 +3327,7 @@ function collectNtForm() {
     // 策略：任务级查询间隔与开始时间（需引擎侧改动后生效，但先落库）
     interval_min: iv.min,
     interval_max: iv.max,
+    start_mode: ntStartMode(),
     start_at: ntStartAtValue()
   };
   if (train) {
@@ -3300,7 +3365,6 @@ function createNewTask(btn) {
   }
   if (!train && f.period_from > f.period_to) { toast('出发时间段的开始时间不能晚于结束时间', 'err'); return; }
   if (ntStartMode() === 'at' && !ntStartAtValue()) { toast('已选「定时开始」，请填写开始时间', 'err'); return; }
-  if (ntStartMode() === 'at' && ntStartAtValue() && ntStartAtValue() <= '2026' ) { toast('开始时间格式不正确', 'err'); return; }
   var editing = APP.editJobId || null;
   if (btn) btn.disabled = true;
   api(editing ? ('/api/jobs/' + encodeURIComponent(editing)) : '/api/jobs',
@@ -3311,7 +3375,7 @@ function createNewTask(btn) {
       APP.pickOrder = [];
       setNtMode('train');
       clearJobEdit();
-      toast(editing ? '任务已保存' : '任务已创建并开始抢票', 'ok');
+      toast(editing ? '任务已保存' : (f.start_at ? '任务已创建，等待定时启动' : '任务已创建并开始抢票'), 'ok');
       go('jobs');
     })
     .catch(function (e) { toast(e.message, 'err'); })
@@ -3860,7 +3924,8 @@ function prefillNewFromMonitor() {
 // ⚠️ 只在导航入口调用：从车票查询「添加到任务/取消」返回的是「继续编辑同一个草稿」，
 //    那时候清空会把用户刚填好的名字抹掉。
 function resetNtTaskName() {
-  if (APP.editJobId) return;            // 编辑态保留回填的名称
+  if (APP.editJobId) return;            // 编辑态保留回填的配置
+  setNtStartAt('');                     // 新任务默认立即开始，不继承上一任务的定时点
   var n = $('ntName');
   if (n) n.value = '';
 }

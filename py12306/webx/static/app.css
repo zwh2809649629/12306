@@ -224,6 +224,7 @@ input[type=date]:disabled,input[type=time]:disabled,input[type=datetime-local]:d
 .toolbar .sp{margin-left:auto; display:flex; gap:9px}
 .job{background:var(--card); border:1px solid var(--line); border-radius:var(--r-lg); box-shadow:var(--shadow); padding:16px 18px; margin-bottom:12px}
 .job .l1{display:flex; align-items:center; gap:10px}
+.job .job-id{font-size:10.5px;color:var(--faint);font-family:Consolas,"Cascadia Mono",monospace;white-space:nowrap}
 /* 任务名是主标识，区间降为副标题（之前只有区间，看不到任务名） */
 .job .jname{font-size:15.5px; font-weight:700; color:var(--ink); flex-shrink:0}
 .job .route{font-size:12.5px; font-weight:600; color:var(--sub); display:flex; align-items:center; gap:8px; min-width:0}
@@ -232,6 +233,7 @@ input[type=date]:disabled,input[type=time]:disabled,input[type=datetime-local]:d
 .job .l1 .acts{margin-left:auto; display:flex; gap:4px; flex-shrink:0}
 /* 账号未登录 / 任务已结束的说明条（不只靠一个标签，用户容易看漏） */
 .job .job-hint{margin-top:10px; padding:8px 11px; border-radius:8px; background:var(--warn-bg); color:var(--warn); font-size:12.5px; line-height:1.6}
+.job .job-hint.scheduled{background:var(--info-bg);color:var(--info)}
 .job .job-hint b{font-weight:700}
 .job .job-hint.done{background:var(--line-soft); color:var(--sub)}
 /* 下单成功 / 待支付：时效性强（12306 要求 30 分钟内支付），用更醒目的红色系 */
@@ -543,7 +545,7 @@ tr.hit-row:hover{background:var(--red-bg)}
 
 /* ============ 日志 ============ */
 .term-toolbar{display:flex; align-items:center; gap:8px; padding:12px 14px; border-bottom:1px solid #1E2637}
-.lv-chip{font-size:12px; font-weight:600; padding:4.5px 11px; border-radius:99px; color:#8A93A6; background:#1B2333}
+.lv-chip{display:inline-flex; flex:0 0 auto; align-items:center; justify-content:center; white-space:nowrap; font-size:12px; font-weight:600; padding:4.5px 11px; border-radius:99px; color:#8A93A6; background:#1B2333; cursor:pointer; user-select:none}
 .lv-chip.on{background:var(--red); color:#fff}
 .term-search{margin-left:auto; width:200px; background:#1B2333; border-color:#2A3450; color:#C6CDDC; font-size:12px; padding:6.5px 10px}
 .term{background:#0F1420; border-radius:0 0 var(--r-lg) var(--r-lg); padding:13px 16px 16px; font-family:Consolas,"Cascadia Mono",monospace; font-size:12.3px; line-height:1.9; color:#C8D0E0}
@@ -890,6 +892,8 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
    任务卡片底部统计：已查询 / 命中（两个是独立的量，必须分开看）
    ========================================================================== */
 .job .l3 .l3stat{display:inline-flex;align-items:center;gap:16px}
+.job .l3 .job-start-meta.pending{color:#2865BF;font-weight:650}
+.job .l3 .job-start-meta.reached{color:var(--ok);font-weight:650}
 .job .l3 .l3stat .h b{color:var(--red)}
 .job .l3 .l3stat .q b{color:var(--info)}
 
