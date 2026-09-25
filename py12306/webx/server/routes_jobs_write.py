@@ -47,6 +47,24 @@ def _job_view_by_id(db, job_id):
     return _job_view(j, db) if j else None
 
 
+def _train_items(value):
+    out = []
+    for item in value or []:
+        if not isinstance(item, dict):
+            continue
+        number = str(item.get('train_number') or '').strip().upper()
+        date = str(item.get('date') or '').strip()
+        if not number or not date:
+            continue
+        out.append({
+            'train_number': number,
+            'date': date,
+            'start_date': str(item.get('start_date') or date).strip(),
+            'train_no': str(item.get('train_no') or '').strip(),
+        })
+    return out
+
+
 @bp.route('/api/jobs', methods=['POST'])
 def create_job():
     body = request.get_json(force=True) or {}
@@ -92,6 +110,7 @@ def create_job():
         return {'code': 1, 'msg': '请选择有效的 12306 账号', 'data': None}
     train_numbers = [str(t).strip().upper() for t in (body.get('train_numbers') or []) if str(t).strip()]
     except_numbers = [str(t).strip().upper() for t in (body.get('except_train_numbers') or []) if str(t).strip()]
+    train_items = _train_items(body.get('train_items'))
     if train_numbers and except_numbers:
         return {'code': 1, 'msg': '指定车次与排除车次二选一', 'data': None}
     name = str(body.get('name') or '').strip() or _default_name(stations, dates)
@@ -146,6 +165,7 @@ def create_job():
         'interval_max': imax,
         'start_at': start_at,
         'query_mode': 'train' if body.get('query_mode') == 'train' else 'range',
+        'train_items': train_items,
         'station_mode': station_mode,
         'is_active': 1,
     })
@@ -166,6 +186,17 @@ def create_job():
     return {'code': 0, 'msg': '已创建',
             'data': {'job_id': job_id, 'station_notes': hints or [], 'station_mode': station_mode,
                      'start_mode': start_mode, 'start_at': start_at}}
+
+
+@bp.route('/api/jobs/<job_id>/catalog/stops/refresh', methods=['POST'])
+def refresh_catalog_stops(job_id):
+    body = request.get_json(force=True) or {}
+    train_number = str(body.get('train_number') or '').strip()
+    date = str(body.get('date') or '').strip()
+    if not train_number or not date:
+        return {'code': 1, 'msg': '缺少 train_number/date 参数', 'data': None}
+    from py12306.webx.task_catalog import refresh_job_stop
+    return refresh_job_stop(current_app._get_current_object(), job_id, train_number, date)
 
 
 @bp.route('/api/jobs/toggle', methods=['POST'])
@@ -208,9 +239,9 @@ def update_job(job_id):
         patch['account_key'] = str(body.get('account_key') or '').strip()
     for field, key in (('left_dates', 'left_dates'), ('seats', 'seats'), ('seat_tiers', 'seat_tiers'),
                        ('train_numbers', 'train_numbers'), ('except_train_numbers', 'except_train_numbers'),
-                       ('members', 'members'), ('stations', 'stations')):
+                       ('members', 'members'), ('stations', 'stations'), ('train_items', 'train_items')):
         if key in body and isinstance(body.get(key), list):
-            patch[key] = body.get(key)
+            patch[key] = _train_items(body.get(key)) if key == 'train_items' else body.get(key)
     # 站点匹配方式（exact / expand）；非法值就保持任务原有设置，不要强行重置
     if 'station_mode' in body:
         sm = str(body.get('station_mode') or '').strip().lower()
@@ -259,7 +290,7 @@ def update_job(job_id):
     db.job_update(job_id, patch)
     ConfigSync.publish_jobs()
     catalog_fields = {'left_dates', 'stations', 'train_numbers', 'except_train_numbers',
-                      'period_from', 'period_to', 'station_mode', 'query_mode'}
+                      'period_from', 'period_to', 'station_mode', 'query_mode', 'train_items'}
     if catalog_fields.intersection(patch):
         try:
             from py12306.webx.task_catalog import enqueue_job_catalog

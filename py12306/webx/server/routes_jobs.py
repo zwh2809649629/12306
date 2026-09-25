@@ -268,6 +268,7 @@ def _job_view(job, db):
         'seat_tiers': _seat_tiers(job),
         'train_numbers': json.loads(job['train_numbers'] or '[]'),
         'except_train_numbers': json.loads(job['except_train_numbers'] or '[]'),
+        'train_items': json.loads(job.get('train_items') or '[]'),
         'members': json.loads(job['members'] or '[]'),
         'allow_less_member': bool(job.get('allow_less_member')),
         'period': {'from': job.get('period_from') or '00:00', 'to': job.get('period_to') or '24:00'},

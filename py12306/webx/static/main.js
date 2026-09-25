@@ -496,7 +496,8 @@ var ICONS = {
   pause: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>',
   edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>',
   eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>',
-  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>'
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 0 0-14.9-4L3 10"/><path d="M3 4v6h6"/><path d="M4 13a8 8 0 0 0 14.9 4L21 14"/><path d="M21 20v-6h-6"/></svg>'
 };
 function loadDashboard() {
   api('/api/dashboard').then(function (d) {
@@ -771,7 +772,7 @@ function loadDetail(job_id) {
       dv('查询时段', esc(j.period.from) + ' – ' + esc(j.period.to) +
         (isTrainMode ? '<small>车次已指定，引擎强制全天</small>' : '<small>按出发时刻筛选</small>')) +
       dv('查询间隔', '<b>' + esc(ivMin) + '–' + esc(ivMax) + '</b> 秒<small>本任务专用；待引擎支持后生效</small>') +
-      dv('开始时间', (j.start_at ? '北京时间 ' + esc(j.start_at) : '立即开始') +
+      dv('开始时间', (j.start_at ? esc(j.start_at) : '立即开始') +
         (j.start_at ? '<small>到点触发查询（UTC+8）</small>' : ''));
     if (!trains.length) loadDetailRangeTrains(j);
     // ---------- 量化指标（全宽带）----------
@@ -900,10 +901,6 @@ function openDetailTrainStops(job, trainNumber, date) {
     toast('任务缓存中没有车次 ' + trainNumber + ' 的经停站，请编辑并保存任务刷新缓存', 'err');
     return;
   }
-  if (!item.stops_data || !(item.stops_data.stops || []).length) {
-    toast(item.stops_error || '该车次的经停站缓存暂不可用，请编辑并保存任务重建缓存', 'err');
-    return;
-  }
   var leg = {
     n: item.train_number,
     no: item.train_no,
@@ -911,9 +908,13 @@ function openDetailTrainStops(job, trainNumber, date) {
     to: item.to_station,
     d: item.departure,
     a: item.arrival,
-    m: item.duration
+    m: item.duration,
+    start_date: item.start_date || item.date
   };
-  openStopsForLeg(leg, null, item.date, item.stops_data);
+  openStopsForLeg(leg, null, item.date,
+    item.stops_data && (item.stops_data.stops || []).length ? item.stops_data : null,
+    { job_id: job.job_id, train_number: item.train_number, date: item.date,
+      error: item.stops_error || '' });
 }
 
 // 执行轨迹的租户：TRACK.mode = 'stage'（下单阶段）| 'hit'（命中轨迹）。
@@ -2728,31 +2729,40 @@ function applyMonitor() {
    站名、到发时刻、历时都按新上下车点重算，票价估算与推导区间随之更新。
 
    `leg` 对象是 `MON.rows` / `APP.taskPicked` 共享的引用，所以改一处两边都变。 */
-var STOPS = { leg: null, data: null, from: -1, to: -1, onApply: null };
+var STOPS = { leg: null, data: null, date: '', from: -1, to: -1, onApply: null,
+  refreshTarget: null, refreshBusy: false };
 
 function openStops(i) { openStopsForLeg(MON.rows[i], null); }
 
-function openStopsForLeg(leg, onApply, dateOverride, cachedStops) {
+function openStopsForLeg(leg, onApply, dateOverride, cachedStops, refreshTarget) {
   if (!leg) return;
   if (!leg.no) { toast('该车次缺少 12306 内部编号，无法查询经停站', 'err'); return; }
   STOPS.leg = leg;
   STOPS.data = null;
+  STOPS.date = leg.start_date || dateOverride || (($('mDate') || {}).value || '');
   STOPS.from = -1;
   STOPS.to = -1;
   STOPS.onApply = onApply || null;
+  STOPS.refreshTarget = refreshTarget || null;
+  STOPS.refreshBusy = false;
   $('stopsTitle').textContent = (leg.n || '') + ' 经停站';
-  $('stopsSum').innerHTML =
-    '<span class="tag info">' + routeHtml(leg.f, leg.to) + '</span>' +
-    '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>';
+  renderStopsSummary(leg);
   $('stopsBody').innerHTML = '<tr><td colspan="7" class="stops-msg">正在获取经停站…</td></tr>';
   $('stopsNote').innerHTML = '';
   $('stopsPick').innerHTML = '';
   $('stopsModal').classList.add('open');
-  var date = dateOverride || (($('mDate') || {}).value || '');
+  var date = STOPS.date;
   if (cachedStops) {
     STOPS.data = cachedStops;
     syncStopsSelection();
     renderStops();
+    return;
+  }
+  if (STOPS.refreshTarget) {
+    $('stopsBody').innerHTML = '<tr><td colspan="7" class="stops-msg">暂无经停站缓存，请点击“刷新经停站”重新获取</td></tr>';
+    $('stopsNote').innerHTML = STOPS.refreshTarget.error
+      ? '<b>上次获取失败：</b>' + esc(STOPS.refreshTarget.error)
+      : '当前车次还没有经停站缓存。';
     return;
   }
   api('/api/tickets/stops?train_no=' + encodeURIComponent(leg.no) +
@@ -2766,6 +2776,64 @@ function openStopsForLeg(leg, onApply, dateOverride, cachedStops) {
       $('stopsBody').innerHTML = '';
       $('stopsNote').innerHTML = '<b>获取失败：</b>' + esc(e.message);
     });
+}
+
+function renderStopsSummary(leg) {
+  $('stopsSum').innerHTML =
+    '<div class="stops-summary-text">' +
+      '<span class="tag info">' + routeHtml(leg.f, leg.to) + '</span>' +
+      '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>' +
+    '</div>' +
+    '<button class="icon-btn stops-refresh" id="stopsRefresh" type="button" title="刷新经停站" aria-label="刷新经停站">' + ICONS.refresh + '</button>';
+}
+
+function refreshStops() {
+  var target = STOPS.refreshTarget;
+  if (!STOPS.leg || STOPS.refreshBusy) return;
+  var button = $('stopsRefresh');
+  STOPS.refreshBusy = true;
+  if (button) {
+    button.disabled = true;
+    button.title = '刷新中…';
+    button.setAttribute('aria-label', '刷新中…');
+  }
+  $('stopsNote').innerHTML = '正在从 12306 重新获取经停站…';
+  var request = target
+    ? api('/api/jobs/' + encodeURIComponent(target.job_id) + '/catalog/stops/refresh', {
+      method: 'POST',
+      body: JSON.stringify({ train_number: target.train_number, date: target.date })
+    })
+    : api('/api/tickets/stops?train_no=' + encodeURIComponent(STOPS.leg.no) +
+      '&date=' + encodeURIComponent(STOPS.date)).then(function (data) {
+      return { stops_data: data };
+    });
+  request.then(function (data) {
+    if (target && (!STOPS.refreshTarget || STOPS.refreshTarget.job_id !== target.job_id
+        || STOPS.refreshTarget.train_number !== target.train_number
+        || STOPS.refreshTarget.date !== target.date)) return;
+    STOPS.data = data.stops_data;
+    if (STOPS.refreshTarget) STOPS.refreshTarget.error = '';
+    syncStopsSelection();
+    renderStops();
+    toast(target ? '经停站已刷新并写入任务缓存' : '经停站已刷新', 'ok');
+    if (target && DETAIL_JOB_ID === target.job_id) loadDetail(DETAIL_JOB_ID);
+  }).catch(function (e) {
+    if (target && STOPS.refreshTarget && STOPS.refreshTarget.job_id === target.job_id
+        && STOPS.refreshTarget.train_number === target.train_number
+        && STOPS.refreshTarget.date === target.date) {
+      STOPS.refreshTarget.error = e.message;
+      $('stopsBody').innerHTML = '<tr><td colspan="7" class="stops-msg">经停站获取失败，请稍后重试</td></tr>';
+      $('stopsNote').innerHTML = '<b>获取失败：</b>' + esc(e.message);
+    }
+    toast(e.message, 'err');
+  }).finally(function () {
+    STOPS.refreshBusy = false;
+    if (button) {
+      button.disabled = false;
+      button.title = '刷新经停站';
+      button.setAttribute('aria-label', '刷新经停站');
+    }
+  });
 }
 
 function closeStops() { $('stopsModal').classList.remove('open'); }
@@ -2873,9 +2941,7 @@ function applyStopsPick() {
   // priceKey() 会退化成用站名，后端解析后重新查真实票价。
   leg.f_code = '';
   leg.to_code = '';
-  $('stopsSum').innerHTML =
-    '<span class="tag info">' + routeHtml(leg.f, leg.to) + '</span>' +
-    '<span class="tag muted">' + esc(leg.d) + ' 开 · 全程 ' + fmtDur(leg.m) + '</span>';
+  renderStopsSummary(leg);
   // 席别余票属于原区间，改区间后清掉「可订」标记，避免继续显示成可订
   leg.bookable = false;
   refreshAfterLegChange(STOPS.onApply);
@@ -3192,16 +3258,22 @@ function applyJobToForm(j) {
 function restoreTaskTrains(j) {
   var pair = (j.stations && j.stations[0]) || {};
   var seats = (j.seats || []).slice();
+  var meta = {};
+  (j.train_items || []).forEach(function (item) {
+    meta[String(item.train_number || '').toUpperCase() + '|' + String(item.date || '')] = item;
+  });
   var seatMap = {};
   seats.forEach(function (name) {
     var key = SEAT_KEY[name];
     if (key) seatMap[key] = '—';
   });
   return (j.train_numbers || []).map(function (number) {
+    var item = meta[String(number).toUpperCase() + '|' + String((j.left_dates || [])[0] || '')] || {};
     return {
       leg: {
         n: String(number), tn: '', f: pair.left || '', d: '',
-        to: pair.arrive || '', a: '', m: null, s: seatMap
+        to: pair.arrive || '', a: '', m: null, s: seatMap,
+        no: item.train_no || '', start_date: item.start_date || item.date || (j.left_dates || [])[0] || ''
       },
       seats: seats.slice()
     };
@@ -3226,10 +3298,21 @@ function refreshTaskTrainData(j) {
   })).then(function (groups) {
     if (APP.taskTrainQuerySeq !== querySeq || !APP.editJobId) return;
     var latest = {};
+    var savedMeta = {};
+    (j.train_items || []).forEach(function (item) {
+      savedMeta[String(item.train_number || '').toUpperCase() + '|' + String(item.date || '')] = item;
+    });
     groups.forEach(function (rows) {
       rows.forEach(function (leg) {
         var number = String(leg.n || '');
-        if (number && numbers.indexOf(number) >= 0 && !latest[number]) latest[number] = leg;
+        if (number && numbers.indexOf(number) >= 0 && !latest[number]) {
+          var meta = savedMeta[number.toUpperCase() + '|' + String(dates[0] || '')];
+          if (meta) {
+            leg.start_date = meta.start_date || leg.start_date || meta.date;
+            leg.no = meta.train_no || leg.no;
+          }
+          latest[number] = leg;
+        }
       });
     });
     APP.taskPicked = numbers.map(function (number) {
@@ -3332,6 +3415,15 @@ function collectNtForm() {
     members: (APP.paxSel || []).slice(),
     allow_less_member: !!$('ntLessMember').checked,
     seats: (APP.selSeats || []).slice(),
+    train_items: train ? (APP.taskPicked || []).map(function (s) {
+      var leg = s.leg || {};
+      return {
+        train_number: String(leg.n || '').toUpperCase(),
+        date: String((APP.selDates || [])[0] || '').trim(),
+        start_date: String(leg.start_date || (APP.selDates || [])[0] || '').trim(),
+        train_no: String(leg.no || '').trim()
+      };
+    }).filter(function (item) { return item.train_number && item.date; }) : [],
     // 优先级结构（二维）：引擎不读，仅为了让任务详情页能重建「哪几个属同一级」的分级配色。
     // 车次模式没有优先级概念，用一维包一层当第 1 级。
     seat_tiers: train ? [(APP.selSeats || []).slice()]
@@ -3835,6 +3927,7 @@ function wireStatic() {
   // 经停站弹窗：点遮罩/关闭按钮/按 Esc 退出
   $('closeStops').addEventListener('click', closeStops);
   $('stopsModal').addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('#stopsRefresh')) { refreshStops(); return; }
     if (e.target === $('stopsModal')) closeStops();
   });
   // 「应用区间」把上/下车选择写回车次；「恢复原区间」回到该车次当前区间

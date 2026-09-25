@@ -67,6 +67,7 @@ class DataStore:
                     interval_max REAL,
                     start_at TEXT,              -- 北京时间定时启动 'YYYY-MM-DD HH:MM:SS'（旧分钟格式兼容）
                     query_mode TEXT DEFAULT 'range', -- train / range，仅用于管理台编辑回显
+                    train_items TEXT,           -- JSON [{train_number,date,start_date,train_no}]
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT,
                     updated_at TEXT,
@@ -184,6 +185,8 @@ class DataStore:
                 cur.execute("ALTER TABLE job ADD COLUMN station_mode TEXT DEFAULT 'expand'")
             if 'query_mode' not in cols:
                 cur.execute("ALTER TABLE job ADD COLUMN query_mode TEXT DEFAULT 'range'")
+            if 'train_items' not in cols:
+                cur.execute("ALTER TABLE job ADD COLUMN train_items TEXT")
             # 迁移前没有模式字段：有车次白名单的历史任务按车次查询回显，
             # 无白名单的历史任务保持区间查询。用 kv 标记只执行一次，
             # 避免以后「区间查询 + 车次筛选」的任务被再次改成车次模式。
@@ -232,7 +235,7 @@ class DataStore:
         data['updated_at'] = _now()
         cols = ['job_id', 'job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                 'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-            'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'station_mode',
+                'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'station_mode', 'train_items',
                 'is_active', 'created_at', 'updated_at']
         vals = []
         for c in cols:
@@ -245,7 +248,7 @@ class DataStore:
     def job_update(self, job_id, data):
         allowed = ['job_name', 'account_key', 'left_dates', 'stations', 'seats', 'seat_tiers',
                    'train_numbers', 'except_train_numbers', 'members', 'allow_less_member',
-                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'station_mode', 'is_active',
+                   'period_from', 'period_to', 'interval_min', 'interval_max', 'start_at', 'query_mode', 'station_mode', 'train_items', 'is_active',
                    'finished_at', 'finish_reason',
                    'updated_at']
         sets, vals = [], []
@@ -285,6 +288,44 @@ class DataStore:
             'WHERE job_id=? AND generation=?',
             (state, json.dumps(payload or [], ensure_ascii=False), len(payload or []), str(message or ''),
              _now(), job_id, generation))
+
+    def job_catalog_update_stop(self, job_id, train_number, date,
+                                stops_data=None, stops_error='', item_updates=None):
+        """Update one cached train's stop data without rebuilding the catalog."""
+        with self.lock:
+            row = self.conn.execute(
+                'SELECT payload FROM job_train_catalog WHERE job_id=?', (job_id,)
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                items = json.loads(row['payload'] or '[]')
+            except Exception:
+                items = []
+            if not isinstance(items, list):
+                return None
+            target = None
+            for item in items:
+                if (str(item.get('train_number') or '').upper() == str(train_number).upper()
+                        and str(item.get('date') or '') == str(date)):
+                    target = item
+                    break
+            if target is None:
+                return None
+            for key, value in (item_updates or {}).items():
+                if key in ('train_no', 'start_date', 'start_station', 'end_station'):
+                    target[key] = value
+            if stops_data is not None:
+                target['stops_data'] = stops_data
+                target['stops_error'] = ''
+            else:
+                target['stops_error'] = str(stops_error or '经停站获取失败')
+            self.conn.execute(
+                'UPDATE job_train_catalog SET payload=?, train_count=?, updated_at=? '
+                'WHERE job_id=?',
+                (json.dumps(items, ensure_ascii=False), len(items), _now(), job_id))
+            self.conn.commit()
+            return dict(target)
 
     def job_toggle_active(self, job_id, active):
         # 重新启用时清掉「已结束」标记，否则任务会一直显示为已完成/已结束

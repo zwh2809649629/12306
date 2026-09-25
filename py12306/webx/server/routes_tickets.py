@@ -2,6 +2,7 @@
 import re
 import threading
 import time
+from datetime import datetime
 
 from flask import Blueprint, request
 
@@ -308,6 +309,10 @@ def tickets():
                 'd': left_time,
                 'a': arrive_time,
                 'm': minutes,
+                # 12306 余票行 t[13] 直接返回车次始发日期（YYYYMMDD）。
+                'start_date': _start_date_for_row(t, date),
+                'start_station': _station_name(t[4], station_names),
+                'end_station': _station_name(t[5], station_names),
                 'bookable': ticket_num == 'Y',
                 's': seat_map,
                 # 12306 内部车次号（如 65000Z80060Y）与起/终点站序号，
@@ -360,6 +365,17 @@ def _station_name(code, station_names):
         return ''
 
 
+def _start_date_for_row(ticket, query_date):
+    """Normalize the origin date returned in a 12306 ticket row."""
+    raw_date = ticket[13] if len(ticket) > 13 else ''
+    if re.fullmatch(r'\d{8}', raw_date or ''):
+        try:
+            return datetime.strptime(raw_date, '%Y%m%d').strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', raw_date or ''):
+        return raw_date
+    return query_date
 def _parse_lishi(value):
     """
     12306 自带的历时字段 t[10]，格式 'HH:MM'，小时可 >24（如 Z181 的 '25:23'）。

@@ -908,7 +908,7 @@ color:var(--warn);margin-left:6px;white-space:nowrap}
    ========================================================================== */
 .job .l3 .l3stat{display:inline-flex;align-items:center;gap:16px}
 .job .l3 .job-start-meta.pending{color:#2865BF;font-weight:650}
-.job .l3 .job-start-meta.reached{color:var(--ok);font-weight:650}
+.job .l3 .job-start-meta.reached{color:inherit;font-weight:inherit}
 .job .l3 .l3stat .h b{color:var(--red)}
 .job .l3 .l3stat .q b{color:var(--info)}
 
@@ -1160,7 +1160,9 @@ body:has(#view-detail.is-active){overflow-y:hidden}
    曾经的冲突源 `.view#view-monitor .table{min-width:1100px}` 已命中不到它。
    （若日后又把弹窗移回某个 `.view` 内，必须改回两级 id 才能压过它。） */
 .stops-dialog{width:min(540px,100%)}
-.stops-sum{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px}
+.stops-sum{display:flex;align-items:center;gap:7px;margin-bottom:10px}
+.stops-summary-text{display:flex;flex:1;min-width:0;flex-wrap:wrap;gap:7px;align-items:center}
+.stops-sum .stops-refresh{margin-left:auto;flex:0 0 auto}
 .stops-wrap{max-height:min(46vh,360px);overflow-y:auto;border:1px solid var(--line);border-radius:9px}
 #stopsModal .stops-table{width:100%;min-width:0;max-width:100%;table-layout:fixed}
 #stopsModal .stops-table th,
@@ -1170,6 +1172,14 @@ body:has(#view-detail.is-active){overflow-y:hidden}
 #stopsModal .stops-table thead th{
   position:sticky;top:0;z-index:2;background:#FCFCFD;color:var(--sub);font-size:11px;font-weight:700;
   box-shadow:inset 0 -1px 0 var(--line);line-height:16px;
+}
+
+@media(min-width:981px){
+  #view-detail .detail-stack:first-child{grid-template-rows:300px minmax(0,1fr)}
+  #view-detail .detail-stack:first-child>.card:first-child{min-height:0}
+  #view-detail .detail-stack:first-child>.card:first-child .detail-facts{
+    flex:1 1 auto;min-height:0;max-height:none;
+  }
 }
 /* 列宽：站名列 `auto` 吃掉剩余空间（406px 容器 → 约 100px，容得下
    「上海虹桥」这类 4 字站名）；其余列按实测内容宽给最小值。
@@ -1219,7 +1229,7 @@ body:has(#view-detail.is-active){overflow-y:hidden}
 .stops-note b{color:var(--sub)}
 /* 底部：当前选择 + 恢复/应用 */
 .stops-foot{
-  display:flex;align-items:center;gap:8px;padding:12px 18px 16px;
+  display:flex;align-items:center;gap:8px;padding:12px 18px 16px;flex-wrap:wrap;
   border-top:1px solid var(--line-soft);
 }
 .stops-foot .stops-pick{flex:1;min-width:0;font-size:12px;color:var(--sub)}
