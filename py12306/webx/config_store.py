@@ -2,15 +2,20 @@
 import copy
 import json
 import os
+import threading
 
 from py12306.config import Config
 from py12306.helpers.func import singleton
+
 
 # webx.json 内置默认值（首启生成；env.py 不参与任何环节）
 WEBX_DEFAULTS = {
     'version': 1,
     'server': {'port': 8600, 'host': '0.0.0.0'},
-    'query': {'interval': 1, 'request_max_retry': 5, 'thread_enabled': 0, 'job_timeout': 3, 'presale_days': 15},
+    'query': {
+        'interval': 1, 'request_max_retry': 5, 'thread_enabled': 0,
+        'job_timeout': 3, 'presale_days': 15
+    },
     'user': {'heartbeat_interval': 120},
     'cdn': {'enabled': 0, 'check_time_out': 1},
     'log': {'to_file': 1, 'path': 'runtime/webx.log'},
@@ -75,6 +80,7 @@ class ConfigStore:
     """
     FILE = None
     _data = None
+    _lock = threading.RLock()
 
     def __init__(self):
         if self._data is not None: return
@@ -85,6 +91,9 @@ class ConfigStore:
         if not os.path.exists(self.FILE):
             self.write(WEBX_DEFAULTS)
         self._data = self._read_raw()
+        query = self._data.get('query') or {}
+        if query.pop('reconcile_enabled', None) is not None:
+            self.write(self._data)
 
     # ---------------- 读 ----------------
     def _read_raw(self):
@@ -92,29 +101,33 @@ class ConfigStore:
             return json.load(f)
 
     def get(self):
-        return copy.deepcopy(self._data)
+        with self._lock:
+            return copy.deepcopy(self._data)
 
     def refresh(self):
-        self._data = self._read_raw()
-        return self._data
+        with self._lock:
+            self._data = self._read_raw()
+            return copy.deepcopy(self._data)
 
     # ---------------- 写 ----------------
     def write(self, data):
-        tmp = self.FILE + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.FILE)
-        self._data = data
-        return data
+        with self._lock:
+            tmp = self.FILE + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.FILE)
+            self._data = copy.deepcopy(data)
+            return copy.deepcopy(data)
 
     def update(self, patch):
         """deep-merge patch 进当前配置并写盘；对嵌套 dict 逐层合并"""
-        data = self._data
-        _deep_merge(data, patch)
-        return self.write(data)
+        with self._lock:
+            data = self._read_raw()
+            _deep_merge(data, patch)
+            return self.write(data)
 
     # ---------------- 脱敏 ----------------
     def get_masked(self):

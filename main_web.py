@@ -11,6 +11,8 @@
 #   env.py 完全不参与——本入口不加载、不依赖 env.py。
 import os
 import sys
+import threading
+import time
 
 
 def _ensure_streams():
@@ -48,6 +50,28 @@ from py12306.user.user import User
 from py12306.webx.config_store import ConfigStore
 from py12306.webx.db import DataStore
 from py12306.webx.sync import ConfigSync
+
+
+_WATCHDOG_LOG_LOCK = threading.Lock()
+
+
+def _write_manual_reconcile_log(message):
+    """Append one manual reconciliation result without touching BaseLog's buffers."""
+    try:
+        log_cfg = ConfigStore().get().get('log') or {}
+        if log_cfg.get('to_file', 1) not in (1, True, '1'):
+            return
+        path = log_cfg.get('path') or 'runtime/webx.log'
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        line = '%s webx 手动对账：%s\n' % (
+            time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()), message)
+        with _WATCHDOG_LOG_LOCK:
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(line)
+    except Exception:
+        pass
 
 
 def install_engine_hooks():
@@ -118,8 +142,6 @@ def _start_webx_daemons():
         CommonLog.add_quick_log('webx 后台守护已在运行，跳过重复启动').flush()
         return
     _start_webx_daemons._started = True
-    import threading
-
     def daily_counter():
         from py12306.log.query_log import QueryLog
         last = None
@@ -130,10 +152,6 @@ def _start_webx_daemons():
                 if last is not None and cur > last:
                     DataStore().daily_incr(time.strftime('%Y-%m-%d', time.localtime()), cur - last)
                 last = cur
-            except Exception:
-                pass
-            try:
-                _reconcile_paused_jobs()
             except Exception:
                 pass
             try:
@@ -164,14 +182,14 @@ def _reconcile_paused_jobs():
     期间界面上已经是「已暂停」，日志却还在刷查询 —— 用户看到的就是
     「显示已暂停但后台还在运行」。
 
-    这里每 30 秒对账：摘除 DB 已暂停/结束但引擎仍存活的实例；也会补载 DB
-    中仍启用、未结束且已到启动时间，但意外不在引擎里的任务。未来定时任务不会提前加载。
-    只在检测到不一致时操作。
+    仅在管理台明确点击“立即对账”时执行：摘除 DB 已暂停/结束但引擎仍存活的实例；
+    也会补载 DB 中仍启用、未结束且已到启动时间，但意外不在引擎里的任务。
+    未来定时任务不会提前加载，只在检测到不一致时操作。
     """
     from py12306.query.query import Query
     ins = Query.__dict__.get('__it__')
     if ins is None or not getattr(ins, 'is_ready', False):
-        return
+        return '引擎尚未就绪，本轮跳过'
     from py12306.helpers.func import md5
     from py12306.webx.sync import ConfigSync
     # Use the same eligibility rules as publish_jobs: excludes paused, finished,
@@ -183,9 +201,31 @@ def _reconcile_paused_jobs():
     alive_ids = {str(getattr(j, 'id', '') or '') for j in alive_jobs}
     stale = [j for j in (getattr(ins, 'jobs', None) or [])
              if getattr(j, 'is_alive', True) and str(getattr(j, 'id', '')) not in expected]
+    dead_workers = []
+    for job in alive_jobs:
+        engine_id = str(getattr(job, 'id', '') or '')
+        if engine_id not in expected or not getattr(job, '_webx_worker_exited_at', 0):
+            continue
+        worker = getattr(job, '_webx_worker_thread', None)
+        if worker is None or not worker.is_alive():
+            dead_workers.append(job)
     missing = set(expected) - alive_ids
-    if not stale and not missing:
-        return
+    if not stale and not missing and not dead_workers:
+        return '正常（DB 应运行 %s，Job 存活 %s，未发现异常）' % (
+            len(expected), len(alive_jobs))
+    if dead_workers:
+        dead_ids = {id(job) for job in dead_workers}
+        for job in dead_workers:
+            job.is_alive = False
+            try:
+                engine_id = str(getattr(job, 'id', '') or '')
+                DataStore().job_event_add(
+                    expected[engine_id]['webx_id'], 'recover',
+                    '检测到查询线程异常退出，系统已自动重启任务')
+            except Exception:
+                pass
+        ins.jobs[:] = [job for job in (getattr(ins, 'jobs', None) or [])
+                       if id(job) not in dead_ids]
     ConfigSync.publish_jobs()
     notes = []
     if stale:
@@ -195,10 +235,23 @@ def _reconcile_paused_jobs():
         names = sorted({str(expected[engine_id].get('job_name') or engine_id)
                         for engine_id in missing})
         notes.append('重载 DB 启用但引擎缺失的任务：%s' % '、'.join(names))
+    if dead_workers:
+        names = sorted({str(getattr(job, 'job_name', '') or getattr(job, 'id', ''))
+                        for job in dead_workers})
+        notes.append('重启 DB 启用但查询线程已退出的任务：%s' % '、'.join(names))
 
 
-    if notes:
-        CommonLog.add_quick_log('webx 对账：%s' % '；'.join(notes)).flush()
+    return '已修复：%s' % '；'.join(notes)
+
+
+def run_manual_reconcile():
+    """Run one task reconciliation requested explicitly from the management UI."""
+    try:
+        message = _reconcile_paused_jobs()
+    except Exception as exc:
+        message = '执行异常：%s: %s' % (type(exc).__name__, exc)
+    _write_manual_reconcile_log(message)
+    return message
 
 
 def main():

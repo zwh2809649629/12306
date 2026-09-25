@@ -149,3 +149,10 @@ def settings_save():
         CommonLog.add_quick_log('webx 设置应用失败: %s' % e).flush()
 
     return {'code': 0, 'msg': '已保存并生效', 'data': {'password_reset': bool(new_pwd)}}
+
+
+@bp.route('/api/settings/reconcile', methods=['POST'])
+def settings_reconcile():
+    from main_web import run_manual_reconcile
+    message = run_manual_reconcile()
+    return {'code': 0, 'msg': message, 'data': {'result': message}}

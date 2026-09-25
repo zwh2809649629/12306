@@ -30,9 +30,9 @@ def _norm_period(value, dflt):
 def _default_name(stations, dates):
     pairs = [s for s in (stations or []) if s.get('left') and s.get('arrive')]
     if len(pairs) == 1:
-        seg = pairs[0]['left'] + ' 至 ' + pairs[0]['arrive']
+        seg = pairs[0]['left'] + '至' + pairs[0]['arrive']
     elif pairs:
-        seg = pairs[0]['left'] + ' 至 ' + pairs[-1]['arrive'] + '等%d个区间' % len(pairs)
+        seg = pairs[0]['left'] + '至' + pairs[-1]['arrive'] + '等%d个区间' % len(pairs)
     else:
         seg = '未命名区间'
     date_part = ''

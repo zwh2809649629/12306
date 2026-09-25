@@ -132,6 +132,9 @@ def _do_login_success(key, real_name=None):
     removed = _dedupe_by_name(key, real_name)
     ConfigSync.publish_accounts()
     _force_engine_ready(key)
+    # 账号恢复不一定改变 QUERY_JOBS；若查询循环此前因账号失效退出，
+    # 仅发布账号不会重新唤醒任务，因此显式做一次任务发布/循环自检。
+    ConfigSync.publish_jobs()
     if removed:
         UserLog.add_quick_log('webx 账号去重: %s 与账号 %s 同名，已移除重复行'
                               % (real_name, '、'.join(removed))).flush()

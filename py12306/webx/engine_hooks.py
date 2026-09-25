@@ -38,7 +38,50 @@ _JOB_ID_BY_ENGINE = {}
 _JOB_ID_CACHE_AT = 0.0
 _JOB_ID_CACHE_TTL = 5.0
 
-# {thread_id: job_name} —— 「当前线程正在下单的任务」。
+
+class _WebXQueryStopped(Exception):
+    """内部控制流：任务在账号等待期间被停用。"""
+
+
+import threading
+
+_ACCOUNT_WAIT_LOCK = threading.RLock()
+_ACCOUNT_WAITERS = {}
+
+
+def _account_waiter(account_key):
+    key = str(account_key or '')
+    with _ACCOUNT_WAIT_LOCK:
+        return _ACCOUNT_WAITERS.setdefault(key, threading.Condition(_ACCOUNT_WAIT_LOCK))
+
+
+def _notify_account_waiters(account_key):
+    key = str(account_key or '')
+    if not key:
+        return
+    condition = _account_waiter(key)
+    with condition:
+        condition.notify_all()
+
+
+def _hook_account_ready_signal():
+    """账号恢复或任务销毁时唤醒对应任务，不使用定时轮询。"""
+    from py12306.user.job import UserJob
+    if getattr(UserJob.user_did_load, '_webx_account_ready_signal_wrapped', False):
+        return
+    original = UserJob.user_did_load
+
+    def user_did_load(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            _notify_account_waiters(getattr(self, 'key', ''))
+
+    user_did_load._webx_account_ready_signal_wrapped = True
+    user_did_load._webx_original = original
+    UserJob.user_did_load = user_did_load
+
+# {thread_id: Job} —— 「当前线程正在下单的任务」。
 # 下单链路里 `request_init_dc_page` 挂在 UserJob 上（拿不到 job_name），
 # 而它前面一步 `submit_order_request` 挂在 Order 上（有 self.query_ins.job_name）。
 # 两步同线程、同一账号串行 → 用线程局部把任务名递过去。
@@ -48,17 +91,19 @@ _ORDER_CTX = {}
 def _set_cur_job(job):
     try:
         import threading
-        _ORDER_CTX[threading.get_ident()] = getattr(job, 'job_name', '') or ''
+        _ORDER_CTX[threading.get_ident()] = job
     except Exception:
         pass
 
 
 _TICKET_STATION_CTX = {}
 _QUERY_ROUTE_JOB_CTX = {}
+_QUERY_LOG_JOB_CTX = {}
 def _cur_job_name():
     try:
         import threading
-        return _ORDER_CTX.get(threading.get_ident(), '') or ''
+        job = _ORDER_CTX.get(threading.get_ident())
+        return getattr(job, 'job_name', '') or ''
     except Exception:
         return ''
 
@@ -119,21 +164,50 @@ def _job_id_for(job):
         return None
 
 
+def _log_job(obj):
+    """从 Job、Order 或 UserJob 上取出关联的查询任务。"""
+    try:
+        if getattr(obj, 'job_name', ''):
+            return obj
+        query = getattr(obj, 'query_ins', None)
+        if query is not None and getattr(query, 'job_name', ''):
+            return query
+    except Exception:
+        pass
+    return None
+
+
+def _job_log_label(obj):
+    """日志中统一展示任务名和唯一任务 ID。"""
+    job = _log_job(obj) or obj
+    try:
+        name = getattr(job, 'job_name', '') or ''
+        task_id = _job_id_for(job) or getattr(job, 'id', '') or ''
+        if name and task_id:
+            return '【%s】(%s)' % (name, task_id)
+        if name:
+            return '【%s】' % name
+    except Exception:
+        pass
+    return ''
+
+
 def _jn(obj):
-    """日志前缀：带上任务名。
+    """日志前缀：统一带上任务名和唯一任务 ID。
 
     详情页的「实时日志」是按任务名过滤日志文件的（`_job_logs`），
     而下单流程的日志原本不带任务名 → 排队/提交订单那些行**根本不会出现在任务详情里**。
     """
-    try:
-        name = getattr(obj, 'job_name', '') or ''
-        if not name and getattr(obj, 'query_ins', None) is not None:
-            name = getattr(obj.query_ins, 'job_name', '') or ''
-    except Exception:
-        name = ''
-    if not name:
-        name = _cur_job_name()
-    return ('[%s] ' % name) if name else ''
+    label = _job_log_label(obj)
+    if not label:
+        try:
+            import threading
+            label = _job_log_label(_ORDER_CTX.get(threading.get_ident()))
+        except Exception:
+            pass
+    if not label and _cur_job_name():
+        label = '【%s】' % _cur_job_name()
+    return (label + ' ') if label else ''
 
 
 def _evjob(job, kind, message=''):
@@ -167,12 +241,15 @@ def install():
         _hook_get_user_passengers()
         _hook_get_user_info()
         _hook_can_access_passengers()
+        _hook_job_thread_errors()
         _hook_query_loop()
         _hook_scheduled_job_runner()
         _hook_query_count()
         _hook_job_destroy()
         _hook_job_init_data()
         _hook_job_check_passengers()
+        _hook_account_ready_signal()
+        _hook_query_account_gate()
         _hook_job_refresh_station()
         _hook_station_filter()
         _hook_query_train_log()
@@ -188,6 +265,7 @@ def install():
                 'save_user(空会话守卫) / request_device_id(防递归) / qr_login(让位网页扫码) / '
                 'get_user_passengers / get_user_info(登录态确认) / can_access_passengers(就绪探针) / '
                 'train_log(车次行实际区间) / '
+                'job_error(任务线程异常落日志+事件) / '
                 'query_loop(启用任务后自动查询) / query_count(按任务计数) / '
                 'job_destroy(结束状态落库) / station_filter(只抢指定车站，修同城站扩展误下单) / '
                 'seat_log(命中日志记录实际出发站和终点站) / '
@@ -207,7 +285,7 @@ def install():
 
 
 def _hook_log_timestamps():
-    """统一给 BaseLog.flush() 输出的每个日志批次加毫秒时间戳。"""
+    """统一查询日志格式，并为每条完整日志加一个毫秒时间戳。"""
     import datetime
     import threading
 
@@ -227,8 +305,14 @@ def _hook_log_timestamps():
         original_job_start = Job.start
 
         def job_start(self, *args, **kwargs):
+            import threading
             previous = getattr(query_job_context, 'job', None)
+            previous_query_number = getattr(query_job_context, 'query_number', None)
+            thread_id = threading.get_ident()
+            previous_log_job = _QUERY_LOG_JOB_CTX.get(thread_id)
             query_job_context.job = self
+            query_job_context.query_number = None
+            _QUERY_LOG_JOB_CTX[thread_id] = self
             try:
                 return original_job_start(self, *args, **kwargs)
             finally:
@@ -239,6 +323,17 @@ def _hook_log_timestamps():
                         pass
                 else:
                     query_job_context.job = previous
+                if previous_query_number is None:
+                    try:
+                        del query_job_context.query_number
+                    except AttributeError:
+                        pass
+                else:
+                    query_job_context.query_number = previous_query_number
+                if previous_log_job is None:
+                    _QUERY_LOG_JOB_CTX.pop(thread_id, None)
+                else:
+                    _QUERY_LOG_JOB_CTX[thread_id] = previous_log_job
 
         job_start._webx_query_log_context_wrapped = True
         job_start._webx_original = original_job_start
@@ -248,6 +343,10 @@ def _hook_log_timestamps():
         with flush_lock:
             instance = cls()
             logs = instance.get_logs()
+            if logs:
+                logs[:] = [item for item in logs if str(item or '').strip()]
+            if not logs:
+                return None
             if logs:
                 first = next((i for i, item in enumerate(logs)
                               if str(item or '').strip()), None)
@@ -260,7 +359,136 @@ def _hook_log_timestamps():
     flush._webx_original = original_flush
     BaseLog.flush = classmethod(flush)
 
-    # QueryLog.print_job_start 以前自己附带秒级时间，统一时间戳后去掉重复时间。
+    # 原版把查询明细拆成多条 add_log，再用制表符拼在一起；WebX 改为下面的完整摘要。
+    if not getattr(QueryLog.add_log, '_webx_query_format_wrapped', False):
+        original_add_log = QueryLog.add_log.__func__
+
+        def add_log(cls, content='', *args, **kwargs):
+            if isinstance(content, str):
+                body = content.lstrip('\n')
+                if body.startswith('出发日期 '):
+                    return cls()
+                if body.startswith('耗时 ') or body.startswith('*耗时 ') or body.startswith('停留 '):
+                    return cls()
+                if body.startswith('查询任务 ') and body.rstrip().endswith('已结束'):
+                    import threading
+                    job = (_QUERY_LOG_JOB_CTX.get(threading.get_ident())
+                           or getattr(query_job_context, 'job', None)
+                           or _ORDER_CTX.get(threading.get_ident()))
+                    content = _jn(job) + '查询任务已结束' if job else '查询任务已结束'
+                elif '车票购买成功，订单号' in body:
+                    return cls()
+                elif body.strip() == '当前任务已结束':
+                    return cls()
+            return original_add_log(cls, content, *args, **kwargs)
+
+        add_log._webx_query_format_wrapped = True
+        add_log._webx_original = original_add_log
+        QueryLog.add_log = classmethod(add_log)
+
+    if not getattr(QueryLog.add_quick_log, '_webx_query_format_wrapped', False):
+        original_add_quick_log = QueryLog.add_quick_log.__func__
+
+        def add_quick_log(cls, content='', *args, **kwargs):
+            if isinstance(content, str):
+                body = content.strip()
+                import threading
+                job = (_QUERY_LOG_JOB_CTX.get(threading.get_ident())
+                       or getattr(query_job_context, 'job', None)
+                       or _ORDER_CTX.get(threading.get_ident()))
+                if body == '# 提交订单成功！#':
+                    content = _jn(job) + '提交订单成功！' if job else '提交订单成功！'
+                elif body.startswith('查询任务 ') and body.rstrip().endswith('已结束'):
+                    content = _jn(job) + '查询任务已结束' if job else '查询任务已结束'
+                elif body == '当前任务已结束':
+                    content = _jn(job) + '查询任务已结束' if job else '查询任务已结束'
+                elif '车票购买成功，订单号' in body:
+                    return cls()
+            return original_add_quick_log(cls, content, *args, **kwargs)
+
+        add_quick_log._webx_query_format_wrapped = True
+        add_quick_log._webx_original = original_add_quick_log
+        QueryLog.add_quick_log = classmethod(add_quick_log)
+
+    if not getattr(QueryLog.add_query_time_log, '_webx_query_format_wrapped', False):
+        original_query_time = QueryLog.add_query_time_log.__func__
+
+        def add_query_time_log(cls, time, is_cdn):
+            job = getattr(query_job_context, 'job', None)
+            if job is not None:
+                job._webx_query_elapsed = float(time or 0)
+                return cls()
+            return original_query_time(cls, time, is_cdn)
+
+        add_query_time_log._webx_query_format_wrapped = True
+        add_query_time_log._webx_original = original_query_time
+        QueryLog.add_query_time_log = classmethod(add_query_time_log)
+
+    if not getattr(QueryLog.add_stay_log, '_webx_query_format_wrapped', False):
+        original_stay = QueryLog.add_stay_log.__func__
+
+        def add_stay_log(cls, second):
+            job = getattr(query_job_context, 'job', None)
+            if job is not None:
+                job._webx_query_interval = second
+                return cls()
+            return original_stay(cls, second)
+
+        add_stay_log._webx_query_format_wrapped = True
+        add_stay_log._webx_original = original_stay
+        QueryLog.add_stay_log = classmethod(add_stay_log)
+
+    from py12306.log.order_log import OrderLog
+    if not getattr(OrderLog.add_quick_log, '_webx_query_format_wrapped', False):
+        original_order_quick = OrderLog.add_quick_log.__func__
+
+        def order_quick_log(cls, content='', *args, **kwargs):
+            if isinstance(content, str):
+                body = content.strip()
+                import threading
+                job = _ORDER_CTX.get(threading.get_ident())
+                if job and not body.startswith('【'):
+                    content = _jn(job) + body
+            return original_order_quick(cls, content, *args, **kwargs)
+
+        order_quick_log._webx_query_format_wrapped = True
+        order_quick_log._webx_original = original_order_quick
+        OrderLog.add_quick_log = classmethod(order_quick_log)
+
+    def _query_number(value):
+        try:
+            parts = str(value).split('+')
+            return sum(float(part.strip()) for part in parts)
+        except Exception:
+            return value
+
+    def _emit_query_summary(job):
+        left = str(getattr(job, 'left_station', '') or '').strip()
+        arrive = str(getattr(job, 'arrive_station', '') or '').strip()
+        elapsed = float(getattr(job, '_webx_query_elapsed', 0) or 0)
+        interval = _query_number(getattr(job, '_webx_query_interval', 0) or 0)
+        label = _query_route_text(left, arrive) if left and arrive else ''
+        QueryLog.add_quick_log(
+            '%s%s 查询耗时%.2fs，间隔%.2fs' % (_jn(job), label, elapsed, interval)).flush(publish=False)
+
+    if not getattr(Job.safe_stay, '_webx_query_format_wrapped', False):
+        original_safe_stay = Job.safe_stay
+
+        def safe_stay(self, *args, **kwargs):
+            try:
+                from py12306.helpers.func import get_interval_num, stay_second
+                origin = get_interval_num(self.interval)
+                additional = float(getattr(self, 'interval_additional', 0) or 0)
+                self._webx_query_interval = origin + additional
+                _emit_query_summary(self)
+                return stay_second(origin + additional)
+            except Exception:
+                return original_safe_stay(self, *args, **kwargs)
+
+        safe_stay._webx_query_format_wrapped = True
+        safe_stay._webx_original = original_safe_stay
+        Job.safe_stay = safe_stay
+
     if not getattr(QueryLog.print_job_start, '_webx_timestamp_wrapped', False):
         def print_job_start(cls, job_name):
             instance = cls()
@@ -288,10 +516,10 @@ def _hook_log_timestamps():
                 else:
                     message = '>> 本任务第 {query_count} 次查询 {job_name}'.format(
                         query_count=query_count, job_name=job_name)
-            instance.add_log(message)
+            label = _job_log_label(job) if job is not None else '【%s】' % job_name
+            instance.add_quick_log('%s 第 %s 次查询。' % (label, query_count))
             instance.refresh_data()
-            if query_log_module.is_main_thread():
-                instance.flush(publish=False)
+            instance.flush(publish=False)
             return instance
 
         print_job_start._webx_timestamp_wrapped = True
@@ -506,8 +734,48 @@ def _hook_get_passenger_for_members():
 #   - 刷新前摘掉已 destroy 的 Job，使“暂停后再启用”能重建实例。
 # **不修改 py12306 原文件。**
 
+def _hook_job_thread_errors():
+    """Surface uncaught per-job thread errors in WebX logs and task events."""
+    import threading
+    import time
+    import traceback
+
+    from py12306.query.job import Job
+    if getattr(Job.run, '_webx_error_log_wrapped', False):
+        return
+    original = Job.run
+
+    def run(self, *args, **kwargs):
+        thread = threading.current_thread()
+        previous_log_thread = getattr(thread, '_webx_log_thread', False)
+        thread._webx_log_thread = True
+        self._webx_worker_thread = thread
+        self._webx_worker_started_at = time.time()
+        self._webx_worker_exited_at = 0.0
+        try:
+            return original(self, *args, **kwargs)
+        except Exception as exc:
+            message = '查询任务执行异常: %s: %s' % (type(exc).__name__, exc)
+            detail = '%s%s\n%s' % (_jn(self), message, traceback.format_exc().rstrip())
+            try:
+                from py12306.log.common_log import CommonLog
+                CommonLog.add_quick_log(detail).flush()
+            except Exception:
+                pass
+            _evjob(self, 'error', message)
+            raise
+        finally:
+            self._webx_worker_exited_at = time.time()
+            self._webx_worker_thread = None
+            thread._webx_log_thread = previous_log_thread
+
+    run._webx_error_log_wrapped = True
+    run._webx_original = original
+    Job.run = run
+
 def _hook_query_loop():
     import threading
+    import time
 
     from py12306.app import Const
     from py12306.query.query import Query
@@ -519,10 +787,31 @@ def _hook_query_loop():
     original_update = Query.update_query_jobs
     state_lock = threading.Lock()
 
+    def start_background(instance):
+        with state_lock:
+            if (getattr(instance, '_webx_query_loop_running', False) or
+                    getattr(instance, '_webx_query_loop_starting', False)):
+                return
+            instance._webx_query_loop_starting = True
+        th = threading.Thread(target=instance.start, daemon=True,
+                              name=WEBX_LOG_THREAD_NAME)
+        # 标记为「日志主线程」：引擎只在主线程落盘（见 _hook_log_thread）
+        try:
+            th._webx_log_thread = True
+        except Exception:
+            pass
+        try:
+            th.start()
+        except Exception:
+            with state_lock:
+                instance._webx_query_loop_starting = False
+
     def start(self, *args, **kwargs):
         with state_lock:
             if getattr(self, '_webx_query_loop_running', False):
+                self._webx_query_loop_starting = False
                 return None
+            self._webx_query_loop_starting = False
             self._webx_query_loop_running = True
         try:
             from py12306.config import Config
@@ -544,7 +833,20 @@ def _hook_query_loop():
                 runnable = [job for job in live
                             if not is_engine_job_claimed(getattr(job, 'id', ''))]
                 if runnable:
-                    jobs_do(runnable, 'run')
+                        for job in runnable:
+                            try:
+                                job.run()
+                            except Exception as exc:
+                                try:
+                                    from py12306.log.common_log import CommonLog
+                                    CommonLog.add_quick_log(
+                                        'webx 查询任务执行异常 [%s](%s): %r' % (
+                                            getattr(job, 'job_name', ''),
+                                            getattr(job, 'id', ''),
+                                            exc)).flush()
+                                except Exception:
+                                    pass
+                                time.sleep(1.0)
                 elif live:
                     if Const.IS_TEST:
                         return None
@@ -556,6 +858,14 @@ def _hook_query_loop():
         finally:
             with state_lock:
                 self._webx_query_loop_running = False
+                restart = bool(getattr(self, '_webx_query_loop_restart_pending', False))
+                self._webx_query_loop_restart_pending = False
+            if restart and not Const.IS_TEST:
+                try:
+                    if any(getattr(job, 'is_alive', True) for job in (self.jobs or [])):
+                        start_background(self)
+                except Exception:
+                    pass
 
     def update_query_jobs(self, auto=False):
         if auto:
@@ -570,16 +880,15 @@ def _hook_query_loop():
         if auto and not Const.IS_TEST:
             try:
                 runnable = any(getattr(job, 'is_alive', True) for job in (self.jobs or []))
-                running = bool(getattr(self, '_webx_query_loop_running', False))
-                if runnable and not running:
-                    th = threading.Thread(target=self.start, daemon=True,
-                                          name=WEBX_LOG_THREAD_NAME)
-                    # 标记为「日志主线程」：引擎只在主线程落盘（见 _hook_log_thread）
-                    try:
-                        th._webx_log_thread = True
-                    except Exception:
-                        pass
-                    th.start()
+                if runnable:
+                    with state_lock:
+                        running = bool(getattr(self, '_webx_query_loop_running', False))
+                        if running:
+                            # Refresh may race with the old loop observing an empty job list.
+                            # Let that loop restart itself after its finally block.
+                            self._webx_query_loop_restart_pending = True
+                    if not running:
+                        start_background(self)
             except Exception:
                 pass
         return result
@@ -649,17 +958,78 @@ def _hook_query_count():
     Job.query_by_date = query_by_date
 
 
+def _hook_query_account_gate():
+    """暂停账号失效任务的请求，等待账号恢复事件后自动继续。"""
+    from py12306.query.job import Job
+    if not getattr(Job.query_by_date, '_webx_account_gate_wrapped', False):
+        original = Job.query_by_date
+
+        def query_by_date(self, *args, **kwargs):
+            try:
+                from py12306.webx.job_schedule import _job_account_ready
+            except Exception:
+                return original(self, *args, **kwargs)
+
+            condition = _account_waiter(getattr(self, 'account_key', ''))
+            with condition:
+                while getattr(self, 'is_alive', True):
+                    try:
+                        ready = _job_account_ready(self)
+                    except Exception:
+                        ready = True
+                    if ready:
+                        self._webx_account_wait_logged = False
+                        return original(self, *args, **kwargs)
+                    if not getattr(self, '_webx_account_wait_logged', False):
+                        self._webx_account_wait_logged = True
+                        from py12306.log.common_log import CommonLog
+                        CommonLog.add_quick_log(
+                            '%s账号已过期或未就绪，等待账号恢复事件' % _jn(self)).flush()
+                    condition.wait()
+
+            raise _WebXQueryStopped()
+
+        query_by_date._webx_account_gate_wrapped = True
+        query_by_date._webx_original = original
+        Job.query_by_date = query_by_date
+
+    if getattr(Job.start, '_webx_account_gate_start_wrapped', False):
+        return
+    original_start = Job.start
+
+    def start(self, *args, **kwargs):
+        try:
+            return original_start(self, *args, **kwargs)
+        except _WebXQueryStopped:
+            return None
+
+    start._webx_account_gate_start_wrapped = True
+    start._webx_original = original_start
+    Job.start = start
+
+
 def _hook_job_destroy():
     from py12306.query.job import Job
     if getattr(Job.destroy, '_webx_wrapped', False):
         return
     original = Job.destroy
     def destroy(self):
+        import threading
+        thread_id = threading.get_ident()
+        previous_log_job = _QUERY_LOG_JOB_CTX.get(thread_id)
+        _QUERY_LOG_JOB_CTX[thread_id] = self
         try:
             _record_job_finished(self)
         except Exception:
             pass
-        return original(self)
+        try:
+            return original(self)
+        finally:
+            _notify_account_waiters(getattr(self, 'account_key', ''))
+            if previous_log_job is None:
+                _QUERY_LOG_JOB_CTX.pop(thread_id, None)
+            else:
+                _QUERY_LOG_JOB_CTX[thread_id] = previous_log_job
 
     destroy._webx_wrapped = True
     destroy._webx_original = original
@@ -814,8 +1184,7 @@ def _note_station_skip(job, train_number, actual_left='', actual_arrive=''):
         nums = getattr(job, '_webx_station_skip_trains', None)
         if nums is None:
             nums = job._webx_station_skip_trains = []
-        route = '%s 至 %s' % (actual_left or '未知', actual_arrive or '未知')
-        detail = '%s（%s）' % (train_number, route) if train_number else route
+        detail = _query_route_text(actual_left, actual_arrive, train_number)
         if detail not in nums:
             nums.append(detail)
     except Exception:
@@ -832,8 +1201,8 @@ def _warn_station_unresolved(job, code, side, actual_left='', actual_arrive=''):
             return
         warned.add(key)
         train = _call(job, 'get_info_of_train_number') or '未知车次'
-        route = '%s 至 %s' % (actual_left or '未知站', actual_arrive or '未知站')
-        message = '%s车次 %s（%s）站点解析失败：%s站电报码 %s 未映射' % (_jn(job), train, route, side, code or '空')
+        route = _query_route_text(actual_left or '未知站', actual_arrive or '未知站', train)
+        message = '%s车次 %s站点解析失败：%s站电报码 %s 未映射' % (_jn(job), route, side, code or '空')
         from py12306.log.common_log import CommonLog
         CommonLog.add_quick_log(message).flush()
         _evjob(job, 'warning', message)
@@ -851,7 +1220,16 @@ def _emit_station_skip_summary(job):
     trains = getattr(job, '_webx_station_skip_trains', []) or []
     message = '已按站点过滤 %d 条非目标车站的车次' % count
     if trains:
-        message += '（车次及实际区间：%s%s）' % ('、'.join(trains[:8]), '…' if len(trains) > 8 else '')
+        formatted = []
+        for item in trains[:8]:
+            try:
+                train, route = item.split('（', 1)
+                formatted.append('【%s（%s】' % (train, route))
+            except Exception:
+                formatted.append('【%s】' % item)
+        if len(trains) > 8:
+            formatted.append('…')
+        message += '：' + '、'.join(formatted)
     try:
         from py12306.log.common_log import CommonLog
         CommonLog.add_quick_log('%s%s' % (_jn(job), message)).flush()
@@ -976,8 +1354,25 @@ def _hook_station_filter():
     Job.is_trains_number_valid = is_trains_number_valid
 
 
+def _query_route_text(left, arrive, number=''):
+    route = '%s➜%s' % (left or '未知', arrive or '未知')
+    return '[%s(%s)]' % (number, route) if number else '[%s]' % route
+
+
+def _emit_query_train_routes(job):
+    routes = getattr(job, '_webx_query_train_routes', None) or []
+    from py12306.log.query_log import QueryLog
+    date = str(getattr(job, 'left_date', '') or '').strip() or '未知日期'
+    left = str(getattr(job, 'left_station', '') or '').strip() or '未知起点'
+    arrive = str(getattr(job, 'arrive_station', '') or '').strip() or '未知终点'
+    scope = '%s %s' % (date, _query_route_text(left, arrive))
+    message = '%s%s 车次具体区间：[%s]' % (_jn(job), scope, '、'.join(routes))
+    QueryLog.add_quick_log(message).flush(publish=False)
+
+
 def _hook_query_train_log():
     """Annotate per-train query lines with the response row's actual endpoints."""
+    from py12306.query.job import Job
     from py12306.log.query_log import QueryLog
     method = QueryLog.add_log
     original = getattr(method, '__func__', method)
@@ -993,7 +1388,8 @@ def _hook_query_train_log():
             logger.add_log('任务名称：{}'.format(job.job_name))
             logger.add_log('任务id：{}'.format(task_id))
             for station in job.stations:
-                logger.add_log('出发站：{} 到达站：{}'.format(station.get('left'), station.get('arrive')))
+                logger.add_log('区间：{}'.format(
+                    _query_route_text(station.get('left'), station.get('arrive'))))
 
             logger.add_log('乘车日期：{}'.format(job.left_dates))
             logger.add_log('坐席：{}'.format('，'.join(job.allow_seats)))
@@ -1006,7 +1402,8 @@ def _hook_query_train_log():
             if route and job.allow_train_numbers:
                 left = route.get('left') or ''
                 arrive = route.get('arrive') or ''
-                numbers = '，'.join('%s(%s 至 %s)' % (n, left, arrive) for n in job.allow_train_numbers)
+                numbers = '，'.join(
+                    _query_route_text(left, arrive, n) for n in job.allow_train_numbers)
             logger.add_log('筛选车次：{}'.format(numbers))
             logger.add_log('')
         logger.flush()
@@ -1014,9 +1411,31 @@ def _hook_query_train_log():
     print_init_jobs._webx_query_route_wrapped = True
     QueryLog.print_init_jobs = classmethod(print_init_jobs)
 
+    if not getattr(Job.handle_response, '_webx_query_train_routes_wrapped', False):
+        original_handle_response = Job.handle_response
+
+        def handle_response(self, *args, **kwargs):
+            self._webx_query_train_routes = []
+            try:
+                return original_handle_response(self, *args, **kwargs)
+            finally:
+                _emit_query_train_routes(self)
+
+        handle_response._webx_query_train_routes_wrapped = True
+        handle_response._webx_original = original_handle_response
+        Job.handle_response = handle_response
+
 
     def add_log(cls, content='', *args, **kwargs):
         import threading
+        if isinstance(content, str):
+            leading = '\n' if content.startswith('\n') else ''
+            body = content[len(leading):]
+            if body.startswith('出发日期 ') and ': ' in body:
+                prefix, route = body.split(': ', 1)
+                parts = route.split(' - ', 1)
+                if len(parts) == 2 and all(parts):
+                    content = leading + prefix + ': ' + _query_route_text(parts[0], parts[1])
         job = _QUERY_ROUTE_JOB_CTX.get(threading.get_ident())
         if job:
             try:
@@ -1024,7 +1443,11 @@ def _hook_query_train_log():
                 if number and str(content).strip() == number:
                     _, left, arrive = _row_station_ok(job)
                     if left or arrive:
-                        content = '%s（%s 至 %s）' % (content, left or '未知', arrive or '未知')
+                        routes = getattr(job, '_webx_query_train_routes', None)
+                        if routes is None:
+                            routes = job._webx_query_train_routes = []
+                        routes.append(_query_route_text(left, arrive, content).strip('[]'))
+                        return None
             except Exception:
                 pass
         return original(cls, content, *args, **kwargs)
@@ -1387,6 +1810,7 @@ def _hook_order_flow_guard():
     # 先修正原版第一步的误导文案。
     OrderLog.MESSAGE_SUBMIT_ORDER_REQUEST_SUCCESS = (
         '下单请求已受理，正在获取订单确认令牌（尚未生成订单）')
+    OrderLog.MESSAGE_CONFIRM_SINGLE_FOR_QUEUE_SUCCESS = '提交订单成功！'
 
     order_urls = {
         API_SUBMIT_ORDER_REQUEST,
@@ -2279,9 +2703,23 @@ def _record_hit(job, user):
 
 def _hook_order_success():
     from py12306.order.order import Order
+    from py12306.log.order_log import OrderLog
     if getattr(Order.order_did_success, '_webx_wrapped', False):
         return
     original = Order.order_did_success
+
+    if not getattr(OrderLog.print_ticket_did_ordered, '_webx_query_format_wrapped', False):
+        def print_ticket_did_ordered(cls, order_id):
+            import threading
+            job = _ORDER_CTX.get(threading.get_ident())
+            message = '%s提交订单成功！' % _jn(job) if job else '提交订单成功！'
+            if order_id:
+                message += '订单号 %s' % order_id
+            cls.add_quick_log(message).flush()
+            return cls
+
+        print_ticket_did_ordered._webx_query_format_wrapped = True
+        OrderLog.print_ticket_did_ordered = classmethod(print_ticket_did_ordered)
 
     def order_did_success(self):
         try:

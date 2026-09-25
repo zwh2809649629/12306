@@ -26,7 +26,7 @@ def logs():
     if not path or not os.path.exists(path):
         return {'code': 0, 'msg': '', 'data': {'lines': [], 'total': 0}}
     with open(path, encoding='utf-8', errors='replace') as f:
-        lines = f.readlines()
+        lines = [line for line in f if line.strip()]
     # 取尾部 limit
     total = len(lines)
     lines = lines[-limit:]

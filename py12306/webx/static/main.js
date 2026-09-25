@@ -6,6 +6,7 @@ var $ = function (id) { return document.getElementById(id); };
 var TOKEN_KEY = 'webx_token';
 var USERNAME_KEY = 'webx_username';
 var booted = false;
+var DETAIL_JOB_ID = '';
 var SEATS_CN = ['商务座', '一等座', '二等座', '软卧', '硬卧', '硬座', '无座', '特等座'];
 
 /* ---------- 基础工具 ---------- */
@@ -398,6 +399,9 @@ function startPolling() {
   var v = currentView();
   if (v === 'dashboard') pollTimers.dash = setInterval(loadDashboard, 3000);
   if (v === 'logs' && !logPaused) pollTimers.log = setInterval(loadLogs, 6000);
+  if (v === 'detail' && DETAIL_JOB_ID) pollTimers.detail = setInterval(function () {
+    loadDetail(DETAIL_JOB_ID);
+  }, 3000);
   // 任务列表/详情：引擎会主动结束任务（下单成功、乘客校验失败）、账号会掉线，
   // 状态必须自己刷新，否则页面会一直停在进入时的旧结论上
   if (v === 'jobs') pollTimers.jobs = setInterval(loadJobs, 5000);
@@ -452,6 +456,7 @@ function go(view, ctx) {
   document.querySelectorAll('.nav a').forEach(function (a) { a.classList.remove('on'); });
   var el = $('view-' + view);
   if (!el) return;
+  DETAIL_JOB_ID = view === 'detail' && ctx && ctx.job_id ? String(ctx.job_id) : '';
   el.classList.add('is-active');
   var nav = document.querySelector('.nav a[data-view="' + (view === 'detail' ? 'jobs' : view) + '"]');
   if (nav) nav.classList.add('on');
@@ -703,7 +708,7 @@ function loadDetail(job_id) {
       } else if (j.status === 'blocked') {
         $('dHint').className = 'detail-hint warn';
         $('dHint').innerHTML = '账号<b>' + esc(j.account_name || j.account_key || '')
-          + '</b>当前未登录，任务已中止、不会发起任何查询。'
+          + '</b>当前未登录，查询已暂停；账号恢复后任务将自动继续。'
           + '<button class="link-btn" type="button" id="dGoAcc">去账号管理登录</button>';
         if ($('dGoAcc')) $('dGoAcc').onclick = function () { go('accounts'); };
       } else if (dDone) {
@@ -837,7 +842,9 @@ function loadDetail(job_id) {
     // 日志（后端已按任务名过滤且取最新，见 routes_jobs._job_logs）
     var logs = j.logs || [];
     if ($('dLogSub')) $('dLogSub').textContent = logs.length ? '最新 ' + logs.length + ' 行 · 已按任务名过滤' : '';
-    $('dLog').innerHTML = logs.length ? logs.map(function (l) { return '<div class="' + logLineClass(l) + '">' + esc(l) + '</div>'; }).join('') : '<div style="color:var(--faint)">暂无日志</div>';
+    var detailLog = $('dLog');
+    detailLog.innerHTML = logs.length ? logs.map(function (l) { return '<div class="' + logLineClass(l) + '">' + esc(l) + '</div>'; }).join('') : '<div style="color:var(--faint)">暂无日志</div>';
+    detailLog.scrollTop = detailLog.scrollHeight;
   }).catch(function (e) { toast(e.message, 'err'); go('jobs'); });
 }
 
@@ -3571,7 +3578,10 @@ function logTermColor(l) {
 
 /* ---------- 9. 设置 ---------- */
 function loadSettings() {
+  var requestSeq = (loadSettings._requestSeq || 0) + 1;
+  loadSettings._requestSeq = requestSeq;
   api('/api/settings').then(function (d) {
+    if (requestSeq !== loadSettings._requestSeq) return;
     var c = d.config, st = d.state || {};
     var sections = [];
     function fldLabel(label, path, extra) {
@@ -3619,6 +3629,7 @@ function loadSettings() {
       fldLabel('任务超时（秒）', 'query.job_timeout') +
       fldLabel('账号心跳间隔（秒）', 'user.heartbeat_interval') +
       fldLabel('多线程查询', 'query.thread_enabled', { type: 'bool', hint: '每个任务独立线程查询' }) +
+      '<div class="setting-toggle"><div><b>任务手动对账</b><small>仅在点击时检查 DB、引擎任务与查询线程，并执行一次修复</small></div><button class="btn btn-outline btn-sm" id="settingsReconcile" type="button">立即对账</button></div>' +
       '<div class="setting-pair setting-cdn-pair">' + fldLabel('启用 CDN', 'cdn.enabled', { type: 'bool' }) + fldLabel('CDN 检测超时（秒）', 'cdn.check_time_out', { relatedTo: 'cdn.enabled' }) + '</div>' +
       fldLabel('日志写入文件', 'log.to_file', { type: 'bool' }) + '</div>');
     section('set-notify', '通知渠道', '每个渠道独立配置；开关只控制当前渠道，不会影响其他提醒方式。', '<div class="channel-grid">' +
@@ -3642,6 +3653,14 @@ function loadSettings() {
       '<div class="setting-pair setting-rail-pair">' + fldLabel('缓存 RAIL 设备 ID', 'rail.cache_enabled', { type: 'bool', hint: '启用后才使用右侧设备参数' }) +
       fldLabel('设备 ID', 'rail.device_id', { relatedTo: 'rail.cache_enabled' }) + fldLabel('设备过期值', 'rail.expiration', { relatedTo: 'rail.cache_enabled' }) + '</div></div>');
     $('setGrid').innerHTML = '<div class="settings-layout"><div class="settings-main">' + sections.join('') + '</div><div class="settings-note">配置持久化于 <b>runtime/webx.json</b>；密钥字段留空表示保持原值。日志：' + esc((c.log.path || '') + (c.log.path_exists ? '（存在）' : '（未生成）')) + '</div></div>';
+    var reconcileButton = $('settingsReconcile');
+    if (reconcileButton) reconcileButton.addEventListener('click', function () {
+      reconcileButton.disabled = true;
+      api('/api/settings/reconcile', { method: 'POST' })
+        .then(function (result) { toast(result.result || '对账完成', 'ok'); })
+        .catch(function (error) { toast(error.message, 'err'); })
+        .finally(function () { reconcileButton.disabled = false; });
+    });
     var intervalPreset = $('settingsIntervalPreset');
     if (intervalPreset) intervalPreset.addEventListener('change', function () {
       var custom = intervalPreset.value === 'custom';
@@ -3920,7 +3939,7 @@ function saveSettings() {
   api('/api/settings', { method: 'POST', body: JSON.stringify({ config: cfg }) })
     .then(function (d) {
       toast(d.password_reset ? '设置已保存，管理台密码已重置，请重新登录' : '设置已保存并生效', 'ok');
-      if (d.password_reset) { /* 后端已改口令；当前 token 仍有效，下次登录用新密码 */ loadSettings(); }
+      loadSettings();
     })
     .catch(function (e) { toast(e.message, 'err'); })
     .finally(function () { btn.disabled = false; });

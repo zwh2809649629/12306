@@ -343,7 +343,8 @@ class ConfigSync:
                     expected = {str(md5(info)) for info in new}
                     alive = {str(getattr(job, 'id', '') or '') for job in (query.jobs or [])
                              if getattr(job, 'is_alive', False)}
-                    refresh_engine = expected != alive
+                    loop_running = bool(getattr(query, '_webx_query_loop_running', False))
+                    refresh_engine = expected != alive or (bool(expected) and not loop_running)
             except Exception:
                 pass
         if refresh_engine:

@@ -465,7 +465,7 @@ def _job_logs(job_name, limit=100):
             return []
         with open(path, encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
-        out = [raw.rstrip('\n') for raw in lines if job_name in raw]
+        out = [raw.rstrip('\n') for raw in lines if raw.strip() and job_name in raw]
         return out[-limit:]
     except Exception:
         return []
